@@ -167,17 +167,17 @@ export function AdminHeader({
             <DropdownMenuSeparator />
             <DropdownMenuItem
               className="cursor-pointer gap-2"
-              onSelect={() => adminToast.placeholder("Admin Profile")}
+              onSelect={() => router.push("/admin/settings#profile")}
             >
               <User className="h-4 w-4 text-text-secondary" aria-hidden="true" />
-              <span>Account Profile (Planned)</span>
+              <span>Account Profile</span>
             </DropdownMenuItem>
             <DropdownMenuItem
               className="cursor-pointer gap-2"
-              onSelect={() => adminToast.placeholder("Admin Preferences")}
+              onSelect={() => router.push("/admin/settings#workspace")}
             >
               <Settings className="h-4 w-4 text-text-secondary" aria-hidden="true" />
-              <span>Workspace Settings (Planned)</span>
+              <span>Workspace Settings</span>
             </DropdownMenuItem>
             <DropdownMenuItem
               className="cursor-pointer gap-2"

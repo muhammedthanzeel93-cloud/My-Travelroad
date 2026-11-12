@@ -8,7 +8,11 @@ import { Compass, ExternalLink, Menu, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { ADMIN_NAV_GROUPS, type AdminNavItem } from "./navigation";
+import {
+  ADMIN_NAV_GROUPS,
+  isAdminNavItemActive,
+  type AdminNavItem,
+} from "./navigation";
 import { AdminNavIcon } from "./admin-nav-icon";
 
 export interface AdminMobileNavProps {
@@ -51,7 +55,7 @@ export function AdminMobileNav({
         >
           <div className="flex h-16 items-center justify-between border-b border-border px-4">
             <Link
-              href="/admin/design-system"
+              href="/admin"
               onClick={() => setOpen(false)}
               className="flex items-center gap-2.5"
             >
@@ -95,11 +99,9 @@ export function AdminMobileNav({
                 </p>
                 <nav aria-label={`${group.label} mobile`} className="space-y-1">
                   {group.items.map((item) => {
-                    const isRouteActive =
-                      item.href &&
-                      (pathname === item.href || pathname.startsWith(`${item.href}/`));
                     const isSelected = Boolean(
-                      isRouteActive || activeItemId === item.id
+                      isAdminNavItemActive(item, pathname ?? "") ||
+                        activeItemId === item.id
                     );
 
                     const itemClasses = cn(
@@ -121,7 +123,7 @@ export function AdminMobileNav({
                           <AdminNavIcon iconKey={item.iconKey} />
                           <span className="flex-1 truncate text-left">{item.label}</span>
                           {item.badgeText && (
-                            <Badge variant="subtle" size="sm">
+                            <Badge variant={isSelected ? "subtle" : "muted"} size="sm">
                               {item.badgeText}
                             </Badge>
                           )}

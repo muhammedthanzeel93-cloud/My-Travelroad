@@ -33,29 +33,29 @@ export const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
         id: "overview",
         label: "Overview",
         iconKey: "overview",
-        badgeText: "Planned",
-        isPlaceholder: true,
+        href: "/admin",
+        isPlaceholder: false,
       },
       {
         id: "destinations",
         label: "Destinations",
         iconKey: "destinations",
-        badgeText: "Planned",
-        isPlaceholder: true,
+        href: "/admin/destinations",
+        isPlaceholder: false,
       },
       {
         id: "categories",
         label: "Categories",
         iconKey: "categories",
-        badgeText: "Planned",
-        isPlaceholder: true,
+        href: "/admin/categories",
+        isPlaceholder: false,
       },
       {
         id: "verification",
         label: "Destination Verification",
         iconKey: "verification",
-        badgeText: "Planned",
-        isPlaceholder: true,
+        href: "/admin/destination-verification",
+        isPlaceholder: false,
       },
     ],
   },
@@ -67,29 +67,29 @@ export const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
         id: "users",
         label: "Users",
         iconKey: "users",
-        badgeText: "Planned",
-        isPlaceholder: true,
+        href: "/admin/users",
+        isPlaceholder: false,
       },
       {
         id: "reviews",
         label: "Reviews",
         iconKey: "reviews",
-        badgeText: "Planned",
-        isPlaceholder: true,
+        href: "/admin/reviews",
+        isPlaceholder: false,
       },
       {
         id: "reports",
         label: "Reports",
         iconKey: "reports",
-        badgeText: "Planned",
-        isPlaceholder: true,
+        href: "/admin/reports",
+        isPlaceholder: false,
       },
       {
         id: "settings",
         label: "Settings",
         iconKey: "settings",
-        badgeText: "Planned",
-        isPlaceholder: true,
+        href: "/admin/settings",
+        isPlaceholder: false,
       },
     ],
   },
@@ -102,9 +102,35 @@ export const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
         label: "Design System",
         iconKey: "designSystem",
         href: "/admin/design-system",
-        badgeText: "Active",
+        badgeText: "Preview",
         isPlaceholder: false,
       },
     ],
   },
 ];
+
+/**
+ * Checks whether an admin navigation item matches the current pathname.
+ * Uses strict matching for `/admin` so Overview is not highlighted on child routes.
+ */
+export function isAdminNavItemActive(
+  item: AdminNavItem,
+  pathname: string
+): boolean {
+  if (!item.href) return false;
+  if (item.href === "/admin") {
+    return pathname === "/admin";
+  }
+  return pathname === item.href || pathname.startsWith(`${item.href}/`);
+}
+
+/** Finds the active navigation item matching a given admin pathname. */
+export function findActiveAdminNavItem(
+  pathname: string
+): AdminNavItem | undefined {
+  for (const group of ADMIN_NAV_GROUPS) {
+    const match = group.items.find((item) => isAdminNavItemActive(item, pathname));
+    if (match) return match;
+  }
+  return undefined;
+}

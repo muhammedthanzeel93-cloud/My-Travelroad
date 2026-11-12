@@ -23,7 +23,7 @@ export function AdminBreadcrumbs({ items, className }: AdminBreadcrumbsProps) {
       <ol className="flex flex-wrap items-center gap-1.5">
         <li className="inline-flex items-center">
           <Link
-            href="/admin/design-system"
+            href="/admin"
             className="inline-flex items-center gap-1.5 rounded-sm text-text-secondary transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
           >
             <Shield className="h-3.5 w-3.5 text-primary" aria-hidden="true" />

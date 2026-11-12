@@ -1,12 +1,13 @@
 "use client";
 
 import * as React from "react";
+import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { ConfirmDialog } from "@/components/admin/feedback/confirm-dialog";
 import { adminToast } from "@/components/admin/feedback/admin-toast";
 import { AdminHeader } from "./admin-header";
 import { AdminSidebar } from "./admin-sidebar";
-import { ADMIN_NAV_GROUPS, type AdminNavItem } from "./navigation";
+import { findActiveAdminNavItem, type AdminNavItem } from "./navigation";
 
 export interface AdminMainContainerProps
   extends React.HTMLAttributes<HTMLDivElement> {
@@ -34,17 +35,13 @@ export function AdminMainContainer({
 
 /** Full admin layout wrapper coordinating sidebar, header, main workspace, and confirmation dialogs. */
 export function AdminShell({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname() ?? "/admin";
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
   const [signOutDialogOpen, setSignOutDialogOpen] = React.useState(false);
-  const selectedNavId = "design-system";
 
-  const activeItemLabel = React.useMemo(() => {
-    for (const group of ADMIN_NAV_GROUPS) {
-      const match = group.items.find((item) => item.id === selectedNavId);
-      if (match) return match.label;
-    }
-    return "Admin Design System";
-  }, [selectedNavId]);
+  const activeItem = findActiveAdminNavItem(pathname);
+  const selectedNavId = activeItem?.id ?? "overview";
+  const activeItemLabel = activeItem?.label ?? "Admin Console";
 
   const handleSelectPlaceholder = (item: AdminNavItem) => {
     adminToast.placeholder(item.label);
@@ -73,7 +70,7 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
 
         <footer className="border-t border-border bg-surface/60 px-4 py-3 text-xs text-text-secondary sm:px-6 lg:px-8">
           <div className="mx-auto flex max-w-[1440px] flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
-            <span>My Travelroad Admin UI Foundation (Task 03 Structural Preview)</span>
+            <span>My Travelroad Admin Console (Structural UI Preview)</span>
             <span>Development sample components only — auth &amp; backend excluded</span>
           </div>
         </footer>
@@ -83,7 +80,7 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
         open={signOutDialogOpen}
         onOpenChange={setSignOutDialogOpen}
         title="Sign out of Admin Preview?"
-        description="Authentication is not enabled in Task 03. Confirming demonstrates standard session exit dialog behavior."
+        description="Authentication is not enabled yet. Confirming demonstrates standard session exit dialog behavior."
         targetLabel="Amina Rahman (Preview)"
         variant="warning"
         confirmLabel="Simulate Sign Out"

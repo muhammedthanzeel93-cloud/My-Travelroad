@@ -12,7 +12,11 @@ import {
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { ADMIN_NAV_GROUPS, type AdminNavItem } from "./navigation";
+import {
+  ADMIN_NAV_GROUPS,
+  isAdminNavItemActive,
+  type AdminNavItem,
+} from "./navigation";
 import { AdminNavIcon } from "./admin-nav-icon";
 
 export interface AdminSidebarProps {
@@ -47,7 +51,7 @@ export function AdminSidebar({
         )}
       >
         <Link
-          href="/admin/design-system"
+          href="/admin"
           aria-label="My Travelroad Admin"
           className="flex items-center gap-2.5 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
         >
@@ -84,10 +88,10 @@ export function AdminSidebar({
             )}
             <nav aria-label={group.label} className="space-y-1">
               {group.items.map((item) => {
-                const isRouteActive =
-                  item.href &&
-                  (pathname === item.href || pathname.startsWith(`${item.href}/`));
-                const isSelected = Boolean(isRouteActive || activeItemId === item.id);
+                const isSelected = Boolean(
+                  isAdminNavItemActive(item, pathname ?? "") ||
+                    activeItemId === item.id
+                );
 
                 const itemClasses = cn(
                   "group flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-[13px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1",
@@ -113,7 +117,7 @@ export function AdminSidebar({
                         <span className="flex-1 text-left leading-snug">{item.label}</span>
                         {item.badgeText && (
                           <Badge
-                            variant={item.isPlaceholder ? "muted" : "subtle"}
+                            variant={isSelected ? "subtle" : "muted"}
                             size="sm"
                             className="shrink-0"
                           >
