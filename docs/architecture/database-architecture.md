@@ -302,7 +302,7 @@ CREATE TABLE destination_locations (
         )
     ),
     CONSTRAINT ck_locations_restricted_centroid CHECK (
-        is_restricted = FALSE OR (public_approximate_centroid IS NOT NULL AND public_approximate_display_name IS NOT NULL)
+        is_restricted = FALSE OR public_approximate_display_name IS NOT NULL
     )
 );
 
@@ -310,6 +310,9 @@ CREATE TABLE destination_locations (
 CREATE INDEX idx_locations_coordinates ON destination_locations USING GIST (coordinates);
 CREATE INDEX idx_locations_public_centroid ON destination_locations USING GIST (public_approximate_centroid) 
     WHERE public_approximate_centroid IS NOT NULL;
+CREATE INDEX idx_locations_public_coord_expr ON destination_locations USING GIST (
+    (CASE WHEN is_restricted THEN public_approximate_centroid ELSE coordinates END)
+);
 
 -- B-Tree Administrative Hierarchy Indexes
 CREATE INDEX idx_locations_district ON destination_locations (district);
@@ -321,7 +324,8 @@ CREATE INDEX idx_locations_restricted ON destination_locations (is_restricted);
 #### Geospatial Integrity Guarantees:
 - **`ck_locations_coord_range`**: Validates at the database engine level that the projected longitude (X) falls strictly within `[-180.0, 180.0]` and latitude (Y) falls strictly within `[-90.0, 90.0]`. This prevents inverted coordinate entry or mathematical singularities from corrupting geodetic spatial calculations.
 - **`ck_locations_coord_valid`**: Guarantees that the point geometry conforms to Open Geospatial Consortium (OGC) Simple Features specifications (`ST_IsValid`).
-- **`ck_locations_restricted_centroid`**: Guarantees that any sensitive or restricted site must provide a non-null, publicly safe approximate centroid and geographic display name before it can be persisted.
+- **`ck_locations_restricted_centroid`**: Enforces that any destination flagged as `is_restricted = TRUE` must carry an approved `public_approximate_display_name` (e.g. *"Nilambur Eco-Zone Buffer Area"*). For Tiers 1 and 2 (Approved Gateway or Reviewed Administrative Centroid), `public_approximate_centroid` is populated; for Tier 3 (Coordinate Suppression), `public_approximate_centroid` is explicitly `NULL` to suppress map pin rendering while allowing textual locality presentation.
+- **`idx_locations_public_coord_expr`**: Expression GiST index that indexes the exact coalesced coordinate expression projected by `v_public_destination_locations`, ensuring direct index scans for all public map searches.
 
 ---
 
@@ -615,16 +619,18 @@ Fetch destinations inside the traveler's active interactive map bounding box (`m
 
 ##### A. Technical Breakdown of the `&&` Operator on `GEOGRAPHY(Point, 4326)`
 In PostgreSQL/PostGIS, the `&&` operator is the **2D bounding-box intersection operator**.
-- When applied to `geography`, PostGIS computes geodetic bounding boxes on the WGS 84 ellipsoid and tests overlap against the GiST index (`idx_locations_coordinates`).
-- This test evaluates in sub-millisecond execution time because it discards non-matching rows using bounding-box spatial tree traversal without computing computationally heavy geodetic spherical trigonometric formulas on candidate points.
+- When applied to `geography`, PostGIS computes geodetic bounding boxes on the WGS 84 ellipsoid and tests overlap against the GiST index (`idx_locations_coordinates` or `idx_locations_public_coord_expr`).
+- This test discards non-matching rows using bounding-box spatial tree traversal without computing computationally heavy geodetic spherical trigonometric formulas on candidate points.
 
 ##### B. Handling the 180° Antimeridian (International Date Line)
 When an interactive map spans across the 180° meridian (e.g. Pacific island tourism corridors or global viewports), the viewport's Western boundary has a positive longitude (`min_lng > 0`) while the Eastern boundary has a negative longitude (`max_lng < 0`), resulting in `min_lng > max_lng` (for example, `min_lng = 175.0` and `max_lng = -175.0`).
 - If passed directly to `ST_MakeEnvelope(min_lng, min_lat, max_lng, max_lat, 4326)`, the constructor treats `min_lng` as greater than `max_lng`, creating an inverted envelope that either raises an error or queries the opposite 350° of the globe.
-- **Robust Antimeridian Viewport Query Pattern**: The query dynamically checks if `min_lng > max_lng` and splits the search into two separate valid geodetic envelopes joined by `OR`:
+- **Flaw of Procedural `CASE` in `WHERE`**: Embedding conditional logic inside a SQL `CASE` expression in the `WHERE` clause interferes with the PostgreSQL query optimizer. Because the planner treats `CASE` procedurally, it often fails to push down the spatial predicates into the GiST index, falling back to an unindexed sequential scan (`Seq Scan`) across the entire table.
+- **Index-Friendly Application Dispatch Pattern**: The trusted backend service inspects the bounding coordinates before dispatching the query:
 
 ```sql
--- Production Map Viewport Query with Antimeridian Support & Privacy Masking
+-- Pattern A: Standard Viewport Query (min_lng <= max_lng)
+-- Employs direct GiST Bitmap Index Scan against idx_locations_public_coord_expr
 SELECT 
     d.id,
     d.title,
@@ -638,24 +644,56 @@ SELECT
 FROM destinations d
 JOIN v_public_destination_locations vdl ON vdl.destination_id = d.id
 WHERE d.publication_status = 'published'
+  AND vdl.public_coordinates IS NOT NULL
+  AND vdl.public_coordinates && ST_MakeEnvelope(:min_lng, :min_lat, :max_lng, :max_lat, 4326)::geography
+LIMIT :limit;
+```
+
+```sql
+-- Pattern B: Antimeridian-Crossing Viewport Query (min_lng > max_lng)
+-- Dispatches two valid geodetic envelopes joined by OR, allowing GiST BitmapOr index scans
+SELECT 
+    d.id,
+    d.title,
+    d.slug,
+    vdl.is_restricted,
+    ST_X(vdl.public_coordinates::geometry) AS longitude,
+    ST_Y(vdl.public_coordinates::geometry) AS latitude,
+    vdl.public_locality_name,
+    vdl.district,
+    vdl.state_or_province
+FROM destinations d
+JOIN v_public_destination_locations vdl ON vdl.destination_id = d.id
+WHERE d.publication_status = 'published'
+  AND vdl.public_coordinates IS NOT NULL
   AND (
-    CASE 
-        -- Standard Viewport (Does not cross the 180° meridian)
-        WHEN :min_lng <= :max_lng THEN 
-            vdl.public_coordinates && ST_MakeEnvelope(:min_lng, :min_lat, :max_lng, :max_lat, 4326)::geography
-        -- Antimeridian-Spanning Viewport (min_lng > max_lng)
-        -- Split into Eastern Hemisphere [min_lng .. 180.0] and Western Hemisphere [-180.0 .. max_lng]
-        ELSE (
-            vdl.public_coordinates && ST_MakeEnvelope(:min_lng, :min_lat, 180.0, :max_lat, 4326)::geography
-            OR
-            vdl.public_coordinates && ST_MakeEnvelope(-180.0, :min_lat, :max_lng, :max_lat, 4326)::geography
-        )
-    END
+      vdl.public_coordinates && ST_MakeEnvelope(:min_lng, :min_lat, 180.0, :max_lat, 4326)::geography
+      OR
+      vdl.public_coordinates && ST_MakeEnvelope(-180.0, :min_lat, :max_lng, :max_lat, 4326)::geography
   )
 LIMIT :limit;
 ```
 
-##### C. Application-Level Parameter Validation & Sanitization
+##### C. Execution Plan Verification Protocol via `EXPLAIN (ANALYZE, BUFFERS)`
+To verify that queries utilize the GiST spatial index and minimize disk I/O, developers and DBAs must run execution plan analyses on staging instances loaded with representative data:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT 
+    d.id, d.title, vdl.public_locality_name
+FROM destinations d
+JOIN v_public_destination_locations vdl ON vdl.destination_id = d.id
+WHERE d.publication_status = 'published'
+  AND vdl.public_coordinates IS NOT NULL
+  AND vdl.public_coordinates && ST_MakeEnvelope(75.5, 10.5, 76.5, 11.5, 4326)::geography;
+```
+
+**Plan Verification Criteria**:
+1. **Node Types**: The plan must show `Bitmap Index Scan` on `idx_locations_public_coord_expr` (or `idx_locations_coordinates`) leading to a `Bitmap Heap Scan`. It must **never** show a `Seq Scan` on `destination_locations`.
+2. **Buffer Hit Ratio**: In warm cache scenarios, `Buffers: shared hit` should account for virtually all page reads, with `shared read = 0` or minimal.
+3. **Performance Realism**: Execution durations must never be claimed speculatively in architecture documentation (e.g. "sub-millisecond"). Real-world response times depend directly on table cardinality, spatial density of points in the viewport, disk I/O throughput, available shared memory (`shared_buffers`), and database server concurrency. Benchmarking must occur on representative staging infrastructure.
+
+##### D. Application-Level Parameter Validation & Sanitization
 To prevent denial-of-service through excessive spatial queries or coordinate errors, the application API layer enforces:
 1. **Latitude Clamping**: Latitude must be strictly bounded between `-85.05112878` and `85.05112878` (Web Mercator boundary) or `-90.0` and `90.0` (WGS 84 bounds). Values outside this raise `400 Bad Request`.
 2. **Longitude Normalization**: Longitudes are wrapped/clamped to `[-180.0, 180.0]`.
@@ -666,21 +704,38 @@ To prevent denial-of-service through excessive spatial queries or coordinate err
 
 ### 4.4 Coordinate Privacy & Sensitivity Protection Architecture
 
-Fragile ecosystems (e.g. Kadalundi migratory bird nesting banks, private tribal settlements in Nilambur, defense border zones) must never expose exact GPS coordinates to public discovery queries or client browsers.
+Fragile ecosystems (e.g. Kadalundi migratory bird nesting banks, private tribal settlements in Nilambur, defense border zones) must never expose exact GPS coordinates to public discovery queries, client browsers, or data exports.
 
-#### 1. Public vs. Privileged Access Boundary & PostgreSQL Roles
-Access control is enforced at the database privilege level, not merely in application code:
-- **`app_user` (Standard Application Web Pool)**:
+#### 1. PostgreSQL View Ownership & Access Security Model
+PostgreSQL 15+ supports fine-grained control over view execution semantics. To prevent unauthorized access to restricted coordinates:
+
+- **View Ownership (`schema_owner`)**:
+  The view `v_public_destination_locations` is owned by the trusted database schema role (`schema_owner`), not by the web application role.
+- **Definer Semantics (`security_invoker = false`)**:
+  By default in PostgreSQL, views execute with the privileges of the **view owner** (`security_invoker = false`). This architectural decision is deliberate and necessary:
+  - `schema_owner` possesses `SELECT` privilege on the underlying `destination_locations` table and can execute the coordinate masking logic.
+  - The public application role (`app_user`) has **zero table-level privileges** on `destination_locations`:
+    ```sql
+    -- 1. Strictly revoke all direct table access from public web role
+    REVOKE ALL ON destination_locations FROM PUBLIC, app_user;
+
+    -- 2. Grant SELECT exclusively on the privacy-protecting view
+    GRANT SELECT ON v_public_destination_locations TO app_user;
+
+    -- 3. Set view owner to schema owner
+    ALTER VIEW v_public_destination_locations OWNER TO schema_owner;
+    ```
+  - If `security_invoker = true` were set, PostgreSQL would evaluate underlying table permissions against `app_user`, causing all public queries to fail with `permission denied for relation destination_locations`. Leaving `security_invoker = false` enables the view to serve as a secure privilege gateway.
+- **Row-Level Security (RLS) Interaction**:
+  If Row-Level Security is enabled on `destination_locations`, PostgreSQL enforces that a view with `security_invoker = false` evaluates RLS policies as the view owner (`schema_owner`). Because `schema_owner` is the table owner, it bypasses RLS, ensuring that the view can access all rows to produce the sanitized output. `app_user` remains completely blocked from the underlying table.
+- **Prevention of Side-Channel Leaks & Leaky Functions**:
+  - *No Custom Functions*: `app_user` has `REVOKE CREATE ON SCHEMA public FROM app_user;`, preventing malicious users from defining custom procedural functions that could be evaluated by the query optimizer before the view's projection.
+  - *No Distance-to-Target Probing*: Because `v_public_destination_locations` only projects `public_coordinates`, any spatial calculations executed by `app_user` (such as `ST_Distance`) operate strictly on the public centroid or safe coordinates. It is mathematically impossible to probe distance against the secret exact coordinates.
+- **Privileged Access Pool (`admin_service_role`)**:
+  Internal administrative and curation services connect using a dedicated connection pool authenticated as `admin_service_role`:
   ```sql
-  -- Restrict direct access to sensitive raw coordinates
-  REVOKE SELECT ON destination_locations FROM app_user;
-  -- Grant access strictly to the privacy-protecting view
-  GRANT SELECT ON v_public_destination_locations TO app_user;
-  ```
-- **`admin_service_role` (Privileged Administrative & Curator Pool)**:
-  ```sql
-  -- Privileged role retains direct access for verified GIS curation
   GRANT SELECT, INSERT, UPDATE ON destination_locations TO admin_service_role;
+  GRANT SELECT ON v_public_destination_locations TO admin_service_role;
   ```
 
 #### 2. Public Database View Definition (`v_public_destination_locations`)
@@ -691,6 +746,7 @@ SELECT
     dl.destination_id,
     dl.is_restricted,
     dl.restriction_reason,
+    -- Projected coordinate: returns centroid if restricted, exact if public, or NULL if suppressed
     CASE 
         WHEN dl.is_restricted THEN dl.public_approximate_centroid
         ELSE dl.coordinates
@@ -710,22 +766,42 @@ SELECT
 FROM destination_locations dl;
 ```
 
-#### 3. Approximate Centroid Generation Rules
-When an administrator or curator marks a destination as `is_restricted = TRUE`, the following pipeline rules dictate centroid generation:
-1. **Snapping to Official Visitor Gateway**:
-   The centroid is snapped to an official, publicly accessible access point located outside the sensitive zone (e.g., Forest Department reception counter, eco-tourism ticketing office, designated parking facility, or boat jetty).
-2. **Algorithmic Offset / Gaussian Jitter**:
-   If no official gateway exists, the centroid is generated by applying an intentional Gaussian jitter with a radial displacement between $1.5\text{ km}$ and $3.0\text{ km}$ from the actual site, ensuring exact nesting locations or settlements cannot be triangulated.
-3. **Macro Geographic Labeling**:
-   The `public_approximate_display_name` must reflect a general administrative buffer area (e.g. *"Nilambur Eco-Zone Buffer Area"* or *"Kadalundi Estuary Conservation Area"*) rather than specific micro-coordinates.
-4. **Database Check Constraint**:
-   ```sql
-   CONSTRAINT ck_locations_restricted_centroid CHECK (
-       is_restricted = FALSE OR (public_approximate_centroid IS NOT NULL AND public_approximate_display_name IS NOT NULL)
-   )
-   ```
+#### 3. Restricted-Coordinate Publication Hierarchy (Rejection of Gaussian Jitter)
+The previous proposal to apply automatic pseudo-random Gaussian jitter (e.g. 1.5 to 3.0 km random displacement) is **explicitly rejected** on technical and safety grounds:
+- *Physical Safety Hazards*: Unsupervised algorithmic coordinate displacement can inadvertently place a map pin in a deep gorge, active quarry, river current, cliff face, or private estate, creating life-safety hazards for tourists attempting to navigate there.
+- *Statistical Triangulation Vulnerability*: If randomized jitter were computed dynamically or across multiple exports, an adversary could collect multiple noisy samples and compute their arithmetic mean, mathematically recovering the true sensitive coordinates.
 
-#### 4. Cache, Logging, and Export Safeguards
+Instead, My Travelroad mandates a human-governed **3-Tier Publication Policy**:
+
+```
++----------------------------------------------------------------------------------------------------+
+|                       RESTRICTED SITE COORDINATE PUBLICATION HIERARCHY                             |
++----------------------------------------------------------------------------------------------------+
+| PRIORITY 1: APPROVED OFFICIAL PUBLIC VISITOR ACCESS POINT                                         |
+| - Curated gateway: Forest Dept counter, official parking area, ticketing office, boat jetty.       |
+| - Safe, legally accessible to tourists, located outside the ecological/tribal perimeter.           |
+| - public_approximate_centroid = ST_SetSRID(ST_MakePoint(lng, lat), 4326)::geography               |
++----------------------------------------------------------------------------------------------------+
+                                      | (If no official visitor gateway exists)
+                                      v
++----------------------------------------------------------------------------------------------------+
+| PRIORITY 2: REVIEWED SAFE ADMINISTRATIVE-AREA CENTROID                                             |
+| - Verified administrative buffer: Taluk headquarters, village center, or buffer zone hub.          |
+| - Human-reviewed by curator to ensure it lands in an accessible public town/road location.          |
+| - public_approximate_centroid = Reviewed Centroid; display_name = "Nilambur Buffer Area"           |
++----------------------------------------------------------------------------------------------------+
+                                      | (If neither option is safe or available)
+                                      v
++----------------------------------------------------------------------------------------------------+
+| PRIORITY 3: COMPLETE COORDINATE SUPPRESSION (NO MAP PIN)                                          |
+| - public_approximate_centroid = NULL                                                               |
+| - Map pin is entirely suppressed in UI and API (public_coordinates IS NULL).                       |
+| - Public displays show textual administrative locality only (e.g. "District: Malappuram").         |
++----------------------------------------------------------------------------------------------------+
+```
+
+#### 4. Approval Governance & Uniform Redaction Across Stacks
+- **Curator Approval Responsibility**: Setting coordinates for Tiers 1 and 2 or designating Tier 3 suppression requires human review and sign-off by an authorized curator (`curator` or `super_admin`) during the destination verification workflow.
 - **Application Logging**: Production log formatters must intercept and redact coordinates for restricted entities, replacing raw coordinates with `[REDACTED_SENSITIVE_COORDINATE]`.
 - **Edge CDN & Client Caching**: Cache keys and payloads for public discovery must strictly consume the sanitized view data.
 - **Bulk GeoJSON / CSV Export Endpoints**: Public data export APIs must never query the base `destination_locations` table; exports must strictly project `v_public_destination_locations` to prevent accidental mass leakage of sensitive ecological locations.
@@ -756,58 +832,59 @@ When an administrator or curator marks a destination as `is_restricted = TRUE`, 
 | `destination_verifications` | `verification_records` | 1:N | `verification_id` | **CASCADE** | CASCADE | Audit records belong to the verification container. |
 | `verification_evidence` | `verification_records` | 1:N | `evidence_id` | **SET NULL** | CASCADE | Deleting an evidence document flags records as lacking proof rather than dropping the audit history. |
 
-### Account Deactivation, Tombstone Anonymization & Audit Retention Workflow
+### Account Deactivation, Tombstone Anonymization & Audit Retention Lifecycle
 
-#### The Integrity Conflict: Cascading Deletion vs. Restrictive Audit Foreign Keys
-A fundamental tension exists in production database architectures between **user privacy rights (GDPR/Right to Erasure)** and **regulatory compliance / non-repudiation (Audit Trail Integrity)**:
+#### 1. The Conflict: Cascading User Deletion vs. Restrictive Audit Foreign Keys
+A fundamental tension exists in production database architectures between **user privacy rights (GDPR Art. 17 Right to Erasure)** and **regulatory compliance / non-repudiation (Audit Trail Integrity)**:
 - Cascading deletion (`ON DELETE CASCADE`) is configured on `accounts -> tourist_profiles`, `accounts -> account_security_credentials`, and `accounts -> saved_destinations`.
 - Restrictive deletion (`ON DELETE RESTRICT`) is configured on `accounts -> audit_logs`, `accounts -> verification_evidence`, and `accounts -> verification_records`.
 - If an account has ever performed an audited event (e.g. curator approvals, admin setting changes, contributor submissions), executing `DELETE FROM accounts WHERE id = :id` will immediately fail with a foreign key constraint violation.
 
-#### Architectural Resolution: The Tombstone Anonymization Pattern
-Rather than breaking audit foreign keys with nullable columns (`SET NULL`), which would permanently destroy accountability provenance, My Travelroad enforces a two-tier **Deactivation and Anonymization Pipeline**:
+#### 2. The Comprehensive PII Reality in Historical Audit Logs
+A naïve tombstone pattern that only scrubs the `accounts` and `tourist_profiles` tables is legally and technically defective if historical audit records still store personal data. The red-team audit identified six potentially identifying vectors in `audit_logs`:
+1. **`actor_email`**: Plaintext corporate or personal email addresses stored on every audited action.
+2. **`ip_address`**: Client IP addresses (classified as personal data under CJEU *Breyer* ruling).
+3. **`user_agent`**: Device and browser fingerprints.
+4. **`previous_state_snapshot` (JSONB)**: Historical state snapshots containing plaintext personal data (`email`, `phone`, `display_name`, `bio`, `avatar_url`).
+5. **`new_state_snapshot` (JSONB)**: Updated state snapshots containing the same personal data.
+6. **`context_notes`**: Free-text operational notes that may reference names, phone numbers, or email addresses.
+
+#### 3. Legally Grounded 3-Phase Retention & Erasure Lifecycle
+Under GDPR Article 5(1)(e) (Storage Limitation) and Article 6(1)(f) (Legitimate Interest), personal telemetry cannot be retained indefinitely under the blanket guise of "audit logging." My Travelroad enforces a structured lifecycle:
 
 ```
 +----------------------------------------------------------------------------------------------------+
-|                                ACCOUNT DELETION WORKFLOW                                           |
+|                                ACCOUNT LIFECYCLE & RETENTION SCHEDULE                              |
 +----------------------------------------------------------------------------------------------------+
-| 1. USER REQUESTS ACCOUNT DELETION                                                                 |
-|    - Immediate soft-deactivation (status = 'deactivated', is_public = false)                       |
-|    - 30-day grace period initiated                                                                |
+| PHASE 1: ACTIVE OPERATIONAL SECURITY (0 - 90 DAYS)                                                 |
+| - Full telemetry retained: ip_address, user_agent, actor_email, snapshots.                         |
+| - Legal Basis: Legitimate interest in cybersecurity, anti-abuse, and fraud forensics (Recital 49). |
 +----------------------------------------------------------------------------------------------------+
                                       |
-                                      v
+                                      v (Automated daily scheduled batch job)
 +----------------------------------------------------------------------------------------------------+
-| 2. GRACE PERIOD EXPIRES -> EVALUATE ACCOUNT AUDIT HISTORY                                         |
+| PHASE 2: TELEMETRY TRUNCATION (> 90 DAYS)                                                          |
+| - Automated background task truncates sensitive telemetry for all audit logs older than 90 days:   |
+|   ip_address -> NULL; user_agent -> 'Anonymized-Client-Telemetry'                                  |
+| - Core audit provenance (who did what to which entity) is preserved without network fingerprints.  |
 +----------------------------------------------------------------------------------------------------+
-         |                                                                    |
-  HAS AUDIT LOGS OR VERIFICATION RECORDS                              ZERO AUDIT / VERIFICATION RECORDS
-         |                                                                    |
-         v                                                                    v
-+----------------------------------------------------+             +---------------------------------+
-| TOMBSTONE ANONYMIZATION APPLIED                   |             | HARD CASCADE DELETE EXECUTED    |
-| - Scrub accounts.email -> 'deleted_<uuid>@anon'   |             | DELETE FROM accounts            |
-| - Scrub accounts.phone -> NULL                     |             | WHERE id = :id;                 |
-| - Scrub tourist_profiles PII                       |             | (Completely purges account,     |
-| - DELETE FROM account_security_credentials         |             |  credentials, profile, saved)   |
-| - DELETE FROM saved_destinations                   |             +---------------------------------+
-| - Retain accounts UUID as immutable tombstone      |
-| - audit_logs & verification_records retain         |
-|   valid FK references with zero retained PII!      |
-+----------------------------------------------------+
+                                      |
+                                      v (Upon confirmed user account deletion request)
++----------------------------------------------------------------------------------------------------+
+| PHASE 3: RIGHT-TO-ERASURE & TOMBSTONE EXECUTION                                                    |
+| - 30-day recovery grace period expires.                                                            |
+| - IF zero audit/verification records: Physical cascade purge (DELETE FROM accounts).                |
+| - IF historical audit/verification records exist: Atomic Tombstone Anonymization Job executed.      |
++----------------------------------------------------------------------------------------------------+
 ```
 
-##### 1. Stage 1: Soft Deactivation (Grace Period)
-- Sets `accounts.status = 'deactivated'` and `tourist_profiles.is_public = FALSE`.
-- Revokes all active JSON Web Tokens (JWTs) and authentication session tokens.
-- Account is hidden from public discovery, search indices, and curator queues.
+#### 4. The Atomic Tombstone Anonymization & PII Sanitization Job
+When an account with historical audit or verification records is erased, an automated administrative job executes the following atomic transaction:
 
-##### 2. Stage 2: Anonymization Execution (Right to Erasure)
-For accounts with associated audit or verification records, an automated background job executes the following atomic SQL transaction:
 ```sql
 BEGIN;
 
--- 1. Anonymize accounts table (scrub PII while preserving UUID key and format check)
+-- 1. Anonymize accounts table (scrub PII while preserving UUID key and email format constraint)
 UPDATE accounts 
 SET 
     email = 'deleted_' || id || '@anonymized.mytravelroad.local',
@@ -831,28 +908,58 @@ SET
     updated_at = CURRENT_TIMESTAMP
 WHERE account_id = :target_account_id;
 
--- 3. Permanently purge authentication secrets (passwords, MFA secrets)
+-- 3. Permanently purge authentication secrets (passwords, MFA secrets, lockouts)
 DELETE FROM account_security_credentials WHERE account_id = :target_account_id;
 
 -- 4. Permanently purge private bookmarks and wishlists
 DELETE FROM saved_destinations WHERE account_id = :target_account_id;
 
--- 5. Record irreversible anonymization event in audit log
+-- 5. Anonymize historical audit log actor identities and truncate immediate telemetry
+UPDATE audit_logs
+SET 
+    actor_email = 'deleted_' || actor_account_id || '@anonymized.mytravelroad.local',
+    ip_address = NULL,
+    user_agent = 'Erased-Client-Telemetry'
+WHERE actor_account_id = :target_account_id;
+
+-- 6. Sanitize JSONB State Snapshots across audit_logs
+-- Strips all personal keys from JSONB snapshots where this account was the target entity
+UPDATE audit_logs
+SET 
+    previous_state_snapshot = CASE 
+        WHEN previous_state_snapshot IS NOT NULL THEN 
+            (previous_state_snapshot - 'email' - 'phone' - 'display_name' - 'bio' - 'avatar_url' - 'home_region')
+            || '{"_erasure_redacted": true}'::jsonb
+        ELSE NULL 
+    END,
+    new_state_snapshot = CASE 
+        WHEN new_state_snapshot IS NOT NULL THEN 
+            (new_state_snapshot - 'email' - 'phone' - 'display_name' - 'bio' - 'avatar_url' - 'home_region')
+            || '{"_erasure_redacted": true}'::jsonb
+        ELSE NULL 
+    END,
+    context_notes = 'Operational context redacted upon GDPR Right-to-Erasure compliance.'
+WHERE (entity_type IN ('account', 'tourist_profile') AND entity_id = :target_account_id::text)
+   OR (actor_account_id = :target_account_id);
+
+-- 7. Record an irreversible system tombstone event with ZERO personal data
 INSERT INTO audit_logs (
     actor_account_id, actor_email, actor_role, 
-    action, entity_type, entity_id, context_notes
+    ip_address, user_agent, action, entity_type, entity_id, 
+    previous_state_snapshot, new_state_snapshot, context_notes
 ) VALUES (
-    :target_account_id, 'system@mytravelroad.local', 'system',
-    'account_anonymized_tombstone', 'account', :target_account_id::text,
-    'GDPR Right-to-Erasure executed. All PII scrubbed; tombstone preserved for audit non-repudiation.'
+    :target_account_id, 'system@anonymized.mytravelroad.local', 'system',
+    NULL, 'System-Sanitizer', 'account_anonymized_tombstone', 'account', :target_account_id::text,
+    NULL, '{"tombstone_applied": true}'::jsonb,
+    'GDPR Right-to-Erasure executed. All PII, credentials, wishlists, and JSON snapshots sanitized.'
 );
 
 COMMIT;
 ```
 
-##### 3. Retention Guarantees
-- **Traveler Privacy**: All names, email addresses, phone numbers, avatars, bios, wishlists, and passwords are permanently destroyed.
-- **Audit Non-Repudiation**: `audit_logs` and `verification_records` retain valid foreign keys. An auditor can confirm that a verification action was certified by a former staff member with role `curator` on date $T$, without storing the former staff member's personal identity.
+#### 5. Verification Records & Evidence Retention
+- **`verification_records`**: Retains the certified audit stamp (`field`, `status`, `confidence_level`, `valid_until`, `timestamp`) and the certified fact SHA-256 hash. The `verified_by` column points to the tombstone UUID. This ensures an auditor can prove that field $F$ was certified by a qualified staff member at time $T$, without retaining the former employee's personal contact details.
+- **`verification_evidence`**: Official documents (government gazettes, DTPC circulars, forest department survey maps) are public administrative records and remain permanently retained. If any evidence item contained personal employee badges or IDs, the underlying asset is scrubbed from secure storage and replaced with an administrative redaction flag.
 
 ---
 
@@ -1068,8 +1175,9 @@ Indexes accelerate lookups but incur storage overhead and slow down insert/updat
 | `destinations` | `idx_destinations_status` | B-tree | `publication_status` | Filters out non-published drafts in public discovery queries. |
 | `destinations` | `idx_destinations_primary_cat` | B-tree | `primary_category_id` | Category-specific destination listings (`/categories/[slug]`). |
 | `destinations` | `idx_destinations_published_featured` | B-tree (Partial) | `(publication_status, featured_rank)` | Accelerates homepage hero showcases: `WHERE publication_status = 'published' AND featured_rank IS NOT NULL`. |
-| `destination_locations` | `idx_locations_coordinates` | **GiST** | `coordinates` | Spatial index powering `ST_DWithin` proximity and bounding-box `&&` viewport queries. |
+| `destination_locations` | `idx_locations_coordinates` | **GiST** | `coordinates` | Spatial index powering `ST_DWithin` proximity queries on exact coordinates. |
 | `destination_locations` | `idx_locations_public_centroid` | **GiST** (Partial) | `public_approximate_centroid` | Spatial index for approximate public centroids when coordinates are restricted. |
+| `destination_locations` | `idx_locations_public_coord_expr` | **GiST** | `(CASE WHEN is_restricted THEN public_approximate_centroid ELSE coordinates END)` | Direct GiST index scan on the coalesced public coordinate projection evaluated by `v_public_destination_locations`. |
 | `destination_locations` | `idx_locations_state_country` | B-tree (Composite) | `(country_code, state_or_province, district)` | Regional filtering as platform expands from Malappuram to Kerala, India, and global. |
 | `destination_locations` | `idx_locations_taluk` | B-tree | `taluk_or_subdivision` | Sub-district filtering (e.g. 'Nilambur', 'Tirur', 'Eranad'). |
 | `destination_media` | `idx_media_single_cover` | B-tree (Partial Unique) | `destination_id WHERE is_cover = TRUE` | Enforces and instantly resolves the single cover photo per destination. |
@@ -1101,49 +1209,92 @@ Indexes accelerate lookups but incur storage overhead and slow down insert/updat
 
 ### 8.2 Role and Privilege Escalation Prevention
 
-#### Role Hierarchy & Invariants
-My Travelroad enforces five explicit roles defined in the domain architecture:
-`traveler` $\rightarrow$ `contributor` $\rightarrow$ `curator` $\rightarrow$ `moderator` $\rightarrow$ `super_admin`
+#### 1. Why Session-Variable Checks (`current_setting`) Are Insecure
+The red-team review correctly flagged a critical vulnerability in the previous proposal: trusting `current_setting('app.current_actor_role', true)`.
+- In PostgreSQL, custom configuration settings (GUCs) with prefixes like `app.*` are not restricted to superusers. Any database session can execute:
+  ```sql
+  SET LOCAL app.current_actor_role = 'super_admin';
+  -- OR
+  SELECT set_config('app.current_actor_role', 'super_admin', false);
+  ```
+- If an attacker exploits an SQL injection vulnerability or compromises a server running with the standard application role, they can easily forge this session variable within their transaction prior to executing the `UPDATE`.
+- **Core Security Rule**: A database trigger checking a user-writable session variable does **not** constitute a trusted authorization boundary.
 
-- **Ordinary Traveler Invariant**: Ordinary users signing up or updating their profile can never assign or elevate their own role. Self-registration defaults strictly to `role = 'traveler'`.
-- **Server-Side Authorization**: Modifying an account's role requires explicit administrative privilege check (`super_admin` authorization) in the trusted server-side API.
-- **Mandatory Audit Logging**: Every role transition triggers an immediate, immutable entry in `audit_logs` capturing `actor_account_id`, `actor_role`, `previous_state_snapshot`, `new_state_snapshot`, and client IP.
+#### 2. Architectural Boundary: Application vs. Database Authorization
+My Travelroad enforces a strict defense-in-depth separation:
+- **Application Authorization (Business Logic)**:
+  - The API tier authenticates the user's session (verifying JWT / cryptographically signed session cookie).
+  - It validates multi-factor authentication (MFA) and confirms that `actor.role === 'super_admin'`.
+  - Only authenticated super-admin requests are routed to the privileged administrative service.
+- **Database Authorization (Engine Enforcement)**:
+  - Database-level security does not rely on application compliance or session variables.
+  - The database engine itself enforces column-level privileges so that the standard web application pool (`app_user`) physically lacks the SQL permission to modify the `role` column.
 
-#### Database-Level Role Guard Trigger
-To guarantee defense-in-depth even if an application SQL injection or ORM vulnerability attempts to execute an unauthorized role update, PostgreSQL enforces a role-elevation trigger:
+#### 3. Database Privilege Configuration & Role Separation
 
 ```sql
--- Role Elevation Guard Trigger
-CREATE OR REPLACE FUNCTION trg_guard_account_role_elevation()
+-- ==============================================================================
+-- DATABASE PRIVILEGE MATRIX: ROLE ELEVATION PROTECTION
+-- ==============================================================================
+
+-- 1. Standard Web Application Role (app_user)
+-- Can read/write regular entities, but strictly barred from role updates
+REVOKE UPDATE ON accounts FROM app_user;
+GRANT UPDATE (email, phone, status, last_login_at, updated_at) ON accounts TO app_user;
+-- Any query like: UPDATE accounts SET role = 'super_admin' executed by app_user
+-- will be immediately halted by PostgreSQL: ERROR: permission denied for column "role"
+
+-- 2. Privileged Administrative Service Role (admin_service_role)
+-- Used exclusively by internal administrative workers / server actions
+GRANT UPDATE (role, status, updated_at) ON accounts TO admin_service_role;
+```
+
+#### 4. Immutable Role Change Audit Trigger
+To ensure non-repudiation whenever an authorized role elevation is executed by `admin_service_role`, an `AFTER UPDATE` trigger automatically records the transition in `audit_logs`:
+
+```sql
+CREATE OR REPLACE FUNCTION trg_audit_account_role_change()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- Check if role is being modified
     IF NEW.role IS DISTINCT FROM OLD.role THEN
-        -- Verify that the session has explicit super_admin context set by trusted backend
-        IF current_setting('app.current_actor_role', true) IS DISTINCT FROM 'super_admin' THEN
-            RAISE EXCEPTION 'Security Violation: Account role modification requires super_admin authorization. Attempted transition: % -> %', 
-                OLD.role, NEW.role;
-        END IF;
+        INSERT INTO audit_logs (
+            actor_account_id,
+            actor_email,
+            actor_role,
+            action,
+            entity_type,
+            entity_id,
+            previous_state_snapshot,
+            new_state_snapshot,
+            context_notes
+        ) VALUES (
+            -- Actor ID captured from authenticated session context or fallback to system
+            COALESCE(NULLIF(current_setting('app.actor_account_id', true), '')::uuid, NEW.id),
+            COALESCE(NULLIF(current_setting('app.actor_email', true), ''), 'admin_service@mytravelroad.local'),
+            'super_admin',
+            'account_role_elevated',
+            'account',
+            NEW.id::text,
+            jsonb_build_object('role', OLD.role),
+            jsonb_build_object('role', NEW.role),
+            'Role modified via admin_service_role authorization.'
+        );
     END IF;
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 
-CREATE TRIGGER trg_check_account_role_elevation
-BEFORE UPDATE OF role ON accounts
-FOR EACH ROW EXECUTE FUNCTION trg_guard_account_role_elevation();
+CREATE TRIGGER trg_audit_account_role_elevation
+AFTER UPDATE OF role ON accounts
+FOR EACH ROW EXECUTE FUNCTION trg_audit_account_role_change();
 ```
 
-#### PostgreSQL Connection Role Separation
-Database users are separated by operational privilege boundaries:
-- **`app_user` (Standard Application Web Pool)**:
-  - Connects web and mobile API instances.
-  - Can read, insert, and update user records, destinations, and media.
-  - `REVOKE UPDATE (role) ON accounts FROM app_user;` (Direct role modification blocked at the database engine level).
-  - `REVOKE SELECT ON destination_locations FROM app_user;` (Must read from `v_public_destination_locations`).
-- **`admin_service_role` (Privileged Administrative Service Pool)**:
-  - Used exclusively by internal administrative back-office microservices or server actions.
-  - Authorized to execute role modifications and access raw GIS tables after verifying multi-factor super-admin sessions.
+#### 5. Assumptions and Limitations
+1. **Connection Pool Isolation**: This model assumes that standard web traffic connects via the `app_user` database pool, while administrative workflows connect via a separate, authenticated `admin_service_role` pool. If both services share credentials or connect as the database owner, database authorization boundaries are collapsed.
+2. **No Role Inheritance**: `app_user` must not be granted `admin_service_role`, `postgres`, or `SUPERUSER`.
+3. **Infrastructure Controls**: Direct database administration (e.g. by DBAs) requires audited cloud IAM access, as PostgreSQL superusers naturally bypass column-level grant checks.
+
+---
 
 ### 8.3 Audit Log Immutability
 To guarantee compliance with regulatory audit standards:
@@ -1165,12 +1316,19 @@ BEFORE UPDATE OR DELETE ON audit_logs
 FOR EACH ROW EXECUTE FUNCTION trg_prevent_audit_log_mutation();
 ```
 
+---
+
 ### 8.4 Coordinate Redaction for Sensitive Sites
-- **Fragile Zones**: Sites flagged with `is_restricted = TRUE` represent protected wilderness, migratory nesting corridors, sacred tribal areas, or defense boundaries.
-- **Engine Enforcement**: `CONSTRAINT ck_locations_restricted_centroid` requires non-null public approximate centroid coordinates and a public display name.
-- **View Masking**: All public discovery queries read from `v_public_destination_locations`, projecting only the approximate centroid and hiding exact GPS coordinates.
-- **Application Redaction**: Production logging libraries redact coordinate attributes for restricted destinations, logging `[REDACTED_COORDINATES]`.
-- **Export Scrubbing**: Public GeoJSON and CSV download routines query only the public sanitized view.
+- **3-Tier Publication Hierarchy**:
+  1. *Priority 1*: Approved Official Visitor Access Point (parking, check-post, ticketing desk).
+  2. *Priority 2*: Reviewed Safe Administrative Centroid (taluk or forest range buffer center).
+  3. *Priority 3*: Complete Map Pin Suppression (`public_approximate_centroid = NULL`; text locality only).
+- **Rejection of Algorithmic Jitter**: Automatic pseudo-random Gaussian jitter is barred due to physical tourist hazard risks and mathematical triangulation vulnerabilities.
+- **Engine Enforcement**: `CONSTRAINT ck_locations_restricted_centroid` enforces that restricted sites carry an approved public display name, while permitting null centroids for Tier 3 suppression.
+- **View Masking**: All public discovery queries read from `v_public_destination_locations`, projecting only approved public centroids or returning `NULL` for suppressed sites. Raw coordinates are never exposed to `app_user`.
+- **Application & Export Redaction**: Application log formatters redact coordinates for restricted entities (`[REDACTED_COORDINATES]`), and public CSV/GeoJSON exports query only the sanitized view.
+
+---
 
 ### 8.5 Private Saved Destinations
 - Saved destinations belong strictly to the owning account.
@@ -1181,14 +1339,19 @@ FOR EACH ROW EXECUTE FUNCTION trg_prevent_audit_log_mutation();
 
 ## 9. Deletion and Data Retention Policies
 
-| Entity | Deletion Policy | Retention Duration | Cascade / Purge Behavior |
-| :--- | :--- | :--- | :--- |
-| **`accounts`** | Soft-deactivation initially (`status = 'deactivated'`), Tombstone Anonymization upon GDPR/Erasure request (or Hard-delete if 0 audit/verification records). | 30-day grace period, then permanent scrub. | Cascades to purge `account_security_credentials` and `saved_destinations`. Scrubs all PII from `tourist_profiles` and `accounts`. Preserves anonymous UUID tombstone referencing `audit_logs` and `verification_records`. |
-| **`destinations`** | Soft-archive (`publication_status = 'archived'`). Hard deletion restricted to draft cleanup. | Indefinite archival for historical URLs (returns 410 Gone or redirection). | Cascades to `destination_locations`, `destination_media`, `destination_opening_hours`, `destination_verifications`, `destination_secondary_categories`. |
-| **`destination_media`** | Soft-archive (`status = 'rejected'`), Hard deletion for unreferenced files. | 90 days in rejected status before storage garbage collection. | Associated cloud storage blobs deleted via asynchronous background sweep. |
-| **`verification_records`** | Append-only. Never deleted. | Permanent. | Maintains complete audit history of fact updates and drift detection over time. |
-| **`audit_logs`** | Append-only. Immutable. | 7 years minimum for administrative accountability. | Table-level permissions revoke `DELETE` and `UPDATE`. Database trigger raises exception on mutation attempts. |
-| *(Future Phase: `moderation_records`)* | Append-only. | 5 years for legal compliance. | Permanent record of moderator and curator actions on user-generated content. |
+### 9.1 Legally Grounded Retention Schedule
+
+| Entity / Data Category | Data Fields / Attributes | Lawful Basis (GDPR / Data Protection) | Active Retention Duration | Anonymization, Truncation & Purge Mechanism |
+| :--- | :--- | :--- | :--- | :--- |
+| **`accounts` (Active Profile)** | `email`, `phone`, `status`, `role` | GDPR Art. 6(1)(b) (Contract Performance) | Duration of active account + 30-day deletion grace period. | Anonymized to `deleted_<uuid>@anonymized.mytravelroad.local`, phone scrubbed, status set to `deactivated`. |
+| **`account_security_credentials`** | `password_hash`, `mfa_secret_encrypted`, lockouts | GDPR Art. 6(1)(b) (Security of Processing) | Duration of active account. | **Hard-deleted** immediately upon deletion request execution. |
+| **`tourist_profiles`** | `display_name`, `handle`, `avatar_url`, `bio`, `preferences` | GDPR Art. 6(1)(a) (Consent / Profile) | Duration of active account. | Scrubbed to generic `Former Traveler`, avatar/bio purged, preferences cleared. |
+| **`saved_destinations`** | `(account_id, destination_id)`, personal notes | GDPR Art. 6(1)(a) (User Feature) | Duration of active account. | **Hard-deleted** via cascade upon account deletion execution. |
+| **`audit_logs` (Security Telemetry)** | `ip_address`, `user_agent` | GDPR Art. 6(1)(f) (Legitimate Interest: Abuse defense) | **90 days** from event timestamp. | Truncated to `NULL` / generic telemetry string via daily automated maintenance job. |
+| **`audit_logs` (Administrative Provenance)** | `actor_role`, `action`, `entity_type`, `entity_id`, `timestamp` | GDPR Art. 6(1)(c) (Legal Obligation: Non-repudiation) | **7 years** for regulatory accountability. | Preserved permanently. Historical actor email replaced with anonymous tombstone alias; JSON snapshots stripped of PII. |
+| **`verification_records`** | `field`, `status`, `hash`, `timestamp`, `verified_by` | Tourism Data Integrity & Factual Accuracy | **Permanent**. | Certified fact stamps preserved. `verified_by` references the anonymous staff tombstone UUID. |
+| **`verification_evidence`** | Government gazettes, circulars, official survey maps | Public Information & Administrative Record | **Permanent**. | Public official citations preserved. Personal employee identification documents scrubbed. |
+| **`destinations`** | Title, description, operational schedule, gallery | Platform Content | Indefinite archival (`archived` status) for historical URLs. | Soft-archived to preserve URL integrity and search indexing history. |
 
 ---
 
@@ -1200,14 +1363,14 @@ FOR EACH ROW EXECUTE FUNCTION trg_prevent_audit_log_mutation();
 
 ### Phase 2: Taxonomy & Destination Structure
 3. Provision `destination_categories` with self-referencing hierarchy.
-4. Provision `destinations`, `destination_secondary_categories`, `destination_locations` with PostGIS `GEOGRAPHY(Point, 4326)`, coordinate range constraints (`ck_locations_coord_range`, `ck_locations_coord_valid`), and GiST spatial indexes.
+4. Provision `destinations`, `destination_secondary_categories`, `destination_locations` with PostGIS `GEOGRAPHY(Point, 4326)`, coordinate range constraints (`ck_locations_coord_range`, `ck_locations_coord_valid`), GiST spatial index (`idx_locations_coordinates`), and expression GiST index (`idx_locations_public_coord_expr`).
 5. Provision `destination_media` and `destination_opening_hours`.
 
 ### Phase 3: Verification & Audit Layer (Stage A Completion)
 6. Provision `destination_verifications`, `verification_evidence`, `verification_records`.
 7. Provision `saved_destinations` and `audit_logs`.
-8. Apply immutability triggers (`trg_audit_logs_immutable`), role guard triggers (`trg_check_account_role_elevation`), and public views (`v_public_destination_locations`).
-9. Configure PostgreSQL database roles (`app_user` vs. `admin_service_role`).
+8. Apply immutability triggers (`trg_audit_logs_immutable`), role audit triggers (`trg_audit_account_role_elevation`), and public views (`v_public_destination_locations`).
+9. Configure PostgreSQL database roles (`app_user` vs. `admin_service_role`) and column-level update privileges.
 
 ### Phase 4: Social & UGC Moderation Expansion (Future Phase Milestone)
 10. Provision `business_profiles`, `community_posts`, `destination_reviews`, `user_reports`, and `moderation_records`.
@@ -1356,3 +1519,7 @@ CREATE INDEX idx_reports_status ON user_reports (status);
 ### 12.5 Argon2id Memory Footprint vs. Server Concurrency
 - **Decision**: RFC 9106 recommended parameters ($m = 64\text{ MiB}$, $t = 3$, $p = 4$).
 - **Trade-Off**: A 64 MiB RAM requirement per hashing operation provides state-of-the-art resistance to GPU/ASIC brute-force cracking. On a standard backend server with 4 GB to 8 GB RAM, it allows handling 30 to 50 concurrent login operations without memory pressure. Rate-limiting login endpoints (e.g. max 5 attempts/min per IP) prevents malicious denial-of-service memory exhaustion.
+
+### 12.6 PostgreSQL View Security: Definer Views (`security_invoker = false`) vs. Invoker Views
+- **Decision**: Maintain standard PostgreSQL view-owner execution semantics (`security_invoker = false`) with ownership assigned to `schema_owner`.
+- **Trade-Off**: In PostgreSQL 15+, setting `security_invoker = true` forces permission checks against the calling role (`app_user`). Because `app_user` must be strictly forbidden from accessing raw coordinates on `destination_locations`, setting `security_invoker = true` would cause all public map queries to fail with permission errors. Definer views allow `schema_owner` to read the base table, apply the 3-tier coordinate masking logic, and return only sanitized data, while `app_user` has zero table-level read privileges.
