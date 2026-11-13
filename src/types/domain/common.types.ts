@@ -36,23 +36,34 @@ export type IsoDateTimeString = string;
 export type CountryCode = string;
 
 /**
- * Standard WGS 84 geographic coordinate point structured for future PostGIS integration.
- * In PostGIS, coordinates are indexed as POINT(longitude latitude) with SRID 4326.
+ * Canonical PostGIS / GeoJSON WGS 84 geographic coordinate pair.
+ * In RFC 7946 GeoJSON and PostGIS Point geometry (SRID 4326), coordinates
+ * strictly follow axis order: [longitude, latitude] (X = Easting, Y = Northing).
+ *
+ * Labeled tuple element names provide clear compiler typing and IDE autocomplete:
+ * - coordinates[0]: Longitude (-180.0 to 180.0)
+ * - coordinates[1]: Latitude (-90.0 to 90.0)
+ */
+export type GeoCoordinates = [longitude: number, latitude: number];
+
+/**
+ * Standard WGS 84 geographic location point with canonical PostGIS coordinates
+ * and optional physical survey metadata.
+ *
+ * Eliminates duplicate latitude/longitude storage to guarantee data consistency.
  */
 export interface GeoPoint {
-  /** WGS 84 Latitude in decimal degrees (-90.0 to 90.0). */
-  latitude: number;
-  /** WGS 84 Longitude in decimal degrees (-180.0 to 180.0). */
-  longitude: number;
+  /**
+   * Canonical PostGIS / GeoJSON coordinate pair: [longitude, latitude].
+   * Single source of truth for location coordinates.
+   */
+  coordinates: GeoCoordinates;
+
   /** Optional elevation above mean sea level in meters. */
   altitudeMeters?: number | null;
-  /** Accuracy radius in meters when recorded via field GPS. */
+
+  /** GPS accuracy radius in meters when recorded via field survey. */
   accuracyMeters?: number | null;
-  /**
-   * PostGIS-ready coordinate tuple: [longitude, latitude].
-   * Standard GeoJSON and PostGIS Point geometry order.
-   */
-  postGisPoint: [longitude: number, latitude: number];
 }
 
 /**
@@ -73,8 +84,7 @@ export interface CoordinateSensitivity {
     | null;
   /** Approximate public centroid shown on maps when exact coordinates are restricted. */
   publicApproximateCentroid?: {
-    latitude: number;
-    longitude: number;
+    coordinates: GeoCoordinates;
     displayName: string;
   } | null;
 }

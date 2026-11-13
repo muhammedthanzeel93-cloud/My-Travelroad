@@ -112,8 +112,8 @@ The domain architecture addresses several key tourism requirements:
   - primaryCategoryId: CategoryId (Foreign Key, Exactly 1)
   - secondaryCategoryIds: CategoryId[] (Many-to-many associations)
   - location: DestinationLocation (Embedded value object)
-      * coordinates: GeoPoint (latitude, longitude, altitude, postGisPoint [lng, lat])
-      * sensitivity: CoordinateSensitivity (isRestricted, publicApproximateCentroid)
+      * coordinates: GeoPoint (coordinates: GeoCoordinates [longitude, latitude], altitudeMeters?, accuracyMeters?)
+      * sensitivity: CoordinateSensitivity (isRestricted, publicApproximateCentroid: { coordinates: [longitude, latitude], displayName })
       * formattedAddress: string
       * locality?: string | null (Town / village / panchayat)
       * talukOrSubdivision: string (e.g., 'Nilambur', 'Tirur', 'Eranad')
@@ -388,21 +388,36 @@ erDiagram
 
 ## 6. PostGIS Geospatial Readiness & Privacy
 
-### Coordinate Structure
-Every `DestinationLocation` includes:
-- `latitude` (IEEE 754 float, ±90.0)
-- `longitude` (IEEE 754 float, ±180.0)
-- `altitudeMeters` (optional elevation above sea level)
-- `postGisPoint`: `[longitude, latitude]` standard tuple, mapped to:
-  ```sql
-  -- Future PostGIS mapping:
-  ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography
-  ```
+### Canonical Coordinate Representation
+Geographic coordinates are canonically modeled as a labeled tuple `GeoCoordinates`:
+`[longitude: number, latitude: number]`
+
+This strictly follows RFC 7946 GeoJSON and PostGIS Point geometry standard axis order: `X` (Easting / Longitude), `Y` (Northing / Latitude) with SRID 4326.
+
+By eliminating duplicate standalone `latitude` and `longitude` fields alongside the tuple, the data model guarantees consistency and prevents internal coordinate drift. Optional physical survey metadata (`altitudeMeters`, `accuracyMeters`) is preserved in `GeoPoint`:
+
+```typescript
+export type GeoCoordinates = [longitude: number, latitude: number];
+
+export interface GeoPoint {
+  /** Canonical PostGIS / GeoJSON coordinate pair: [longitude, latitude]. */
+  coordinates: GeoCoordinates;
+  /** Optional elevation above mean sea level in meters. */
+  altitudeMeters?: number | null;
+  /** GPS accuracy radius in meters when recorded via field survey. */
+  accuracyMeters?: number | null;
+}
+```
+
+```sql
+-- Direct PostGIS mapping from canonical GeoCoordinates tuple:
+ST_SetSRID(ST_MakePoint(coordinates[0], coordinates[1]), 4326)::geography
+```
 
 ### Privacy & Ecological Protection
 Certain locations (e.g. vulnerable breeding sites at Kadalundi, sensitive forest settlements in Nilambur, sacred groves) require coordinate masking:
 - `isRestricted: true` in `CoordinateSensitivity`.
-- Public discovery APIs return `publicApproximateCentroid` (e.g., the nearest district road junction or ticketing counter) instead of raw coordinates.
+- Public discovery APIs return `publicApproximateCentroid` (containing approximate `coordinates: GeoCoordinates` and a `displayName`) instead of raw coordinates.
 - Full coordinates are only visible to authorized forest rangers or verified research curators.
 
 ---

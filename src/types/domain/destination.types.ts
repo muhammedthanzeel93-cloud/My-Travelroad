@@ -89,7 +89,7 @@ export interface DestinationMedia {
  * to statewide Kerala districts, all Indian states, and international destinations.
  */
 export interface DestinationLocation {
-  /** Exact WGS 84 coordinate point with PostGIS tuple. */
+  /** Exact WGS 84 coordinate point with canonical PostGIS [longitude, latitude] coordinates. */
   coordinates: GeoPoint;
 
   /** Coordinate sensitivity and privacy controls for restricted/fragile ecosystems. */
