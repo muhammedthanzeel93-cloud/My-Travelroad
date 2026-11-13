@@ -87,6 +87,46 @@ CREATE TABLE accounts (
 CREATE UNIQUE INDEX idx_accounts_email_lower ON accounts (LOWER(email));
 CREATE INDEX idx_accounts_status ON accounts (status);
 CREATE INDEX idx_accounts_role ON accounts (role);
+
+-- ==============================================================================
+-- ROOT SYSTEM ACCOUNT SPECIFICATION & IMMUTABILITY TRIGGER
+-- ==============================================================================
+-- A deterministic root system identity is provisioned during migration:
+-- UUID:   '00000000-0000-4000-8000-000000000001'
+-- Email:  'system-internal@mytravelroad.local'
+-- Type:   'system'
+-- Role:   'super_admin'
+-- Status: 'active'
+--
+-- Security Profile & Invariants:
+-- 1. Satisfies Foreign Key: Satisfies fk_audit_actor (audit_logs) for automated system routines.
+-- 2. No Authentication Credentials: Zero entries in account_security_credentials.
+-- 3. No Public Persona: Zero entries in tourist_profiles or saved_destinations.
+-- 4. Inability to Authenticate: Cannot log in via public API, OAuth, or session endpoints.
+-- 5. Immutability Guard: Protected by database trigger against deletion or status/role mutation.
+
+CREATE OR REPLACE FUNCTION trg_protect_system_account()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF (TG_OP = 'DELETE' AND OLD.id = '00000000-0000-4000-8000-000000000001'::uuid) THEN
+        RAISE EXCEPTION 'FATAL: Root system account cannot be deleted.';
+    END IF;
+
+    IF (TG_OP = 'UPDATE' AND OLD.id = '00000000-0000-4000-8000-000000000001'::uuid) THEN
+        IF NEW.status != 'active' OR NEW.role != 'super_admin' OR NEW.type != 'system' THEN
+            RAISE EXCEPTION 'FATAL: Root system account status, role, and type are immutable.';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_guard_system_account
+BEFORE UPDATE OR DELETE ON accounts
+FOR EACH ROW
+WHEN (OLD.id = '00000000-0000-4000-8000-000000000001'::uuid)
+EXECUTE FUNCTION trg_protect_system_account();
 ```
 
 ---
@@ -1020,11 +1060,13 @@ WHERE audit_log_telemetry.audit_log_id = al.id
        OR (al.actor_account_id = :target_account_id));
 
 -- 7. Record an irreversible system tombstone event (append-only write)
+-- Attributed authoritatively to the seeded Root System Account ('00000000-0000-4000-8000-000000000001')
+-- The target erased account is recorded strictly as entity_id, never as the actor.
 WITH new_event AS (
     INSERT INTO audit_logs (
         actor_account_id, actor_role, action, entity_type, entity_id
     ) VALUES (
-        :target_account_id, 'system', 'account.anonymized_tombstone', 'account', :target_account_id::text
+        '00000000-0000-4000-8000-000000000001'::uuid, 'system', 'account.anonymized_tombstone', 'account', :target_account_id::text
     ) RETURNING id
 )
 INSERT INTO audit_log_telemetry (
@@ -1032,7 +1074,7 @@ INSERT INTO audit_log_telemetry (
     new_state_snapshot, context_notes, retention_expires_at, is_anonymized, anonymized_at
 ) 
 SELECT 
-    id, 'system@anonymized.mytravelroad.local', NULL, 'System-Sanitizer',
+    id, 'system-internal@mytravelroad.local', NULL, 'System-Sanitizer',
     '{"tombstone_applied": true}'::jsonb,
     'GDPR Right-to-Erasure executed. All PII, credentials, wishlists, and JSON snapshots sanitized.',
     CURRENT_TIMESTAMP, TRUE, CURRENT_TIMESTAMP
@@ -1338,13 +1380,18 @@ GRANT UPDATE (role, status, updated_at) ON accounts TO admin_service_role;
 
 #### 4. Role Change Auditing Across All Operational Scenarios
 
-##### Scenario A: Authoritative Application-Tier Role Change (Standard Flow)
-All legitimate administrative operations go through the server-side `AccountAdministrationService`:
-1. The service validates the administrator's JWT, MFA credentials, and verifies that `actor.role === 'super_admin'`.
-2. The service establishes a connection as `admin_service_role` and executes an atomic transaction:
+##### Scenario A: Authoritative Application-Tier Role Change (Single Authoritative Audit Trail)
+All legitimate administrative operations must proceed through the server-side `AccountAdministrationService`:
+1. **Human Administrator Authentication**: The service validates the caller's cryptographic session token/JWT and confirms that the administrator's account is in `active` status.
+2. **Step-Up Multi-Factor Authentication (MFA)**: Prior to committing role elevations or modifying privileged permissions, the service prompts and re-verifies a TOTP second factor from the authenticated administrator.
+3. **Strict Super-Admin RBAC & Safety Checks**:
+   - The service enforces `actor.role === 'super_admin'`.
+   - The service verifies invariant safety rules: an administrator cannot demote or suspend themselves (preventing accidental platform lockout), and ordinary users (`traveler`, `contributor`, `curator`, `moderator`) cannot invoke this service.
+4. **Atomic Transaction Execution**:
+   The service acquires a dedicated connection as `admin_service_role` and executes an atomic transaction that applies the update and writes the authoritative audit event simultaneously:
    ```sql
    BEGIN;
-   -- 1. Update the account role
+   -- 1. Update the target account role
    UPDATE accounts 
    SET role = :new_role, updated_at = CURRENT_TIMESTAMP 
    WHERE id = :target_account_id;
@@ -1373,72 +1420,29 @@ All legitimate administrative operations go through the server-side `AccountAdmi
    FROM event;
    COMMIT;
    ```
+This atomic sequence ensures that every legitimate role change produces **exactly one** authoritative, non-repudiable audit event attributed directly to the verified human administrator.
 
 ##### Scenario B: Failed or Unauthorized Role Change Attempts
-1. **Unauthorized Web API Request**: If an unauthorized traveler or attacker issues an API request to modify a role, the application authorization layer rejects the request with `403 Forbidden`. The API tier asynchronously logs a security event via an isolated logging connection (`action = 'security.unauthorized_role_elevation_attempt'`), capturing the caller's IP, account ID, and timestamp.
-2. **Direct SQL Injection on `app_user`**: If an attacker attempts `UPDATE accounts SET role = ...` via an application SQL injection on `app_user`, PostgreSQL halts the query with `ERROR: permission denied for column "role" of relation "accounts"`. The failure is recorded in the PostgreSQL server log.
+1. **Unauthorized Web API Request**: If an unauthorized traveler or malicious caller submits an API request to modify an account role, the application authorization layer rejects the request with `403 Forbidden`. The API layer logs a security alert asynchronously via an isolated security logging pipeline (`action = 'security.unauthorized_role_elevation_attempt'`), capturing the caller's IP, account ID, and timestamp.
+2. **Direct SQL Injection on `app_user`**: If an attacker attempts `UPDATE accounts SET role = ...` via an application SQL injection vulnerability on an `app_user` connection, PostgreSQL halts the query deterministically at the database engine level with `ERROR: permission denied for column "role" of relation "accounts"`. The violation is recorded in the PostgreSQL server log.
 
-##### Scenario C: Exceptional / Out-of-Band Direct Database Updates (DBA Safety Net)
-If an update to `accounts.role` is executed directly via `psql` or an external tool using `admin_service_role` or a PostgreSQL superuser outside the application service, a database safety trigger fires to ensure non-repudiation:
+##### Scenario C: Direct Database Administration (DBA) & Out-of-Band Auditing Reality
+A common architectural anti-pattern is attempting to use a database trigger on `accounts.role` as an "out-of-band detector". In previous drafts, an `AFTER UPDATE OF role` trigger fired on every role change, resulting in severe defects:
+1. **Duplicate & Conflicting Records**: The trigger fired on legitimate `AccountAdministrationService` updates, generating a false "CRITICAL: Out-of-band role change" event alongside the legitimate human-attributed event.
+2. **Inability to Distinguish Callers in Shared Connection Pools**: Both the application service and DBA tools connect via database credentials. The PostgreSQL engine cannot independently determine whether a query came from an application worker or a human typing in `psql` without caller-controlled session GUCs, which are forgeable and not a reliable security boundary.
+3. **Foreign Key Violations & False Attribution**: Triggers attempting to synthesize actor identities either used unseeded all-zeros UUIDs that violated `CONSTRAINT fk_audit_actor` or falsely attributed the change to the target account (`NEW.id`).
 
-```sql
-CREATE OR REPLACE FUNCTION trg_audit_out_of_band_role_change()
-RETURNS TRIGGER AS $$
-DECLARE
-    v_audit_id UUID;
-BEGIN
-    -- NEVER fall back to NEW.id! Attribute to dedicated SYSTEM / OUT-OF-BAND identity
-    INSERT INTO audit_logs (
-        actor_account_id,
-        actor_role,
-        action,
-        entity_type,
-        entity_id
-    ) VALUES (
-        '00000000-0000-0000-0000-000000000000'::uuid, -- Dedicated System/Out-of-Band UUID
-        session_user::text,                           -- Captures PostgreSQL session role
-        'account.role_change_out_of_band',
-        'account',
-        NEW.id::text
-    ) RETURNING id INTO v_audit_id;
-
-    INSERT INTO audit_log_telemetry (
-        audit_log_id,
-        actor_email,
-        ip_address,
-        user_agent,
-        previous_state_snapshot,
-        new_state_snapshot,
-        context_notes,
-        retention_expires_at,
-        is_anonymized
-    ) VALUES (
-        v_audit_id,
-        session_user || '@database.local',
-        inet_client_addr(),
-        'PostgreSQL Direct Connection / DBA Tool',
-        jsonb_build_object('role', OLD.role),
-        jsonb_build_object('role', NEW.role),
-        'CRITICAL: Role modified directly in database outside application service layer. Investigating DBA session.',
-        CURRENT_TIMESTAMP + INTERVAL '365 days',
-        FALSE
-    );
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
-CREATE TRIGGER trg_audit_account_role_elevation
-AFTER UPDATE OF role ON accounts
-FOR EACH ROW 
-WHEN (OLD.role IS DISTINCT FROM NEW.role)
-EXECUTE FUNCTION trg_audit_out_of_band_role_change();
-```
+Consequently, **the redundant `trg_audit_out_of_band_role_change` trigger is permanently eliminated**. Instead, out-of-band DBA accountability is enforced through enterprise-grade infrastructure and engine-level security controls:
+1. **Strict Credential Isolation**: Application developers, normal staff, and server processes do NOT possess database passwords. The credentials for `admin_service_role` and `app_user` are managed by secrets management infrastructure (e.g. AWS Secrets Manager, HashiCorp Vault) and injected into runtime containers at startup.
+2. **Individual Named DBA Accounts**: Direct operational access to production databases is strictly limited to emergency break-glass procedures via audited bastion hosts. DBAs authenticate using individual named PostgreSQL roles (`dba_alice`, `dba_bob`), never shared service accounts.
+3. **Engine-Level Audit Logging (`pgaudit`)**: The PostgreSQL cluster is configured with the native **`pgaudit`** extension (`pgaudit.log = 'write, role, ddl'`). `pgaudit` intercepts SQL commands at the PostgreSQL parser and executor level, capturing every statement, table, column, session user, client address, and timestamp directly into PostgreSQL's engine log stream.
+4. **External Immutable Log Pipeline**: Server audit logs are streamed synchronously to external write-once-read-many (WORM) storage (e.g. AWS CloudWatch Logs with Object Lock, Google Cloud Logging, Splunk) before any DBA command could alter them. Even a PostgreSQL superuser cannot erase or tamper with logs once streamed to the external collector.
 
 #### 5. Assumptions and Limitations
 1. **Connection Pool Isolation**: The security model relies on strict physical connection pool separation: standard user traffic connects via `app_user`, and administrative actions connect via `admin_service_role`.
 2. **No Role Inheritance**: `app_user` must not be granted `admin_service_role` or `SUPERUSER`.
-3. **Application Layer Trust Boundary**: In pooled environments, the database trusts `admin_service_role` queries to carry accurately asserted administrative actor IDs. This requires thorough code reviews, authenticated internal APIs, and audited server actions.
+3. **Authoritative Application Boundary**: In connection-pooled architectures, the PostgreSQL database engine cannot independently inspect application session states. The application service layer is the authoritative boundary for authenticating human administrators, validating MFA, and asserting actor identity.
+4. **DBA Accountability via Infrastructure**: Defense against rogue DBAs or compromised database credentials cannot be solved with table triggers (which a superuser can simply disable via `ALTER TABLE ... DISABLE TRIGGER ALL`). It is solved by removing direct credentials, enforcing bastion MFA, logging via `pgaudit`, and streaming logs to external immutable SIEM storage.
 
 ---
 
@@ -1527,20 +1531,21 @@ GRANT SELECT, UPDATE, DELETE ON audit_log_telemetry TO audit_maintenance_role;
 ### Phase 1: Core Extension & Foundation Migration
 1. Enable extensions: `CREATE EXTENSION IF NOT EXISTS "uuid-ossp";` and `CREATE EXTENSION IF NOT EXISTS "postgis";`.
 2. Provision `accounts`, `account_security_credentials` (Argon2id without salt column), `tourist_profiles`.
+3. Seed Root System Account: Insert seeded identity `00000000-0000-4000-8000-000000000001` (`system-internal@mytravelroad.local`, type: `system`, role: `super_admin`, status: `active`) and install protective trigger `trg_guard_system_account`.
 
 ### Phase 2: Taxonomy & Destination Structure
-3. Provision `destination_categories` with self-referencing hierarchy.
-4. Provision `destinations`, `destination_secondary_categories`, `destination_locations` with PostGIS `GEOGRAPHY(Point, 4326)`, coordinate range constraints (`ck_locations_coord_range`, `ck_locations_coord_valid`), GiST spatial index (`idx_locations_coordinates`), and expression GiST index (`idx_locations_public_coord_expr`).
-5. Provision `destination_media` and `destination_opening_hours`.
+4. Provision `destination_categories` with self-referencing hierarchy.
+5. Provision `destinations`, `destination_secondary_categories`, `destination_locations` with PostGIS `GEOGRAPHY(Point, 4326)`, coordinate range constraints (`ck_locations_coord_range`, `ck_locations_coord_valid`), GiST spatial index (`idx_locations_coordinates`), and expression GiST index (`idx_locations_public_coord_expr`).
+6. Provision `destination_media` and `destination_opening_hours`.
 
 ### Phase 3: Verification & Audit Layer (Stage A Completion)
-6. Provision `destination_verifications`, `verification_evidence`, `verification_records`.
-7. Provision `saved_destinations`, `audit_logs` (core ledger), and `audit_log_telemetry` (auxiliary privacy extension).
-8. Apply immutability triggers (`trg_audit_logs_immutable`), safety role audit triggers (`trg_audit_account_role_elevation`), and public views (`v_public_destination_locations`, `v_domain_audit_logs`).
-9. Configure PostgreSQL database roles (`app_user`, `admin_service_role`, `audit_maintenance_role`) and column-level update privileges.
+7. Provision `destination_verifications`, `verification_evidence`, `verification_records`.
+8. Provision `saved_destinations`, `audit_logs` (core ledger), and `audit_log_telemetry` (auxiliary privacy extension).
+9. Apply immutability trigger (`trg_audit_logs_immutable`) on `audit_logs` and deploy secure projections (`v_public_destination_locations`, `v_domain_audit_logs`). Note that role elevations are authoritatively audited at the application service tier within atomic transactions, while direct DBA activity is recorded via engine-level `pgaudit`.
+10. Configure PostgreSQL database roles (`app_user`, `admin_service_role`, `audit_maintenance_role`) and column-level update privileges.
 
 ### Phase 4: Social & UGC Moderation Expansion (Future Phase Milestone)
-10. Provision `business_profiles`, `community_posts`, `destination_reviews`, `user_reports`, and `moderation_records`.
+11. Provision `business_profiles`, `community_posts`, `destination_reviews`, `user_reports`, and `moderation_records`.
 
 ### Zero-Downtime Schema Expansion Rules
 - New columns must be added as `NULL` or with safe default values.
@@ -1698,3 +1703,7 @@ CREATE INDEX idx_reports_status ON user_reports (status);
 ### 12.8 PostGIS View Inlining and Expression Index Pushdown
 - **Decision**: Define `idx_locations_public_coord_expr` matching the exact expression projected by `v_public_destination_locations`.
 - **Trade-Off**: Creating an expression index consumes additional disk storage and incurs a minor write overhead on destination insert/update. However, because simple non-aggregate views in PostgreSQL are inlined directly into query trees during the query rewrite phase, the expression index allows public map viewport queries (`&&`) to execute high-performance GiST bitmap index scans directly against the view without requiring caller queries to reference the underlying base table. On small datasets, PostgreSQL naturally chooses sequential scans due to cost calculations; production benchmarking requires representative data volume and updated statistics.
+
+### 12.9 Single Authoritative Application Auditing vs. Redundant Triggers & Seeded System Identity
+- **Decision**: Centralize administrative role audit logging strictly in the server-side `AccountAdministrationService` within an atomic transaction, eliminate redundant in-database role triggers, enforce DBA auditing via engine-level `pgaudit`, and seed a deterministic root system account (`00000000-0000-4000-8000-000000000001`).
+- **Trade-Off**: In connection-pooled multi-tenant backend environments, a database trigger attached to `accounts.role` cannot reliably identify the human end-user behind a pooled connection without caller-controlled session GUCs (which are forgeable). The trigger fired on legitimate application promotions, creating duplicate, conflicting audit rows and raising false "critical out-of-band alerts". By removing the trigger and asserting authoritative human attribution at the application service tier (enforcing MFA and super-admin authorization in an atomic transaction), the system produces exactly one reliable, non-repudiable audit event per business promotion. For direct database queries executed by operational DBAs outside the application, accountability is achieved through infrastructure controls (bastion MFA, individual named DBA roles) and engine-level `pgaudit` logging streamed directly to immutable external WORM storage (CloudWatch/Splunk), which cannot be bypassed by database-level trigger manipulations. Finally, provisioning a seeded root system identity satisfies foreign key integrity across `audit_logs` without allowing automated compliance routines (e.g. Right-to-Erasure tombstones) to falsely attribute system events to the erased user.
