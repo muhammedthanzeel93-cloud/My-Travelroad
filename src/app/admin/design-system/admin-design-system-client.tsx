@@ -330,9 +330,11 @@ export function AdminDesignSystemClient() {
     {
       key: "name",
       header: "Destination (Sample)",
+      mobileLabel: "Destination",
+      mobileRole: "primary",
       sortable: true,
       cell: (row) => (
-        <div className="min-w-[175px]">
+        <div className="md:min-w-[175px]">
           <p className="font-semibold text-text-primary">{row.name}</p>
           <p className="text-xs text-text-secondary">{row.region}</p>
         </div>
@@ -341,9 +343,10 @@ export function AdminDesignSystemClient() {
     {
       key: "category",
       header: "Category",
+      mobileRole: "secondary",
       sortable: true,
       cell: (row) => (
-        <span className="whitespace-nowrap text-xs font-medium text-text-secondary">
+        <span className="md:whitespace-nowrap text-xs font-medium text-text-secondary">
           {row.category}
         </span>
       ),
@@ -351,12 +354,14 @@ export function AdminDesignSystemClient() {
     {
       key: "status",
       header: "Status",
+      mobileRole: "status",
       sortable: true,
       cell: (row) => <StatusBadge status={row.status} size="sm" />,
     },
     {
       key: "verification",
       header: "Verification",
+      mobileRole: "status",
       cell: (row) => (
         <VerificationStatusBadge state={row.verificationStatus} size="sm" />
       ),
@@ -364,8 +369,10 @@ export function AdminDesignSystemClient() {
     {
       key: "curator",
       header: "Curator / Updated",
+      mobileLabel: "Curator & Updated",
+      mobileRole: "secondary",
       cell: (row) => (
-        <div className="whitespace-nowrap text-xs">
+        <div className="md:whitespace-nowrap text-xs">
           <p className="font-medium text-text-primary">{row.submittedBy}</p>
           <p className="text-text-secondary">{row.updatedAt}</p>
         </div>
@@ -374,6 +381,7 @@ export function AdminDesignSystemClient() {
     {
       key: "actions",
       header: "Actions",
+      mobileRole: "actions",
       align: "right",
       widthClassName: "w-[72px]",
       cell: (row) => (
@@ -756,18 +764,27 @@ export function AdminDesignSystemClient() {
           <Tabs
             value={tableMode}
             onValueChange={(value) => setTableMode(value as TablePreviewMode)}
+            className="w-full sm:w-auto shrink-0"
           >
-            <TabsList>
-              <TabsTrigger value="data">Populated</TabsTrigger>
-              <TabsTrigger value="loading">Loading</TabsTrigger>
-              <TabsTrigger value="empty">Empty</TabsTrigger>
-              <TabsTrigger value="error">Error</TabsTrigger>
+            <TabsList className="w-full sm:w-auto max-w-full overflow-x-auto">
+              <TabsTrigger value="data" className="flex-1 sm:flex-initial px-2.5 sm:px-3.5 text-xs sm:text-sm">
+                Populated
+              </TabsTrigger>
+              <TabsTrigger value="loading" className="flex-1 sm:flex-initial px-2.5 sm:px-3.5 text-xs sm:text-sm">
+                Loading
+              </TabsTrigger>
+              <TabsTrigger value="empty" className="flex-1 sm:flex-initial px-2.5 sm:px-3.5 text-xs sm:text-sm">
+                Empty
+              </TabsTrigger>
+              <TabsTrigger value="error" className="flex-1 sm:flex-initial px-2.5 sm:px-3.5 text-xs sm:text-sm">
+                Error
+              </TabsTrigger>
             </TabsList>
           </Tabs>
         </div>
 
         <Card>
-          <CardContent className="p-5 space-y-5">
+          <CardContent className="p-3.5 sm:p-5 space-y-4 sm:space-y-5">
             <TableToolbar
               searchSlot={
                 <AdminSearchInput

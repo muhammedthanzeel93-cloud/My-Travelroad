@@ -71,11 +71,33 @@ export function DestinationsClient() {
 
   const [categoryFilter, setCategoryFilter] = React.useState("all");
   const [statusFilter, setStatusFilter] = React.useState("all");
-  const [addModalOpen, setAddModalOpen] = React.useState(false);
+  const [destModalMode, setDestModalMode] = React.useState<"add" | "edit" | null>(null);
+  const [editingDestination, setEditingDestination] =
+    React.useState<AdminSampleDestinationRow | null>(null);
   const [draftName, setDraftName] = React.useState("");
   const [draftCategory, setDraftCategory] = React.useState("Nature & Forests");
   const [draftRegion, setDraftRegion] = React.useState("");
   const [draftNotes, setDraftNotes] = React.useState("");
+
+  const openAddModal = () => {
+    setDraftName("");
+    setDraftCategory("Nature & Forests");
+    setDraftRegion("");
+    setDraftNotes("");
+    setEditingDestination(null);
+    setDestModalMode("add");
+  };
+
+  const openEditModal = (dest: AdminSampleDestinationRow) => {
+    setDraftName(dest.name);
+    setDraftCategory(dest.category);
+    setDraftRegion(dest.region);
+    setDraftNotes(
+      `Verified regional listing curated by ${dest.submittedBy}. Last updated ${dest.updatedAt}.`
+    );
+    setEditingDestination(dest);
+    setDestModalMode("edit");
+  };
 
   const [confirmState, setConfirmState] = React.useState<{
     open: boolean;
@@ -141,9 +163,11 @@ export function DestinationsClient() {
     {
       key: "name",
       header: "Destination (Sample)",
+      mobileLabel: "Destination",
+      mobileRole: "primary",
       sortable: true,
       cell: (row) => (
-        <div className="min-w-[200px] space-y-0.5">
+        <div className="md:min-w-[180px] space-y-0.5">
           <p className="font-semibold text-text-primary leading-snug">
             {row.name}
           </p>
@@ -154,9 +178,10 @@ export function DestinationsClient() {
     {
       key: "category",
       header: "Category",
+      mobileRole: "secondary",
       sortable: true,
       cell: (row) => (
-        <span className="text-xs sm:text-sm text-text-secondary whitespace-nowrap">
+        <span className="text-xs sm:text-sm text-text-secondary md:whitespace-nowrap">
           {row.category}
         </span>
       ),
@@ -164,12 +189,14 @@ export function DestinationsClient() {
     {
       key: "status",
       header: "Status",
+      mobileRole: "status",
       sortable: true,
       cell: (row) => <StatusBadge status={row.status} size="sm" />,
     },
     {
       key: "verification",
       header: "Verification",
+      mobileRole: "status",
       cell: (row) => (
         <VerificationStatusBadge state={row.verificationStatus} size="sm" />
       ),
@@ -177,8 +204,10 @@ export function DestinationsClient() {
     {
       key: "updated",
       header: "Curator / Updated",
+      mobileLabel: "Curator & Updated",
+      mobileRole: "secondary",
       cell: (row) => (
-        <div className="text-xs text-text-secondary whitespace-nowrap">
+        <div className="text-xs text-text-secondary md:whitespace-nowrap">
           <span className="font-medium text-text-primary">{row.submittedBy}</span>
           <span className="block text-[11px]">{row.updatedAt}</span>
         </div>
@@ -187,6 +216,7 @@ export function DestinationsClient() {
     {
       key: "actions",
       header: "Actions",
+      mobileRole: "actions",
       align: "right",
       cell: (row) => (
         <RowActionMenu
@@ -204,13 +234,9 @@ export function DestinationsClient() {
             },
             {
               id: "edit",
-              label: "Edit Placeholder",
+              label: "Edit Destination (Placeholder)",
               icon: Pencil,
-              onSelect: () =>
-                adminToast.info(
-                  "Edit Destination Placeholder",
-                  "Destination editing & CRUD persistence will be wired in later tasks."
-                ),
+              onSelect: () => openEditModal(row),
             },
             {
               id: "verify",
@@ -266,7 +292,7 @@ export function DestinationsClient() {
             <Button
               type="button"
               size="sm"
-              onClick={() => setAddModalOpen(true)}
+              onClick={openAddModal}
             >
               <Plus className="mr-1.5 h-4 w-4" aria-hidden="true" />
               Add Destination
@@ -289,7 +315,7 @@ export function DestinationsClient() {
       </div>
 
       <Card>
-        <CardContent className="p-5 space-y-5">
+        <CardContent className="p-3.5 sm:p-5 space-y-4 sm:space-y-5">
           <TableToolbar
             searchSlot={
               <AdminSearchInput
@@ -415,26 +441,36 @@ export function DestinationsClient() {
         </CardContent>
       </Card>
 
-      {/* Non-persistent Add Destination UI Placeholder Modal */}
-      <Dialog open={addModalOpen} onOpenChange={setAddModalOpen}>
+      {/* Non-persistent Add / Edit Destination UI Placeholder Modal */}
+      <Dialog
+        open={destModalMode !== null}
+        onOpenChange={(open) => {
+          if (!open) setDestModalMode(null);
+        }}
+      >
         <DialogContent className="sm:max-w-[520px]">
           <DialogHeader>
-            <DialogTitle>Add Destination (UI Placeholder)</DialogTitle>
+            <DialogTitle>
+              {destModalMode === "edit"
+                ? "Edit Destination (UI Placeholder)"
+                : "Add Destination (UI Placeholder)"}
+            </DialogTitle>
             <DialogDescription>
-              Form structure demonstrating Task 03 fields. Submitting displays
-              confirmation feedback without creating database records.
+              {destModalMode === "edit"
+                ? `Form pre-filled with sample listing data for ${editingDestination?.name ?? "destination"}. No records will be modified.`
+                : "Form structure demonstrating Task 03 fields. Submitting displays confirmation feedback without creating database records."}
             </DialogDescription>
           </DialogHeader>
 
           <form
             onSubmit={(event) => {
               event.preventDefault();
-              setAddModalOpen(false);
+              const isEdit = destModalMode === "edit";
+              const targetName = draftName || editingDestination?.name || "Sample Destination";
+              setDestModalMode(null);
               adminToast.info(
-                "Add Destination (Preview Only)",
-                draftName
-                  ? `"${draftName}" validated in UI preview. Database CRUD is excluded.`
-                  : "Submitted blank form preview. CRUD persistence is excluded."
+                isEdit ? "Edit Destination (Preview Only)" : "Add Destination (Preview Only)",
+                `"${targetName}" validated in UI preview. Database CRUD is excluded.`
               );
             }}
             className="space-y-4 pt-2"
@@ -480,11 +516,13 @@ export function DestinationsClient() {
               <Button
                 type="button"
                 variant="outline"
-                onClick={() => setAddModalOpen(false)}
+                onClick={() => setDestModalMode(null)}
               >
                 Cancel
               </Button>
-              <Button type="submit">Preview Submit (Non-Persistent)</Button>
+              <Button type="submit">
+                {destModalMode === "edit" ? "Save Changes (Preview)" : "Preview Submit (Non-Persistent)"}
+              </Button>
             </DialogFooter>
           </form>
         </DialogContent>

@@ -47,7 +47,7 @@ export function TablePagination({
         {itemLabel}
       </p>
 
-      <div className="flex items-center gap-1.5">
+      <div className="flex flex-wrap items-center justify-center gap-1.5">
         <Button
           type="button"
           variant="outline"
@@ -60,7 +60,7 @@ export function TablePagination({
           Prev
         </Button>
 
-        <div className="flex items-center gap-1">
+        <div className="flex flex-wrap items-center justify-center gap-1">
           {Array.from({ length: safeTotalPages }, (_, idx) => idx + 1).map(
             (pageNum) => {
               const isCurrent = pageNum === safePage;

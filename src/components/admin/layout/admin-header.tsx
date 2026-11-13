@@ -88,7 +88,7 @@ export function AdminHeader({
               )}
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-80">
+          <DropdownMenuContent align="end" className="w-[calc(100vw-2rem)] max-w-80">
             <div className="flex items-center justify-between px-2.5 py-1.5">
               <DropdownMenuLabel className="p-0">
                 Sample Notifications

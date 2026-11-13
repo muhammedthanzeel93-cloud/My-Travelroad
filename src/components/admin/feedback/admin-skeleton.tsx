@@ -43,7 +43,7 @@ export function AdminChartSkeleton() {
   );
 }
 
-/** Loading skeleton for tabular admin datasets. */
+/** Loading skeleton for tabular admin datasets across desktop tables and mobile cards. */
 export function AdminTableSkeleton({
   rows = 5,
   columns = 5,
@@ -52,32 +52,56 @@ export function AdminTableSkeleton({
   columns?: number;
 }) {
   return (
-    <div
-      className="divide-y divide-border rounded-xl border border-border bg-surface overflow-hidden"
-      aria-busy="true"
-      aria-label="Loading table rows"
-    >
-      <div className="flex items-center gap-4 bg-slate-50/80 px-4 py-3">
-        <Skeleton className="h-4 w-4 rounded-sm" />
-        {Array.from({ length: columns }).map((_, colIdx) => (
-          <Skeleton key={colIdx} className="h-3.5 flex-1 max-w-[140px]" />
+    <div aria-busy="true" aria-label="Loading table rows">
+      {/* Mobile card skeleton stack (< 768px) */}
+      <div className="space-y-3 md:hidden">
+        {Array.from({ length: Math.min(rows, 3) }).map((_, rowIdx) => (
+          <div
+            key={rowIdx}
+            className="rounded-xl border border-border bg-surface p-3.5 space-y-3"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="space-y-1.5 flex-1">
+                <Skeleton className="h-4 w-40" />
+                <Skeleton className="h-3 w-28" />
+              </div>
+              <Skeleton className="h-7 w-7 rounded-md shrink-0" />
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Skeleton className="h-5 w-16 rounded-full" />
+                <Skeleton className="h-5 w-20 rounded-full" />
+              </div>
+              <Skeleton className="h-6 w-16 rounded-md" />
+            </div>
+          </div>
         ))}
       </div>
-      {Array.from({ length: rows }).map((_, rowIdx) => (
-        <div key={rowIdx} className="flex items-center gap-4 px-4 py-4">
+
+      {/* Tablet & desktop tabular skeleton (>= 768px) */}
+      <div className="hidden md:block divide-y divide-border rounded-xl border border-border bg-surface overflow-hidden">
+        <div className="flex items-center gap-4 bg-slate-50/80 px-4 py-3">
           <Skeleton className="h-4 w-4 rounded-sm" />
-          <div className="flex-1 space-y-1.5">
-            <Skeleton className="h-4 w-44" />
-            <Skeleton className="h-3 w-28" />
-          </div>
-          {Array.from({ length: Math.max(1, columns - 1) }).map((_, colIdx) => (
-            <Skeleton
-              key={colIdx}
-              className="hidden sm:block h-5 flex-1 max-w-[100px] rounded-full"
-            />
+          {Array.from({ length: columns }).map((_, colIdx) => (
+            <Skeleton key={colIdx} className="h-3.5 flex-1 max-w-[140px]" />
           ))}
         </div>
-      ))}
+        {Array.from({ length: rows }).map((_, rowIdx) => (
+          <div key={rowIdx} className="flex items-center gap-4 px-4 py-4">
+            <Skeleton className="h-4 w-4 rounded-sm" />
+            <div className="flex-1 space-y-1.5">
+              <Skeleton className="h-4 w-44" />
+              <Skeleton className="h-3 w-28" />
+            </div>
+            {Array.from({ length: Math.max(1, columns - 1) }).map((_, colIdx) => (
+              <Skeleton
+                key={colIdx}
+                className="h-5 flex-1 max-w-[100px] rounded-full"
+              />
+            ))}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

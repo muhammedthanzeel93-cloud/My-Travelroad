@@ -1185,3 +1185,178 @@ export const ADMIN_SETTINGS_DEFAULTS: AdminSampleSettingsState = {
   tableDensity: "comfortable",
   showSampleBadges: true,
 };
+
+export type AdminReportType =
+  | "inaccurate_info"
+  | "content_flag"
+  | "outdated_details"
+  | "duplicate"
+  | "safety_concern";
+
+export type AdminReportStatus =
+  | "pending"
+  | "in_review"
+  | "resolved"
+  | "dismissed";
+
+export interface AdminSampleModerationReport {
+  id: string;
+  reportCode: string;
+  type: AdminReportType;
+  typeLabel: string;
+  targetType: "destination" | "review" | "user";
+  targetTitle: string;
+  reporterName: string;
+  reporterEmail: string;
+  reason: string;
+  details: string;
+  status: AdminReportStatus;
+  severity: "high" | "medium" | "low";
+  submittedAt: string;
+  resolvedAt?: string;
+}
+
+export const ADMIN_MODERATION_STATS: AdminSampleStat[] = [
+  {
+    id: "rep-stat-total",
+    title: "Total Reports Logged",
+    value: "18",
+    delta: "+3 this week",
+    trend: "up",
+    periodLabel: "sample flags",
+    iconKey: "pending",
+    tone: "muted",
+  },
+  {
+    id: "rep-stat-pending",
+    title: "Pending Review",
+    value: "4",
+    delta: "Requires action",
+    trend: "neutral",
+    periodLabel: "curator queue",
+    iconKey: "pending",
+    tone: "accent",
+  },
+  {
+    id: "rep-stat-in-review",
+    title: "Under Investigation",
+    value: "3",
+    delta: "Assigned",
+    trend: "neutral",
+    periodLabel: "active reviews",
+    iconKey: "destinations",
+    tone: "secondary",
+  },
+  {
+    id: "rep-stat-resolved",
+    title: "Resolved / Dismissed",
+    value: "11",
+    delta: "61% rate",
+    trend: "up",
+    periodLabel: "moderated",
+    iconKey: "verified",
+    tone: "primary",
+  },
+];
+
+export const ADMIN_MODERATION_REPORTS: AdminSampleModerationReport[] = [
+  {
+    id: "rep-001",
+    reportCode: "REP-301",
+    type: "inaccurate_info",
+    typeLabel: "Inaccurate Coordinates",
+    targetType: "destination",
+    targetTitle: "Kadalundi Bird Sanctuary & Estuary",
+    reporterName: "Rajan K. (Local Guide)",
+    reporterEmail: "rajan.guide@example.com",
+    reason: "Boat boarding jetty pin is 850m south of actual ticket counter.",
+    details:
+      "Visitors are arriving at the private fishing quay instead of the community ecotourism gate. Request coordinate update to 11.1294° N, 75.8342° E.",
+    status: "pending",
+    severity: "high",
+    submittedAt: "Sample • 2h ago",
+  },
+  {
+    id: "rep-002",
+    reportCode: "REP-302",
+    type: "content_flag",
+    typeLabel: "Offensive Content",
+    targetType: "review",
+    targetTitle: "Review on Teak Museum & Bio-Resources Nature Trail",
+    reporterName: "Automated Sentinel",
+    reporterEmail: "sentinel-bot@mytravelroad.internal",
+    reason: "Inappropriate language detected in 1-star visitor feedback.",
+    details:
+      "Visitor submission contains abusive remarks directed at ticket counter staff. Requires curator moderation before public display.",
+    status: "in_review",
+    severity: "medium",
+    submittedAt: "Sample • 5h ago",
+  },
+  {
+    id: "rep-003",
+    reportCode: "REP-303",
+    type: "outdated_details",
+    typeLabel: "Outdated Access Hours",
+    targetType: "destination",
+    targetTitle: "Adyanpara Cascades & Forest Trek",
+    reporterName: "Anjali Menon",
+    reporterEmail: "anjali.m@example.com",
+    reason: "Monsoon gate timings have changed from 5:00 PM to 4:30 PM.",
+    details:
+      "Forest department safety guidelines now close the upper pool trail at 4:30 PM due to seasonal flash-flood warnings. Please update the listing timings.",
+    status: "pending",
+    severity: "medium",
+    submittedAt: "Sample • Yesterday",
+  },
+  {
+    id: "rep-004",
+    reportCode: "REP-304",
+    type: "duplicate",
+    typeLabel: "Duplicate Listing",
+    targetType: "destination",
+    targetTitle: "Kottakkal Heritage Herbal Garden",
+    reporterName: "Malappuram Tourism Guild",
+    reporterEmail: "guild@malappuram.example",
+    reason: "Duplicate entry for Arya Vaidya Sala Botanical Garden.",
+    details:
+      "Both listings represent the same historical botanical center in Kottakkal. Merge or archive the duplicate entry.",
+    status: "resolved",
+    severity: "low",
+    submittedAt: "Sample • Nov 08",
+    resolvedAt: "Sample • Nov 09",
+  },
+  {
+    id: "rep-005",
+    reportCode: "REP-305",
+    type: "safety_concern",
+    typeLabel: "Safety Warning",
+    targetType: "destination",
+    targetTitle: "Mini Ooty Glass Bridge & Hilltop",
+    reporterName: "Haris V.",
+    reporterEmail: "haris.v@example.com",
+    reason: "Temporary road repair on Arimbra ghat section.",
+    details:
+      "PWD construction requires heavy vehicles and traveler buses to take the Morayur alternate route. Staging safety alert on destination page.",
+    status: "in_review",
+    severity: "high",
+    submittedAt: "Sample • Nov 10",
+  },
+  {
+    id: "rep-006",
+    reportCode: "REP-306",
+    type: "inaccurate_info",
+    typeLabel: "Fee Discrepancy",
+    targetType: "destination",
+    targetTitle: "Kodikuthimala Mist Point",
+    reporterName: "Siddique P.",
+    reporterEmail: "siddique@example.com",
+    reason: "Watchtower entry fee updated from ₹20 to ₹30.",
+    details:
+      "District Tourism Promotion Council revised the entry tariff last week. Public listing still shows older price.",
+    status: "dismissed",
+    severity: "low",
+    submittedAt: "Sample • Nov 05",
+    resolvedAt: "Sample • Nov 06",
+  },
+];
+

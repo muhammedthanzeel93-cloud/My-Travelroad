@@ -137,13 +137,14 @@ export function CategoriesClient() {
     {
       key: "name",
       header: "Category",
+      mobileRole: "primary",
       sortable: true,
       cell: (row) => (
-        <div className="flex items-start gap-2.5 min-w-[190px]">
+        <div className="flex items-start gap-2.5 md:min-w-[160px]">
           <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
             <FolderTree className="h-4 w-4" aria-hidden="true" />
           </span>
-          <div className="space-y-0.5">
+          <div className="min-w-0 space-y-0.5">
             <p className="font-semibold text-text-primary">{row.name}</p>
             <code className="text-[11px] font-mono text-text-secondary">
               /{row.slug}
@@ -155,8 +156,12 @@ export function CategoriesClient() {
     {
       key: "description",
       header: "Description",
+      mobileRole: "description",
       cell: (row) => (
-        <p className="max-w-md text-xs text-text-secondary leading-relaxed">
+        <p
+          title={row.description}
+          className="text-xs text-text-secondary leading-relaxed md:min-w-[200px] md:max-w-[320px] md:line-clamp-2"
+        >
           {row.description}
         </p>
       ),
@@ -164,6 +169,8 @@ export function CategoriesClient() {
     {
       key: "destinationCount",
       header: "Destinations",
+      mobileLabel: "Linked Destinations",
+      mobileRole: "secondary",
       align: "center",
       sortable: true,
       cell: (row) => (
@@ -175,14 +182,17 @@ export function CategoriesClient() {
     {
       key: "status",
       header: "Status",
+      mobileRole: "status",
       sortable: true,
       cell: (row) => <StatusBadge status={row.status} size="sm" />,
     },
     {
       key: "updatedAt",
       header: "Updated",
+      mobileLabel: "Last Updated",
+      mobileRole: "secondary",
       cell: (row) => (
-        <span className="text-xs text-text-secondary whitespace-nowrap">
+        <span className="text-xs text-text-secondary md:whitespace-nowrap">
           {row.updatedAt}
         </span>
       ),
@@ -190,6 +200,7 @@ export function CategoriesClient() {
     {
       key: "actions",
       header: "Actions",
+      mobileRole: "actions",
       align: "right",
       cell: (row) => (
         <RowActionMenu
@@ -280,7 +291,7 @@ export function CategoriesClient() {
       </div>
 
       <Card>
-        <CardContent className="p-5 space-y-5">
+        <CardContent className="p-3.5 sm:p-5 space-y-4 sm:space-y-5">
           <TableToolbar
             searchSlot={
               <AdminSearchInput

@@ -23,7 +23,7 @@ export function AdminMainContainer({
   return (
     <div
       className={cn(
-        "mx-auto w-full max-w-[1440px] px-4 py-6 sm:px-6 lg:px-8",
+        "mx-auto w-full max-w-[1440px] px-4 py-5 sm:px-6 sm:py-6 lg:px-8",
         className
       )}
       {...props}
@@ -38,6 +38,20 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() ?? "/admin";
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
   const [signOutDialogOpen, setSignOutDialogOpen] = React.useState(false);
+
+  // Auto-collapse desktop sidebar into compact icon rail on narrow lg viewports (1024px-1279px)
+  // while leaving expanded sidebar by default at 1280px+ (such as 1440x900).
+  React.useEffect(() => {
+    const mediaQuery = window.matchMedia("(min-width: 1280px)");
+    setSidebarCollapsed(!mediaQuery.matches);
+
+    const handleChange = (event: MediaQueryListEvent) => {
+      setSidebarCollapsed(!event.matches);
+    };
+
+    mediaQuery.addEventListener("change", handleChange);
+    return () => mediaQuery.removeEventListener("change", handleChange);
+  }, []);
 
   const activeItem = findActiveAdminNavItem(pathname);
   const selectedNavId = activeItem?.id ?? "overview";
@@ -56,7 +70,7 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
         onSelectPlaceholder={handleSelectPlaceholder}
       />
 
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-w-0 flex-1 flex-col overflow-x-clip">
         <AdminHeader
           activeItemId={selectedNavId}
           activeItemLabel={activeItemLabel}

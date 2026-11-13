@@ -149,9 +149,11 @@ export function DestinationVerificationClient() {
     {
       key: "destinationName",
       header: "Submission (Sample)",
+      mobileLabel: "Submission",
+      mobileRole: "primary",
       sortable: true,
       cell: (row) => (
-        <div className="min-w-[200px] space-y-0.5">
+        <div className="md:min-w-[190px] space-y-0.5">
           <p className="font-semibold text-text-primary leading-snug">
             {row.destinationName}
           </p>
@@ -164,6 +166,8 @@ export function DestinationVerificationClient() {
     {
       key: "verificationStatus",
       header: "Verification Status",
+      mobileLabel: "Verification",
+      mobileRole: "status",
       sortable: true,
       cell: (row) => (
         <VerificationStatusBadge state={row.verificationStatus} size="sm" />
@@ -172,9 +176,11 @@ export function DestinationVerificationClient() {
     {
       key: "reviewerName",
       header: "Reviewer Info",
+      mobileLabel: "Assigned Reviewer",
+      mobileRole: "secondary",
       sortable: true,
       cell: (row) => (
-        <div className="text-xs whitespace-nowrap">
+        <div className="text-xs md:whitespace-nowrap">
           <p className="font-medium text-text-primary">{row.reviewerName}</p>
           <p className="text-[11px] text-text-secondary">{row.reviewerRole}</p>
         </div>
@@ -183,8 +189,9 @@ export function DestinationVerificationClient() {
     {
       key: "submittedAt",
       header: "Submitted",
+      mobileRole: "secondary",
       cell: (row) => (
-        <div className="text-xs text-text-secondary whitespace-nowrap">
+        <div className="text-xs text-text-secondary md:whitespace-nowrap">
           <span className="font-medium text-text-primary">{row.submittedAt}</span>
           <span className="block text-[11px]">By {row.submittedBy}</span>
         </div>
@@ -193,6 +200,7 @@ export function DestinationVerificationClient() {
     {
       key: "actions",
       header: "Review Actions",
+      mobileRole: "actions",
       align: "right",
       cell: (row) => (
         <RowActionMenu
@@ -336,7 +344,7 @@ export function DestinationVerificationClient() {
       </div>
 
       <Card>
-        <CardContent className="p-5 space-y-5">
+        <CardContent className="p-3.5 sm:p-5 space-y-4 sm:space-y-5">
           <TableToolbar
             searchSlot={
               <AdminSearchInput

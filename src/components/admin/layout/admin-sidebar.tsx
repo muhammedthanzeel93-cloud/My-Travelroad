@@ -40,7 +40,7 @@ export function AdminSidebar({
       aria-label="Admin sidebar navigation"
       className={cn(
         "hidden lg:flex lg:flex-col lg:shrink-0 border-r border-border bg-surface transition-[width] duration-200 sticky top-0 h-screen",
-        collapsed ? "w-[76px]" : "w-72"
+        collapsed ? "w-[72px]" : "w-60 xl:w-64"
       )}
     >
       {/* Brand Header */}

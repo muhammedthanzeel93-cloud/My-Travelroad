@@ -152,16 +152,21 @@ export function ReviewsClient() {
     {
       key: "destinationName",
       header: "Destination & Excerpt",
+      mobileLabel: "Destination",
+      mobileRole: "primary",
       sortable: true,
       cell: (row) => (
-        <div className="min-w-[230px] max-w-md space-y-1">
+        <div className="md:min-w-[220px] md:max-w-[300px] space-y-1">
           <p className="font-semibold text-text-primary leading-snug">
             {row.destinationName}{" "}
             <span className="font-normal text-xs text-text-secondary">
               &bull; {row.region}
             </span>
           </p>
-          <p className="line-clamp-2 text-xs text-text-secondary leading-relaxed">
+          <p
+            title={row.excerpt}
+            className="line-clamp-2 text-xs text-text-secondary leading-relaxed"
+          >
             {row.excerpt}
           </p>
         </div>
@@ -170,8 +175,9 @@ export function ReviewsClient() {
     {
       key: "reviewerName",
       header: "Reviewer",
+      mobileRole: "secondary",
       cell: (row) => (
-        <div className="flex items-center gap-2.5 whitespace-nowrap">
+        <div className="flex items-center gap-2.5 md:whitespace-nowrap">
           <Avatar size="sm">
             <AvatarFallback>{row.reviewerInitials}</AvatarFallback>
           </Avatar>
@@ -184,20 +190,23 @@ export function ReviewsClient() {
     {
       key: "rating",
       header: "Rating",
+      mobileRole: "status",
       sortable: true,
       cell: (row) => <StarRatingDisplay rating={row.rating} />,
     },
     {
       key: "status",
       header: "Status",
+      mobileRole: "status",
       sortable: true,
       cell: (row) => <StatusBadge status={row.status} size="sm" />,
     },
     {
       key: "submittedAt",
       header: "Date",
+      mobileRole: "secondary",
       cell: (row) => (
-        <span className="text-xs text-text-secondary whitespace-nowrap">
+        <span className="text-xs text-text-secondary md:whitespace-nowrap">
           {row.submittedAt}
         </span>
       ),
@@ -205,6 +214,7 @@ export function ReviewsClient() {
     {
       key: "actions",
       header: "Moderation",
+      mobileRole: "actions",
       align: "right",
       cell: (row) => (
         <RowActionMenu
@@ -307,7 +317,7 @@ export function ReviewsClient() {
       </div>
 
       <Card>
-        <CardContent className="p-5 space-y-5">
+        <CardContent className="p-3.5 sm:p-5 space-y-4 sm:space-y-5">
           <TableToolbar
             searchSlot={
               <AdminSearchInput

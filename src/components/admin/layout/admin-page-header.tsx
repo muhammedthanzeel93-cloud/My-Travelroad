@@ -35,7 +35,7 @@ export function AdminPageHeader({
       )}
 
       <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
-        <div className="space-y-1.5">
+        <div className="space-y-1.5 min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2.5">
             <h1 className="text-2xl font-bold tracking-tight text-text-primary sm:text-3xl">
               {title}

@@ -21,13 +21,24 @@ export function AdminStateTabs({
     <Tabs
       value={value}
       onValueChange={(next) => onValueChange(next as AdminPreviewMode)}
-      className={cn("shrink-0", className)}
+      className={cn("w-full sm:w-auto shrink-0", className)}
     >
-      <TabsList aria-label="Preview view state">
-        <TabsTrigger value="data">Populated</TabsTrigger>
-        <TabsTrigger value="loading">Loading</TabsTrigger>
-        <TabsTrigger value="empty">Empty</TabsTrigger>
-        <TabsTrigger value="error">Error</TabsTrigger>
+      <TabsList
+        aria-label="Preview view state"
+        className="w-full sm:w-auto max-w-full overflow-x-auto"
+      >
+        <TabsTrigger value="data" className="flex-1 sm:flex-initial px-2.5 sm:px-3.5 text-xs sm:text-sm">
+          Populated
+        </TabsTrigger>
+        <TabsTrigger value="loading" className="flex-1 sm:flex-initial px-2.5 sm:px-3.5 text-xs sm:text-sm">
+          Loading
+        </TabsTrigger>
+        <TabsTrigger value="empty" className="flex-1 sm:flex-initial px-2.5 sm:px-3.5 text-xs sm:text-sm">
+          Empty
+        </TabsTrigger>
+        <TabsTrigger value="error" className="flex-1 sm:flex-initial px-2.5 sm:px-3.5 text-xs sm:text-sm">
+          Error
+        </TabsTrigger>
       </TabsList>
     </Tabs>
   );

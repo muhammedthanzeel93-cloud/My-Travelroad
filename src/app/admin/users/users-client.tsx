@@ -128,9 +128,11 @@ export function UsersClient() {
     {
       key: "name",
       header: "User Profile Summary",
+      mobileLabel: "User",
+      mobileRole: "primary",
       sortable: true,
       cell: (row) => (
-        <div className="flex items-center gap-3 min-w-[220px]">
+        <div className="flex items-center gap-3 md:min-w-[200px]">
           <Avatar size="sm">
             <AvatarFallback>{row.initials}</AvatarFallback>
           </Avatar>
@@ -146,6 +148,7 @@ export function UsersClient() {
     {
       key: "role",
       header: "Role",
+      mobileRole: "status",
       sortable: true,
       cell: (row) => (
         <Badge
@@ -166,14 +169,17 @@ export function UsersClient() {
     {
       key: "status",
       header: "Account Status",
+      mobileLabel: "Status",
+      mobileRole: "status",
       sortable: true,
       cell: (row) => <StatusBadge status={row.status} size="sm" />,
     },
     {
       key: "activity",
       header: "Region & Contributions",
+      mobileRole: "secondary",
       cell: (row) => (
-        <div className="text-xs whitespace-nowrap">
+        <div className="text-xs md:whitespace-nowrap">
           <p className="font-medium text-text-primary">{row.region}</p>
           <p className="text-[11px] text-text-secondary tabular-nums">
             {row.savedCount} saved &bull; {row.submissionsCount} submissions
@@ -184,8 +190,9 @@ export function UsersClient() {
     {
       key: "registeredAt",
       header: "Registered",
+      mobileRole: "secondary",
       cell: (row) => (
-        <span className="text-xs text-text-secondary whitespace-nowrap">
+        <span className="text-xs text-text-secondary md:whitespace-nowrap">
           {row.registeredAt}
         </span>
       ),
@@ -193,6 +200,7 @@ export function UsersClient() {
     {
       key: "actions",
       header: "Actions",
+      mobileRole: "actions",
       align: "right",
       cell: (row) => (
         <RowActionMenu
@@ -310,7 +318,7 @@ export function UsersClient() {
       </div>
 
       <Card>
-        <CardContent className="p-5 space-y-5">
+        <CardContent className="p-3.5 sm:p-5 space-y-4 sm:space-y-5">
           <TableToolbar
             searchSlot={
               <AdminSearchInput
