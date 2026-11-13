@@ -30,23 +30,29 @@ This document establishes the production-grade relational database architecture 
 
 ## 3. Stage A Table Specifications
 
-Stage A encompasses **13 core tables** plus **1 junction table** (`destination_secondary_categories`) for secondary category taxonomy associations.
+Stage A encompasses:
+- **13 Core Domain Tables** representing primary entities.
+- **1 Auxiliary Audit Privacy Extension Table** (`audit_log_telemetry`) for privacy lifecycle and telemetry management.
+- **1 Junction Table** (`destination_secondary_categories`) for secondary taxonomy associations.
 
-The 13 Stage A core tables are:
+The 13 Stage A Core Domain Tables:
 1. `accounts` (Core identity & authentication status)
 2. `account_security_credentials` (Argon2id credential secrets & lockouts)
 3. `tourist_profiles` (Public traveler profile & preferences)
 4. `destination_categories` (Hierarchical taxonomy)
 5. `destinations` (Core destination entity)
-6. `destination_secondary_categories` (Junction table: multi-category tagging)
-7. `destination_locations` (PostGIS `GEOGRAPHY(Point, 4326)` & privacy attributes)
-8. `destination_media` (Visual gallery & attribution assets)
-9. `destination_opening_hours` (Structured operational schedules)
-10. `destination_verifications` (Verification container & drift audit schedules)
-11. `verification_evidence` (Documentary proof & government citations)
-12. `verification_records` (Granular fact-level certified audit stamps)
-13. `saved_destinations` (Private traveler wishlists & bookmarks)
-14. `audit_logs` (Immutable administrative audit trail)
+6. `destination_locations` (PostGIS `GEOGRAPHY(Point, 4326)` & privacy attributes)
+7. `destination_media` (Visual gallery & attribution assets)
+8. `destination_opening_hours` (Structured operational schedules)
+9. `destination_verifications` (Verification container & drift audit schedules)
+10. `verification_evidence` (Documentary proof & government citations)
+11. `verification_records` (Granular fact-level certified audit stamps)
+12. `saved_destinations` (Private traveler wishlists & bookmarks)
+13. `audit_logs` (Immutable core administrative audit ledger)
+
+Auxiliary Tables:
+- `audit_log_telemetry` (1:1 privacy extension table resolving the audit immutability vs. anonymization contradiction)
+- `destination_secondary_categories` (N:M taxonomy junction table)
 
 *(Note: User-generated content moderation (`moderation_records`) is explicitly deferred to **Section 11: Future-Phase Database Boundaries** alongside community posts, reviews, and user reports. Stage A editorial curation is comprehensively managed via `destination_verifications`, `verification_records`, `verification_evidence`, and `audit_logs`.)*
 
@@ -527,23 +533,17 @@ CREATE INDEX idx_saved_collection ON saved_destinations (account_id, collection_
 
 ---
 
-### 3.14 `audit_logs`
-Immutable, append-only security and administration audit trail.
+### 3.14 `audit_logs` (Core Immutable Ledger)
+Strictly append-only, immutable administrative audit trail. Stores non-identifying regulatory provenance and event metadata.
 
 ```sql
 CREATE TABLE audit_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     actor_account_id UUID NOT NULL,
-    actor_email VARCHAR(255) NOT NULL,
     actor_role VARCHAR(32) NOT NULL,
-    ip_address INET NULL,
-    user_agent TEXT NULL,
     action VARCHAR(64) NOT NULL,
     entity_type VARCHAR(64) NOT NULL,
     entity_id VARCHAR(64) NOT NULL,
-    previous_state_snapshot JSONB NULL,
-    new_state_snapshot JSONB NULL,
-    context_notes TEXT NULL,
     timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_audit_actor FOREIGN KEY (actor_account_id) 
@@ -555,6 +555,56 @@ CREATE INDEX idx_audit_entity ON audit_logs (entity_type, entity_id);
 CREATE INDEX idx_audit_timestamp ON audit_logs (timestamp DESC);
 CREATE INDEX idx_audit_action ON audit_logs (action);
 ```
+
+---
+
+### 3.15 `audit_log_telemetry` (Auxiliary Privacy Extension)
+Stores personal, forensic, and state-snapshot telemetry associated with audit events. Exactly 1:1 with `audit_logs`. Decoupled from `audit_logs` to enable legal data minimization, 90-day telemetry truncation, and GDPR Right-to-Erasure sanitization without compromising ledger immutability.
+
+```sql
+CREATE TABLE audit_log_telemetry (
+    audit_log_id UUID PRIMARY KEY,
+    actor_email VARCHAR(255) NULL,
+    ip_address INET NULL,
+    user_agent TEXT NULL,
+    previous_state_snapshot JSONB NULL,
+    new_state_snapshot JSONB NULL,
+    context_notes TEXT NULL,
+    retention_expires_at TIMESTAMPTZ NOT NULL,
+    is_anonymized BOOLEAN NOT NULL DEFAULT FALSE,
+    anonymized_at TIMESTAMPTZ NULL,
+
+    CONSTRAINT fk_telemetry_audit FOREIGN KEY (audit_log_id) 
+        REFERENCES audit_logs(id) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE INDEX idx_telemetry_expiry ON audit_log_telemetry (retention_expires_at) WHERE is_anonymized = FALSE;
+CREATE INDEX idx_telemetry_actor_email ON audit_log_telemetry (actor_email) WHERE actor_email IS NOT NULL;
+```
+
+#### Reconstructing the TypeScript Domain Model
+In `src/types/domain/audit.types.ts`, the application expects an `AuditLog` object containing both event metadata and actor telemetry. The relational layer projects this composite domain shape cleanly via a database view:
+
+```sql
+CREATE OR REPLACE VIEW v_domain_audit_logs AS
+SELECT 
+    al.id,
+    al.actor_account_id,
+    alt.actor_email,
+    al.actor_role,
+    alt.ip_address,
+    alt.user_agent,
+    al.action,
+    al.entity_type,
+    al.entity_id,
+    alt.previous_state_snapshot,
+    alt.new_state_snapshot,
+    alt.context_notes,
+    al.timestamp
+FROM audit_logs al
+LEFT JOIN audit_log_telemetry alt ON alt.audit_log_id = al.id;
+```
+When operational telemetry expires after 90 days or an account is erased, `alt.ip_address` and `alt.user_agent` evaluate to `NULL`, cleanly matching the TypeScript domain interface `ipAddress?: string | null`.
 
 #### Editorial Curation vs. Future Moderation Boundary Note:
 Stage A editorial workflows (destination approval, rejection, fact auditing, and corrections) are strictly governed by `destination_verifications`, `verification_records`, and `audit_logs`. The general-purpose user-generated content moderation entity (`moderation_records`) is deferred to **Section 11 (Future-Phase Database Boundaries)** alongside `user_reports`, `community_posts`, and `destination_reviews`.
@@ -688,10 +738,29 @@ WHERE d.publication_status = 'published'
   AND vdl.public_coordinates && ST_MakeEnvelope(75.5, 10.5, 76.5, 11.5, 4326)::geography;
 ```
 
-**Plan Verification Criteria**:
-1. **Node Types**: The plan must show `Bitmap Index Scan` on `idx_locations_public_coord_expr` (or `idx_locations_coordinates`) leading to a `Bitmap Heap Scan`. It must **never** show a `Seq Scan` on `destination_locations`.
-2. **Buffer Hit Ratio**: In warm cache scenarios, `Buffers: shared hit` should account for virtually all page reads, with `shared read = 0` or minimal.
-3. **Performance Realism**: Execution durations must never be claimed speculatively in architecture documentation (e.g. "sub-millisecond"). Real-world response times depend directly on table cardinality, spatial density of points in the viewport, disk I/O throughput, available shared memory (`shared_buffers`), and database server concurrency. Benchmarking must occur on representative staging infrastructure.
+**1. View Inlining & Index Pushdown Eligibility**:
+- In PostgreSQL, simple views without aggregates, window functions, `LIMIT`, `OFFSET`, or `UNION` are automatically inlined into the parent query tree during the query rewrite phase.
+- `v_public_destination_locations` is a simple projected view over `destination_locations`. When a query references `vdl.public_coordinates`, PostgreSQL substitutes the underlying expression:
+  ```sql
+  (CASE WHEN dl.is_restricted THEN dl.public_approximate_centroid ELSE dl.coordinates END)
+  ```
+- Because this expression matches `idx_locations_public_coord_expr` identically, the query optimizer recognizes the expression and considers the GiST index path.
+
+**2. Testing with Representative Data**:
+- In development environments with small table cardinalities (e.g., 5 to 50 destinations), the PostgreSQL cost-based optimizer will calculate that reading a single sequential table page (`cost = 1.05`) is significantly cheaper than traversing a multi-level GiST tree and performing random page lookups (`cost = 8.00+`). Under such conditions, `EXPLAIN` will intentionally choose a `Seq Scan`.
+- To verify index behavior accurately, staging environments must populate representative spatial data (e.g. 10,000 synthetic geolocations across Kerala) followed by `ANALYZE destination_locations;` before evaluating execution plans.
+
+**3. Plan Verification Criteria**:
+- **Node Types**: On representative datasets, the plan should show `Bitmap Index Scan` on `idx_locations_public_coord_expr` leading to a `Bitmap Heap Scan`.
+- **Buffer Hit Ratio**: In warm cache scenarios, `Buffers: shared hit` should account for the vast majority of page accesses, with `shared read = 0` or minimal.
+- **Performance Realism**: Execution durations must never be claimed speculatively in architecture documentation. Real-world latency depends on table cardinality, spatial density of points in the viewport, disk I/O throughput, available shared memory (`shared_buffers`), and database server concurrency. Benchmarking must occur on representative staging infrastructure.
+
+**4. Remediation Protocol if PostgreSQL Chooses a Sequential Scan on Large Datasets**:
+If a sequential scan occurs on production-scale data, DBAs must execute the following diagnostic checklist:
+1. *Update Statistics*: Execute `ANALYZE destination_locations;` to ensure the optimizer has current spatial bounding-box histograms.
+2. *Tune Page Cost Constants*: The default `random_page_cost = 4.0` reflects spinning HDDs. On modern cloud SSD / NVMe volumes (AWS EBS gp3, GCP Hyperdisk), setting `random_page_cost = 1.1` accurately models random page retrieval, encouraging index selection.
+3. *Diagnostic Forced Index Scan*: Execute `SET LOCAL enable_seqscan = off;` within the test session. If the planner successfully switches to `Bitmap Index Scan`, compare the estimated cost against the sequential scan cost to identify whether tuning `random_page_cost` or `cpu_operator_cost` is needed.
+4. *Verify Expression Symmetry*: Verify that no implicit type cast or function signature variance has been introduced into the view definition or query that alters the exact expression signature indexed by `idx_locations_public_coord_expr`.
 
 ##### D. Application-Level Parameter Validation & Sanitization
 To prevent denial-of-service through excessive spatial queries or coordinate errors, the application API layer enforces:
@@ -819,6 +888,7 @@ Instead, My Travelroad mandates a human-governed **3-Tier Publication Policy**:
 | `accounts` | `verification_evidence` | 1:N | `submitted_by` | **RESTRICT** | CASCADE | Historical audit proof cannot be orphaned; account must be retained or reassigned. |
 | `accounts` | `verification_records` | 1:N | `verified_by` | **RESTRICT** | CASCADE | Certified audit stamps must permanently retain the certified curator's account reference. |
 | `accounts` | `audit_logs` | 1:N | `actor_account_id` | **RESTRICT** | CASCADE | Audit log integrity requires preserving historical administrative actors. |
+| `audit_logs` | `audit_log_telemetry` | 1:1 | `audit_log_id` | **CASCADE** | CASCADE | Privacy telemetry extension; purging an audit log cascades to its ephemeral telemetry. |
 | `destination_categories` | `destination_categories` | 1:N | `parent_id` | **RESTRICT** | CASCADE | A parent category cannot be deleted while sub-categories depend on it. |
 | `destination_categories` | `destinations` | 1:N | `primary_category_id` | **RESTRICT** | CASCADE | A category cannot be deleted while destinations reference it as their primary taxonomy. |
 | `destinations` | `destination_secondary_categories` | 1:N | `destination_id` | **CASCADE** | CASCADE | Deleting a destination cleans up secondary tag associations. |
@@ -914,17 +984,22 @@ DELETE FROM account_security_credentials WHERE account_id = :target_account_id;
 -- 4. Permanently purge private bookmarks and wishlists
 DELETE FROM saved_destinations WHERE account_id = :target_account_id;
 
--- 5. Anonymize historical audit log actor identities and truncate immediate telemetry
-UPDATE audit_logs
+-- 5. Anonymize historical audit log actor identities and truncate immediate telemetry in audit_log_telemetry
+-- (CRITICAL: audit_logs is NEVER updated, preserving complete ledger immutability)
+UPDATE audit_log_telemetry
 SET 
-    actor_email = 'deleted_' || actor_account_id || '@anonymized.mytravelroad.local',
+    actor_email = 'deleted_' || al.actor_account_id || '@anonymized.mytravelroad.local',
     ip_address = NULL,
-    user_agent = 'Erased-Client-Telemetry'
-WHERE actor_account_id = :target_account_id;
+    user_agent = 'Erased-Client-Telemetry',
+    is_anonymized = TRUE,
+    anonymized_at = CURRENT_TIMESTAMP
+FROM audit_logs al
+WHERE audit_log_telemetry.audit_log_id = al.id
+  AND al.actor_account_id = :target_account_id;
 
--- 6. Sanitize JSONB State Snapshots across audit_logs
+-- 6. Sanitize JSONB State Snapshots in audit_log_telemetry
 -- Strips all personal keys from JSONB snapshots where this account was the target entity
-UPDATE audit_logs
+UPDATE audit_log_telemetry
 SET 
     previous_state_snapshot = CASE 
         WHEN previous_state_snapshot IS NOT NULL THEN 
@@ -939,20 +1014,29 @@ SET
         ELSE NULL 
     END,
     context_notes = 'Operational context redacted upon GDPR Right-to-Erasure compliance.'
-WHERE (entity_type IN ('account', 'tourist_profile') AND entity_id = :target_account_id::text)
-   OR (actor_account_id = :target_account_id);
+FROM audit_logs al
+WHERE audit_log_telemetry.audit_log_id = al.id
+  AND ((al.entity_type IN ('account', 'tourist_profile') AND al.entity_id = :target_account_id::text)
+       OR (al.actor_account_id = :target_account_id));
 
--- 7. Record an irreversible system tombstone event with ZERO personal data
-INSERT INTO audit_logs (
-    actor_account_id, actor_email, actor_role, 
-    ip_address, user_agent, action, entity_type, entity_id, 
-    previous_state_snapshot, new_state_snapshot, context_notes
-) VALUES (
-    :target_account_id, 'system@anonymized.mytravelroad.local', 'system',
-    NULL, 'System-Sanitizer', 'account_anonymized_tombstone', 'account', :target_account_id::text,
-    NULL, '{"tombstone_applied": true}'::jsonb,
-    'GDPR Right-to-Erasure executed. All PII, credentials, wishlists, and JSON snapshots sanitized.'
-);
+-- 7. Record an irreversible system tombstone event (append-only write)
+WITH new_event AS (
+    INSERT INTO audit_logs (
+        actor_account_id, actor_role, action, entity_type, entity_id
+    ) VALUES (
+        :target_account_id, 'system', 'account.anonymized_tombstone', 'account', :target_account_id::text
+    ) RETURNING id
+)
+INSERT INTO audit_log_telemetry (
+    audit_log_id, actor_email, ip_address, user_agent, 
+    new_state_snapshot, context_notes, retention_expires_at, is_anonymized, anonymized_at
+) 
+SELECT 
+    id, 'system@anonymized.mytravelroad.local', NULL, 'System-Sanitizer',
+    '{"tombstone_applied": true}'::jsonb,
+    'GDPR Right-to-Erasure executed. All PII, credentials, wishlists, and JSON snapshots sanitized.',
+    CURRENT_TIMESTAMP, TRUE, CURRENT_TIMESTAMP
+FROM new_event;
 
 COMMIT;
 ```
@@ -990,6 +1074,7 @@ erDiagram
     DESTINATION_VERIFICATIONS ||--o{ VERIFICATION_EVIDENCE : "holds evidence (1:N)"
     DESTINATION_VERIFICATIONS ||--o{ VERIFICATION_RECORDS : "contains audits (1:N)"
     VERIFICATION_EVIDENCE ||--o{ VERIFICATION_RECORDS : "substantiates (0..1:N)"
+    AUDIT_LOGS ||--o| AUDIT_LOG_TELEMETRY : "ephemeral telemetry (1:0..1)"
 
     ACCOUNTS {
         uuid id PK
@@ -1144,15 +1229,24 @@ erDiagram
     AUDIT_LOGS {
         uuid id PK
         uuid actor_account_id FK
-        varchar actor_email
         varchar actor_role
-        inet ip_address
         varchar action
         varchar entity_type
         varchar entity_id
+        timestamptz timestamp
+    }
+
+    AUDIT_LOG_TELEMETRY {
+        uuid audit_log_id PK,FK
+        varchar actor_email
+        inet ip_address
+        text user_agent
         jsonb previous_state_snapshot
         jsonb new_state_snapshot
-        timestamptz timestamp
+        text context_notes
+        timestamptz retention_expires_at
+        boolean is_anonymized
+        timestamptz anonymized_at
     }
 ```
 
@@ -1190,10 +1284,12 @@ Indexes accelerate lookups but incur storage overhead and slow down insert/updat
 | `audit_logs` | `idx_audit_actor` | B-tree | `actor_account_id` | Auditor inspection of specific administrator activity. |
 | `audit_logs` | `idx_audit_entity` | B-tree (Composite) | `(entity_type, entity_id)` | History trail of changes to a specific destination or record. |
 | `audit_logs` | `idx_audit_timestamp` | B-tree | `timestamp DESC` | Reverse-chronological audit feed. |
+| `audit_log_telemetry` | `idx_telemetry_expiry` | B-tree (Partial) | `retention_expires_at WHERE is_anonymized = FALSE` | Fast batch identification of telemetry records eligible for 90-day truncation. |
+| `audit_log_telemetry` | `idx_telemetry_actor_email` | B-tree (Partial) | `actor_email WHERE actor_email IS NOT NULL` | Identification of historical actor emails for Right-to-Erasure sanitization. |
 
 ### 7.2 Indexes Explicitly Avoided at Stage A
 - **Full-Text Search (tsvector GIN) on `destinations.full_description`**: Avoided at Stage A because destination volume (~hundreds) is efficiently handled via short description / title B-tree prefix searches or PostgreSQL `ILIKE`. Trigram/tsvector GIN indexes will be provisioned in Stage B when full-text search requirements are profiled.
-- **B-tree on `audit_logs.new_state_snapshot`**: Large JSONB payloads should not be indexed arbitrarily; only specific query keys should be indexed via expression indexes if audit filtering needs arise.
+- **B-tree on `audit_log_telemetry.new_state_snapshot`**: Large JSONB payloads should not be indexed arbitrarily; only specific query keys should be indexed via expression indexes if audit filtering needs arise.
 - **Index on `accounts.phone`**: While unique, a separate non-unique index is redundant with the `UNIQUE` constraint index.
 
 ---
@@ -1209,28 +1305,19 @@ Indexes accelerate lookups but incur storage overhead and slow down insert/updat
 
 ### 8.2 Role and Privilege Escalation Prevention
 
-#### 1. Why Session-Variable Checks (`current_setting`) Are Insecure
-The red-team review correctly flagged a critical vulnerability in the previous proposal: trusting `current_setting('app.current_actor_role', true)`.
-- In PostgreSQL, custom configuration settings (GUCs) with prefixes like `app.*` are not restricted to superusers. Any database session can execute:
-  ```sql
-  SET LOCAL app.current_actor_role = 'super_admin';
-  -- OR
-  SELECT set_config('app.current_actor_role', 'super_admin', false);
-  ```
-- If an attacker exploits an SQL injection vulnerability or compromises a server running with the standard application role, they can easily forge this session variable within their transaction prior to executing the `UPDATE`.
-- **Core Security Rule**: A database trigger checking a user-writable session variable does **not** constitute a trusted authorization boundary.
+#### 1. Why Session-Variable Checks & Target Fallbacks Are Insecure
+The red-team review correctly flagged two significant flaws in the previous design:
+1. **Forgeable Session Variables**: In PostgreSQL, custom configuration settings (GUCs) like `app.actor_account_id` are caller-controlled. Any client connection can run `SET LOCAL app.actor_account_id = '<arbitrary-uuid>';`. Checking such variables does **not** establish a trusted human identity.
+2. **Misattribution via `NEW.id` Fallback**: In the previous trigger, falling back to `NEW.id` when no session setting was found resulted in attributing the role change to the *target account* (the user being promoted). If an administrator promotes User X from traveler to curator, the database would record that User X promoted themselves. This is completely false attribution and defeats audit integrity.
 
-#### 2. Architectural Boundary: Application vs. Database Authorization
-My Travelroad enforces a strict defense-in-depth separation:
-- **Application Authorization (Business Logic)**:
-  - The API tier authenticates the user's session (verifying JWT / cryptographically signed session cookie).
-  - It validates multi-factor authentication (MFA) and confirms that `actor.role === 'super_admin'`.
-  - Only authenticated super-admin requests are routed to the privileged administrative service.
-- **Database Authorization (Engine Enforcement)**:
-  - Database-level security does not rely on application compliance or session variables.
-  - The database engine itself enforces column-level privileges so that the standard web application pool (`app_user`) physically lacks the SQL permission to modify the `role` column.
+#### 2. The Architectural Reality: Database Roles vs. Human Identity
+In modern web applications utilizing connection pooling:
+- The database engine authenticates the *shared database user* (`admin_service_role`), not the individual human administrator.
+- The PostgreSQL database engine **cannot** independently verify which human administrator (e.g. Alice vs. Bob) authenticated to the web interface.
+- Therefore, human identity verification and actor attribution are strictly **application-tier responsibilities**. Claims that a database trigger can independently verify human identity without application context are technically unfounded.
 
 #### 3. Database Privilege Configuration & Role Separation
+To guarantee defense-in-depth, database engine-level privileges prevent unauthorized callers from modifying roles:
 
 ```sql
 -- ==============================================================================
@@ -1245,69 +1332,131 @@ GRANT UPDATE (email, phone, status, last_login_at, updated_at) ON accounts TO ap
 -- will be immediately halted by PostgreSQL: ERROR: permission denied for column "role"
 
 -- 2. Privileged Administrative Service Role (admin_service_role)
--- Used exclusively by internal administrative workers / server actions
+-- Used exclusively by authenticated administrative workers / server actions
 GRANT UPDATE (role, status, updated_at) ON accounts TO admin_service_role;
 ```
 
-#### 4. Immutable Role Change Audit Trigger
-To ensure non-repudiation whenever an authorized role elevation is executed by `admin_service_role`, an `AFTER UPDATE` trigger automatically records the transition in `audit_logs`:
+#### 4. Role Change Auditing Across All Operational Scenarios
+
+##### Scenario A: Authoritative Application-Tier Role Change (Standard Flow)
+All legitimate administrative operations go through the server-side `AccountAdministrationService`:
+1. The service validates the administrator's JWT, MFA credentials, and verifies that `actor.role === 'super_admin'`.
+2. The service establishes a connection as `admin_service_role` and executes an atomic transaction:
+   ```sql
+   BEGIN;
+   -- 1. Update the account role
+   UPDATE accounts 
+   SET role = :new_role, updated_at = CURRENT_TIMESTAMP 
+   WHERE id = :target_account_id;
+
+   -- 2. Insert immutable audit event with verified human administrator attribution
+   WITH event AS (
+       INSERT INTO audit_logs (
+           actor_account_id, actor_role, action, entity_type, entity_id
+       ) VALUES (
+           :verified_admin_account_id, 'super_admin', 'account.role_elevate', 'account', :target_account_id::text
+       ) RETURNING id
+   )
+   -- 3. Insert attributable telemetry and administrative justification
+   INSERT INTO audit_log_telemetry (
+       audit_log_id, actor_email, ip_address, user_agent,
+       previous_state_snapshot, new_state_snapshot, context_notes,
+       retention_expires_at, is_anonymized
+   )
+   SELECT 
+       id, :verified_admin_email, :admin_ip::inet, :admin_user_agent,
+       jsonb_build_object('role', :old_role),
+       jsonb_build_object('role', :new_role),
+       :justification_ticket_reference,
+       CURRENT_TIMESTAMP + INTERVAL '90 days',
+       FALSE
+   FROM event;
+   COMMIT;
+   ```
+
+##### Scenario B: Failed or Unauthorized Role Change Attempts
+1. **Unauthorized Web API Request**: If an unauthorized traveler or attacker issues an API request to modify a role, the application authorization layer rejects the request with `403 Forbidden`. The API tier asynchronously logs a security event via an isolated logging connection (`action = 'security.unauthorized_role_elevation_attempt'`), capturing the caller's IP, account ID, and timestamp.
+2. **Direct SQL Injection on `app_user`**: If an attacker attempts `UPDATE accounts SET role = ...` via an application SQL injection on `app_user`, PostgreSQL halts the query with `ERROR: permission denied for column "role" of relation "accounts"`. The failure is recorded in the PostgreSQL server log.
+
+##### Scenario C: Exceptional / Out-of-Band Direct Database Updates (DBA Safety Net)
+If an update to `accounts.role` is executed directly via `psql` or an external tool using `admin_service_role` or a PostgreSQL superuser outside the application service, a database safety trigger fires to ensure non-repudiation:
 
 ```sql
-CREATE OR REPLACE FUNCTION trg_audit_account_role_change()
+CREATE OR REPLACE FUNCTION trg_audit_out_of_band_role_change()
 RETURNS TRIGGER AS $$
+DECLARE
+    v_audit_id UUID;
 BEGIN
-    IF NEW.role IS DISTINCT FROM OLD.role THEN
-        INSERT INTO audit_logs (
-            actor_account_id,
-            actor_email,
-            actor_role,
-            action,
-            entity_type,
-            entity_id,
-            previous_state_snapshot,
-            new_state_snapshot,
-            context_notes
-        ) VALUES (
-            -- Actor ID captured from authenticated session context or fallback to system
-            COALESCE(NULLIF(current_setting('app.actor_account_id', true), '')::uuid, NEW.id),
-            COALESCE(NULLIF(current_setting('app.actor_email', true), ''), 'admin_service@mytravelroad.local'),
-            'super_admin',
-            'account_role_elevated',
-            'account',
-            NEW.id::text,
-            jsonb_build_object('role', OLD.role),
-            jsonb_build_object('role', NEW.role),
-            'Role modified via admin_service_role authorization.'
-        );
-    END IF;
+    -- NEVER fall back to NEW.id! Attribute to dedicated SYSTEM / OUT-OF-BAND identity
+    INSERT INTO audit_logs (
+        actor_account_id,
+        actor_role,
+        action,
+        entity_type,
+        entity_id
+    ) VALUES (
+        '00000000-0000-0000-0000-000000000000'::uuid, -- Dedicated System/Out-of-Band UUID
+        session_user::text,                           -- Captures PostgreSQL session role
+        'account.role_change_out_of_band',
+        'account',
+        NEW.id::text
+    ) RETURNING id INTO v_audit_id;
+
+    INSERT INTO audit_log_telemetry (
+        audit_log_id,
+        actor_email,
+        ip_address,
+        user_agent,
+        previous_state_snapshot,
+        new_state_snapshot,
+        context_notes,
+        retention_expires_at,
+        is_anonymized
+    ) VALUES (
+        v_audit_id,
+        session_user || '@database.local',
+        inet_client_addr(),
+        'PostgreSQL Direct Connection / DBA Tool',
+        jsonb_build_object('role', OLD.role),
+        jsonb_build_object('role', NEW.role),
+        'CRITICAL: Role modified directly in database outside application service layer. Investigating DBA session.',
+        CURRENT_TIMESTAMP + INTERVAL '365 days',
+        FALSE
+    );
+
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 CREATE TRIGGER trg_audit_account_role_elevation
 AFTER UPDATE OF role ON accounts
-FOR EACH ROW EXECUTE FUNCTION trg_audit_account_role_change();
+FOR EACH ROW 
+WHEN (OLD.role IS DISTINCT FROM NEW.role)
+EXECUTE FUNCTION trg_audit_out_of_band_role_change();
 ```
 
 #### 5. Assumptions and Limitations
-1. **Connection Pool Isolation**: This model assumes that standard web traffic connects via the `app_user` database pool, while administrative workflows connect via a separate, authenticated `admin_service_role` pool. If both services share credentials or connect as the database owner, database authorization boundaries are collapsed.
-2. **No Role Inheritance**: `app_user` must not be granted `admin_service_role`, `postgres`, or `SUPERUSER`.
-3. **Infrastructure Controls**: Direct database administration (e.g. by DBAs) requires audited cloud IAM access, as PostgreSQL superusers naturally bypass column-level grant checks.
+1. **Connection Pool Isolation**: The security model relies on strict physical connection pool separation: standard user traffic connects via `app_user`, and administrative actions connect via `admin_service_role`.
+2. **No Role Inheritance**: `app_user` must not be granted `admin_service_role` or `SUPERUSER`.
+3. **Application Layer Trust Boundary**: In pooled environments, the database trusts `admin_service_role` queries to carry accurately asserted administrative actor IDs. This requires thorough code reviews, authenticated internal APIs, and audited server actions.
 
 ---
 
-### 8.3 Audit Log Immutability
-To guarantee compliance with regulatory audit standards:
-```sql
--- Database-level immutability enforcement
-REVOKE UPDATE, DELETE ON audit_logs FROM app_user;
-REVOKE TRUNCATE ON audit_logs FROM app_user;
+### 8.3 Audit Log Immutability & Two-Table Privilege Separation
+To resolve the contradiction between immutable ledgers and data-privacy regulations (GDPR / DPDP), privileges are separated across the two audit tables:
 
--- Defense trigger ensuring rows cannot be modified even if role privileges misconfigured
+#### 1. Core Ledger Immutability (`audit_logs`)
+The core ledger is 100% append-only and mathematically immutable. No role, including `admin_service_role`, can modify or delete historical audit entries:
+
+```sql
+-- Database-level immutability enforcement on audit_logs
+REVOKE UPDATE, DELETE, TRUNCATE ON audit_logs FROM PUBLIC, app_user, admin_service_role;
+
+-- Unconditional trigger preventing ANY mutation on the core audit ledger
 CREATE OR REPLACE FUNCTION trg_prevent_audit_log_mutation()
 RETURNS TRIGGER AS $$
 BEGIN
-    RAISE EXCEPTION 'Audit log entries are immutable and cannot be updated or deleted.';
+    RAISE EXCEPTION 'Audit log entries in audit_logs are permanently immutable and cannot be updated or deleted.';
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1315,6 +1464,23 @@ CREATE TRIGGER trg_audit_logs_immutable
 BEFORE UPDATE OR DELETE ON audit_logs
 FOR EACH ROW EXECUTE FUNCTION trg_prevent_audit_log_mutation();
 ```
+
+#### 2. Auxiliary Privacy Telemetry Privileges (`audit_log_telemetry`)
+Personal telemetry and state snapshots live in `audit_log_telemetry`, subject to strict lifecycle controls:
+
+```sql
+-- Restrict telemetry access from standard web pool
+REVOKE ALL ON audit_log_telemetry FROM PUBLIC, app_user;
+
+-- Administrative service can insert new telemetry and read for audit reporting
+GRANT SELECT, INSERT ON audit_log_telemetry TO admin_service_role;
+
+-- Narrowly scoped maintenance role for retention truncation and Right-to-Erasure
+GRANT SELECT, UPDATE, DELETE ON audit_log_telemetry TO audit_maintenance_role;
+```
+- `audit_maintenance_role` is a specialized database user used exclusively by the scheduled batch retention worker and the GDPR erasure processor.
+- Neither `app_user` nor `admin_service_role` has `UPDATE` or `DELETE` on `audit_log_telemetry`.
+- Because `audit_logs` is never updated, the immutable trigger `trg_audit_logs_immutable` is never violated. Immutability and privacy compliance co-exist without architectural contradiction.
 
 ---
 
@@ -1347,8 +1513,9 @@ FOR EACH ROW EXECUTE FUNCTION trg_prevent_audit_log_mutation();
 | **`account_security_credentials`** | `password_hash`, `mfa_secret_encrypted`, lockouts | GDPR Art. 6(1)(b) (Security of Processing) | Duration of active account. | **Hard-deleted** immediately upon deletion request execution. |
 | **`tourist_profiles`** | `display_name`, `handle`, `avatar_url`, `bio`, `preferences` | GDPR Art. 6(1)(a) (Consent / Profile) | Duration of active account. | Scrubbed to generic `Former Traveler`, avatar/bio purged, preferences cleared. |
 | **`saved_destinations`** | `(account_id, destination_id)`, personal notes | GDPR Art. 6(1)(a) (User Feature) | Duration of active account. | **Hard-deleted** via cascade upon account deletion execution. |
-| **`audit_logs` (Security Telemetry)** | `ip_address`, `user_agent` | GDPR Art. 6(1)(f) (Legitimate Interest: Abuse defense) | **90 days** from event timestamp. | Truncated to `NULL` / generic telemetry string via daily automated maintenance job. |
-| **`audit_logs` (Administrative Provenance)** | `actor_role`, `action`, `entity_type`, `entity_id`, `timestamp` | GDPR Art. 6(1)(c) (Legal Obligation: Non-repudiation) | **7 years** for regulatory accountability. | Preserved permanently. Historical actor email replaced with anonymous tombstone alias; JSON snapshots stripped of PII. |
+| `audit_logs` (Core Ledger) | `actor_account_id`, `actor_role`, `action`, `entity_type`, `entity_id`, `timestamp` | GDPR Art. 6(1)(c) (Legal Obligation: Non-repudiation) | **Permanent / 7+ years** for regulatory accountability. | **100% Immutable**. Never updated or deleted. Unconditional trigger blocks mutation. |
+| `audit_log_telemetry` (Security Telemetry) | `ip_address`, `user_agent` | GDPR Art. 6(1)(f) (Legitimate Interest: Abuse defense) | **90 days** from event timestamp. | Truncated to `NULL` / generic telemetry string via daily automated maintenance job. |
+| `audit_log_telemetry` (State Snapshots & Context) | `actor_email`, `previous_state_snapshot`, `new_state_snapshot`, `context_notes` | GDPR Art. 6(1)(c) & Art. 17 (Right-to-Erasure) | Retained with audit event; sanitized upon account erasure. | Historical actor email anonymized to tombstone alias; JSON snapshots stripped of personal keys (`email`, `phone`, `bio`, etc.). |
 | **`verification_records`** | `field`, `status`, `hash`, `timestamp`, `verified_by` | Tourism Data Integrity & Factual Accuracy | **Permanent**. | Certified fact stamps preserved. `verified_by` references the anonymous staff tombstone UUID. |
 | **`verification_evidence`** | Government gazettes, circulars, official survey maps | Public Information & Administrative Record | **Permanent**. | Public official citations preserved. Personal employee identification documents scrubbed. |
 | **`destinations`** | Title, description, operational schedule, gallery | Platform Content | Indefinite archival (`archived` status) for historical URLs. | Soft-archived to preserve URL integrity and search indexing history. |
@@ -1368,9 +1535,9 @@ FOR EACH ROW EXECUTE FUNCTION trg_prevent_audit_log_mutation();
 
 ### Phase 3: Verification & Audit Layer (Stage A Completion)
 6. Provision `destination_verifications`, `verification_evidence`, `verification_records`.
-7. Provision `saved_destinations` and `audit_logs`.
-8. Apply immutability triggers (`trg_audit_logs_immutable`), role audit triggers (`trg_audit_account_role_elevation`), and public views (`v_public_destination_locations`).
-9. Configure PostgreSQL database roles (`app_user` vs. `admin_service_role`) and column-level update privileges.
+7. Provision `saved_destinations`, `audit_logs` (core ledger), and `audit_log_telemetry` (auxiliary privacy extension).
+8. Apply immutability triggers (`trg_audit_logs_immutable`), safety role audit triggers (`trg_audit_account_role_elevation`), and public views (`v_public_destination_locations`, `v_domain_audit_logs`).
+9. Configure PostgreSQL database roles (`app_user`, `admin_service_role`, `audit_maintenance_role`) and column-level update privileges.
 
 ### Phase 4: Social & UGC Moderation Expansion (Future Phase Milestone)
 10. Provision `business_profiles`, `community_posts`, `destination_reviews`, `user_reports`, and `moderation_records`.
@@ -1523,3 +1690,11 @@ CREATE INDEX idx_reports_status ON user_reports (status);
 ### 12.6 PostgreSQL View Security: Definer Views (`security_invoker = false`) vs. Invoker Views
 - **Decision**: Maintain standard PostgreSQL view-owner execution semantics (`security_invoker = false`) with ownership assigned to `schema_owner`.
 - **Trade-Off**: In PostgreSQL 15+, setting `security_invoker = true` forces permission checks against the calling role (`app_user`). Because `app_user` must be strictly forbidden from accessing raw coordinates on `destination_locations`, setting `security_invoker = true` would cause all public map queries to fail with permission errors. Definer views allow `schema_owner` to read the base table, apply the 3-tier coordinate masking logic, and return only sanitized data, while `app_user` has zero table-level read privileges.
+
+### 12.7 Two-Table Audit Ledger Architecture vs. Single-Table Mutable Triggers
+- **Decision**: Decouple audit records into `audit_logs` (Core Immutable Ledger) and `audit_log_telemetry` (Auxiliary Privacy Extension).
+- **Trade-Off**: A single-table design with an immutable trigger creates an inescapable contradiction: either the trigger must contain conditional bypass logic for maintenance roles (which compromises verifiable immutability and tamper-evidence guarantees), or data minimization and GDPR Right-to-Erasure cannot be legally executed. The Two-Table separation allows `audit_logs` to remain 100% append-only and unconditionally immutable, while personal telemetry (`ip_address`, `user_agent`, JSON snapshots) in `audit_log_telemetry` can be truncated after 90 days and sanitized on account erasure under strict maintenance role permissions. The application reconstructs the full domain model via view `v_domain_audit_logs`.
+
+### 12.8 PostGIS View Inlining and Expression Index Pushdown
+- **Decision**: Define `idx_locations_public_coord_expr` matching the exact expression projected by `v_public_destination_locations`.
+- **Trade-Off**: Creating an expression index consumes additional disk storage and incurs a minor write overhead on destination insert/update. However, because simple non-aggregate views in PostgreSQL are inlined directly into query trees during the query rewrite phase, the expression index allows public map viewport queries (`&&`) to execute high-performance GiST bitmap index scans directly against the view without requiring caller queries to reference the underlying base table. On small datasets, PostgreSQL naturally chooses sequential scans due to cost calculations; production benchmarking requires representative data volume and updated statistics.
