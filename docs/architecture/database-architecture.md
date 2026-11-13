@@ -89,21 +89,96 @@ CREATE INDEX idx_accounts_status ON accounts (status);
 CREATE INDEX idx_accounts_role ON accounts (role);
 
 -- ==============================================================================
--- ROOT SYSTEM ACCOUNT SPECIFICATION & IMMUTABILITY TRIGGER
+-- IDEMPOTENT ROOT SYSTEM ACCOUNT PROVISIONING & CONFLICT HANDLING
 -- ==============================================================================
--- A deterministic root system identity is provisioned during migration:
--- UUID:   '00000000-0000-4000-8000-000000000001'
--- Email:  'system-internal@mytravelroad.local'
--- Type:   'system'
--- Role:   'super_admin'
--- Status: 'active'
+-- Executed in Phase 1 migration immediately following `CREATE TABLE accounts`.
+-- Guarantees the existence of the root system actor before any dependent tables,
+-- foreign keys (fk_audit_actor), or triggers are evaluated.
 --
--- Security Profile & Invariants:
--- 1. Satisfies Foreign Key: Satisfies fk_audit_actor (audit_logs) for automated system routines.
--- 2. No Authentication Credentials: Zero entries in account_security_credentials.
--- 3. No Public Persona: Zero entries in tourist_profiles or saved_destinations.
--- 4. Inability to Authenticate: Cannot log in via public API, OAuth, or session endpoints.
--- 5. Immutability Guard: Protected by database trigger against deletion or status/role mutation.
+-- Migration Idempotency & Conflict Strategy:
+-- 1. If 00000000-0000-4000-8000-000000000001 already exists with identical attributes,
+--    the script is a safe no-op.
+-- 2. If 00000000-0000-4000-8000-000000000001 exists with conflicting identity or security
+--    attributes, migration halts immediately with RAISE EXCEPTION, preventing silent corruption.
+-- 3. If system-internal@mytravelroad.local is occupied by a different UUID, migration halts
+--    with RAISE EXCEPTION for manual DBA investigation.
+
+DO $$
+DECLARE
+    v_existing_by_id RECORD;
+    v_existing_by_email RECORD;
+BEGIN
+    SELECT * INTO v_existing_by_id FROM accounts WHERE id = '00000000-0000-4000-8000-000000000001'::uuid;
+    SELECT * INTO v_existing_by_email FROM accounts WHERE LOWER(email) = LOWER('system-internal@mytravelroad.local');
+
+    -- 1. Validate reserved UUID state
+    IF v_existing_by_id.id IS NOT NULL THEN
+        IF v_existing_by_id.email != 'system-internal@mytravelroad.local' 
+           OR v_existing_by_id.type != 'system' 
+           OR v_existing_by_id.role != 'super_admin' 
+           OR v_existing_by_id.status != 'active'
+           OR v_existing_by_id.phone IS NOT NULL
+           OR v_existing_by_id.email_verified != TRUE
+           OR v_existing_by_id.phone_verified != FALSE THEN
+            RAISE EXCEPTION 'MIGRATION CONFLICT: Reserved root system UUID 00000000-0000-4000-8000-000000000001 is already occupied by a conflicting record (email: %, type: %, role: %, status: %). Manual DBA resolution required.', 
+                v_existing_by_id.email, v_existing_by_id.type, v_existing_by_id.role, v_existing_by_id.status;
+        END IF;
+    END IF;
+
+    -- 2. Validate reserved Email state
+    IF v_existing_by_email.id IS NOT NULL AND v_existing_by_email.id != '00000000-0000-4000-8000-000000000001'::uuid THEN
+        RAISE EXCEPTION 'MIGRATION CONFLICT: Reserved root system email system-internal@mytravelroad.local is occupied by conflicting UUID %. Manual DBA resolution required.', 
+            v_existing_by_email.id;
+    END IF;
+
+    -- 3. Idempotent insertion
+    IF v_existing_by_id.id IS NULL THEN
+        INSERT INTO accounts (
+            id, email, email_verified, phone, phone_verified, status, type, role, created_at, updated_at
+        ) VALUES (
+            '00000000-0000-4000-8000-000000000001'::uuid,
+            'system-internal@mytravelroad.local',
+            TRUE,
+            NULL,
+            FALSE,
+            'active',
+            'system',
+            'super_admin',
+            CURRENT_TIMESTAMP,
+            CURRENT_TIMESTAMP
+        );
+    END IF;
+END;
+$$;
+
+-- ==============================================================================
+-- ROOT SYSTEM ACCOUNT PROTECTION & TOTAL IDENTITY IMMUTABILITY TRIGGER
+-- ==============================================================================
+-- Invariant Specification:
+-- The Root System Account (00000000-0000-4000-8000-000000000001) is an internal non-human
+-- security principal. Its identity and security attributes are 100% immutable:
+-- - id: Strict invariant. Cannot be modified.
+-- - email: Strict invariant. Must remain 'system-internal@mytravelroad.local'.
+-- - phone: Strict invariant. Must remain NULL.
+-- - email_verified: Strict invariant. Must remain TRUE.
+-- - phone_verified: Strict invariant. Must remain FALSE.
+-- - status: Strict invariant. Must remain 'active' (cannot be deactivated or suspended).
+-- - type: Strict invariant. Must remain 'system'.
+-- - role: Strict invariant. Must remain 'super_admin'.
+-- - created_at: Strict invariant. Cannot be modified.
+-- - last_login_at: Strict invariant. Must remain NULL (system account never logs in interactively).
+--
+-- Deliberately Mutable Operational Field:
+-- - updated_at: The sole operational field permitted to change if database maintenance
+--   scripts execute an explicit touch query for administrative housekeeping.
+--
+-- Privileged Infrastructure Boundary & Superuser Limitations:
+-- In PostgreSQL, database owners (schema_owner) and SUPERUSER accounts can bypass table
+-- triggers using `ALTER TABLE accounts DISABLE TRIGGER ALL;`. Therefore, in-database triggers
+-- form an application-tier and standard DBA guardrail, but cannot replace infrastructure security.
+-- Privileged database infrastructure access must be restricted to named DBAs via audited
+-- bastion hosts, and all engine-level DDL/DML statements must be logged via `pgaudit` and streamed
+-- to immutable external storage.
 
 CREATE OR REPLACE FUNCTION trg_protect_system_account()
 RETURNS TRIGGER AS $$
@@ -113,9 +188,37 @@ BEGIN
     END IF;
 
     IF (TG_OP = 'UPDATE' AND OLD.id = '00000000-0000-4000-8000-000000000001'::uuid) THEN
-        IF NEW.status != 'active' OR NEW.role != 'super_admin' OR NEW.type != 'system' THEN
-            RAISE EXCEPTION 'FATAL: Root system account status, role, and type are immutable.';
+        IF NEW.id != OLD.id THEN
+            RAISE EXCEPTION 'FATAL: Root system account id is immutable.';
         END IF;
+        IF NEW.email != 'system-internal@mytravelroad.local' THEN
+            RAISE EXCEPTION 'FATAL: Root system account email is immutable.';
+        END IF;
+        IF NEW.phone IS NOT NULL THEN
+            RAISE EXCEPTION 'FATAL: Root system account phone must remain NULL.';
+        END IF;
+        IF NEW.email_verified != TRUE THEN
+            RAISE EXCEPTION 'FATAL: Root system account email_verified must remain TRUE.';
+        END IF;
+        IF NEW.phone_verified != FALSE THEN
+            RAISE EXCEPTION 'FATAL: Root system account phone_verified must remain FALSE.';
+        END IF;
+        IF NEW.status != 'active' THEN
+            RAISE EXCEPTION 'FATAL: Root system account status must remain active.';
+        END IF;
+        IF NEW.type != 'system' THEN
+            RAISE EXCEPTION 'FATAL: Root system account type must remain system.';
+        END IF;
+        IF NEW.role != 'super_admin' THEN
+            RAISE EXCEPTION 'FATAL: Root system account role must remain super_admin.';
+        END IF;
+        IF NEW.created_at != OLD.created_at THEN
+            RAISE EXCEPTION 'FATAL: Root system account created_at is immutable.';
+        END IF;
+        IF NEW.last_login_at IS NOT NULL THEN
+            RAISE EXCEPTION 'FATAL: Root system account cannot record interactive logins.';
+        END IF;
+        -- Note: updated_at is the sole operational field permitted to mutate.
     END IF;
 
     RETURN NEW;
@@ -127,6 +230,26 @@ BEFORE UPDATE OR DELETE ON accounts
 FOR EACH ROW
 WHEN (OLD.id = '00000000-0000-4000-8000-000000000001'::uuid)
 EXECUTE FUNCTION trg_protect_system_account();
+
+-- ==============================================================================
+-- GENERALIZED SYSTEM-ACCOUNT CHILD RECORD PREVENTION TRIGGER
+-- ==============================================================================
+-- Enforces the No-Credential / No-Profile Invariant at the database engine level.
+-- Prohibits ANY account of type = 'system' from acquiring security credentials,
+-- public profiles, or private bookmarks.
+
+CREATE OR REPLACE FUNCTION trg_prevent_system_account_child_records()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_account_type VARCHAR(32);
+BEGIN
+    SELECT type INTO v_account_type FROM accounts WHERE id = NEW.account_id;
+    IF v_account_type = 'system' THEN
+        RAISE EXCEPTION 'INTEGRITY VIOLATION: System accounts (type = system) are strictly barred from possessing security credentials, tourist profiles, or saved destinations.';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 ```
 
 ---
@@ -148,10 +271,24 @@ CREATE TABLE account_security_credentials (
 
     CONSTRAINT fk_security_account FOREIGN KEY (account_id) 
         REFERENCES accounts(id) ON DELETE CASCADE ON UPDATE CASCADE,
-    CONSTRAINT ck_security_failed_attempts CHECK (failed_login_attempts >= 0)
+    CONSTRAINT ck_security_failed_attempts CHECK (failed_login_attempts >= 0),
+    CONSTRAINT ck_security_no_system_account CHECK (account_id != '00000000-0000-4000-8000-000000000001'::uuid)
 );
 
 CREATE INDEX idx_security_locked_until ON account_security_credentials (locked_until) WHERE locked_until IS NOT NULL;
+
+-- Prevent any system-type account from acquiring credentials
+CREATE TRIGGER trg_guard_no_system_credentials
+BEFORE INSERT OR UPDATE ON account_security_credentials
+FOR EACH ROW
+EXECUTE FUNCTION trg_prevent_system_account_child_records();
+```
+
+#### Database-Level Enforcement of the No-Credential Invariant
+The Root System Account (`00000000-0000-4000-8000-000000000001`) and any account with `type = 'system'` must NEVER possess authentication credentials. This invariant is enforced at the database layer through dual mechanisms:
+1. **Static Engine-Level CHECK Constraint**: `ck_security_no_system_account` rejects any insert or update targeting the reserved system UUID with zero runtime overhead.
+2. **Dynamic Cross-Table Trigger**: `trg_guard_no_system_credentials` fires before insert or update, querying `accounts.type` to reject any system-type account.
+Together with the exclusion of the system account from public authentication APIs, these safeguards guarantee that password hashes, MFA secrets, and interactive login sessions can never be provisioned or exploited for the system identity.
 ```
 
 #### Cryptographic Architecture & Password Security Specification
@@ -208,12 +345,19 @@ CREATE TABLE tourist_profiles (
     CONSTRAINT fk_profiles_account FOREIGN KEY (account_id) 
         REFERENCES accounts(id) ON DELETE CASCADE ON UPDATE CASCADE,
     CONSTRAINT ck_profiles_handle_format CHECK (handle ~ '^[a-zA-Z0-9_]{3,50}$'),
-    CONSTRAINT ck_profiles_display_name_length CHECK (length(trim(display_name)) >= 2)
+    CONSTRAINT ck_profiles_display_name_length CHECK (length(trim(display_name)) >= 2),
+    CONSTRAINT ck_profiles_no_system_account CHECK (account_id != '00000000-0000-4000-8000-000000000001'::uuid)
 );
 
 -- Case-insensitive unique index on public handle
 CREATE UNIQUE INDEX idx_profiles_handle_lower ON tourist_profiles (LOWER(handle));
 CREATE INDEX idx_profiles_travel_preferences ON tourist_profiles USING GIN (travel_preferences);
+
+-- Prevent any system-type account from acquiring a tourist profile
+CREATE TRIGGER trg_guard_no_system_profiles
+BEFORE INSERT OR UPDATE ON tourist_profiles
+FOR EACH ROW
+EXECUTE FUNCTION trg_prevent_system_account_child_records();
 ```
 
 ---
@@ -563,12 +707,19 @@ CREATE TABLE saved_destinations (
     CONSTRAINT fk_saved_account FOREIGN KEY (account_id) 
         REFERENCES accounts(id) ON DELETE CASCADE ON UPDATE CASCADE,
     CONSTRAINT fk_saved_destination FOREIGN KEY (destination_id) 
-        REFERENCES destinations(id) ON DELETE CASCADE ON UPDATE CASCADE
+        REFERENCES destinations(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT ck_saved_no_system_account CHECK (account_id != '00000000-0000-4000-8000-000000000001'::uuid)
 );
 
 CREATE INDEX idx_saved_account_id ON saved_destinations (account_id);
 CREATE INDEX idx_saved_destination_id ON saved_destinations (destination_id);
 CREATE INDEX idx_saved_collection ON saved_destinations (account_id, collection_name) WHERE collection_name IS NOT NULL;
+
+-- Prevent any system-type account from saving destination bookmarks
+CREATE TRIGGER trg_guard_no_system_bookmarks
+BEFORE INSERT OR UPDATE ON saved_destinations
+FOR EACH ROW
+EXECUTE FUNCTION trg_prevent_system_account_child_records();
 ```
 
 ---
@@ -1530,22 +1681,27 @@ GRANT SELECT, UPDATE, DELETE ON audit_log_telemetry TO audit_maintenance_role;
 
 ### Phase 1: Core Extension & Foundation Migration
 1. Enable extensions: `CREATE EXTENSION IF NOT EXISTS "uuid-ossp";` and `CREATE EXTENSION IF NOT EXISTS "postgis";`.
-2. Provision `accounts`, `account_security_credentials` (Argon2id without salt column), `tourist_profiles`.
-3. Seed Root System Account: Insert seeded identity `00000000-0000-4000-8000-000000000001` (`system-internal@mytravelroad.local`, type: `system`, role: `super_admin`, status: `active`) and install protective trigger `trg_guard_system_account`.
+2. Provision `accounts` table with unique indexes and status/role check constraints.
+3. Provision Root System Account: Execute the idempotent PL/pgSQL seeding block with pre-execution conflict checks for `00000000-0000-4000-8000-000000000001` and `system-internal@mytravelroad.local`.
+4. Install `trg_guard_system_account` protection trigger on `accounts` locking down all 10 identity and security attributes.
+5. Install generalized `trg_prevent_system_account_child_records` function.
+6. Provision `account_security_credentials` (Argon2id without salt column) with static constraint `ck_security_no_system_account` and attach trigger `trg_guard_no_system_credentials`.
+7. Provision `tourist_profiles` with static constraint `ck_profiles_no_system_account` and attach trigger `trg_guard_no_system_profiles`.
 
 ### Phase 2: Taxonomy & Destination Structure
-4. Provision `destination_categories` with self-referencing hierarchy.
-5. Provision `destinations`, `destination_secondary_categories`, `destination_locations` with PostGIS `GEOGRAPHY(Point, 4326)`, coordinate range constraints (`ck_locations_coord_range`, `ck_locations_coord_valid`), GiST spatial index (`idx_locations_coordinates`), and expression GiST index (`idx_locations_public_coord_expr`).
-6. Provision `destination_media` and `destination_opening_hours`.
+8. Provision `destination_categories` with self-referencing hierarchy.
+9. Provision `destinations`, `destination_secondary_categories`, `destination_locations` with PostGIS `GEOGRAPHY(Point, 4326)`, coordinate range constraints (`ck_locations_coord_range`, `ck_locations_coord_valid`), GiST spatial index (`idx_locations_coordinates`), and expression GiST index (`idx_locations_public_coord_expr`).
+10. Provision `destination_media` and `destination_opening_hours`.
 
 ### Phase 3: Verification & Audit Layer (Stage A Completion)
-7. Provision `destination_verifications`, `verification_evidence`, `verification_records`.
-8. Provision `saved_destinations`, `audit_logs` (core ledger), and `audit_log_telemetry` (auxiliary privacy extension).
-9. Apply immutability trigger (`trg_audit_logs_immutable`) on `audit_logs` and deploy secure projections (`v_public_destination_locations`, `v_domain_audit_logs`). Note that role elevations are authoritatively audited at the application service tier within atomic transactions, while direct DBA activity is recorded via engine-level `pgaudit`.
-10. Configure PostgreSQL database roles (`app_user`, `admin_service_role`, `audit_maintenance_role`) and column-level update privileges.
+11. Provision `destination_verifications`, `verification_evidence`, `verification_records`.
+12. Provision `saved_destinations` with static constraint `ck_saved_no_system_account` and attach trigger `trg_guard_no_system_bookmarks`.
+13. Provision `audit_logs` (core ledger) referencing `fk_audit_actor -> accounts(id)`, and `audit_log_telemetry` (auxiliary privacy extension).
+14. Apply immutability trigger (`trg_audit_logs_immutable`) on `audit_logs` and deploy secure projections (`v_public_destination_locations`, `v_domain_audit_logs`). Note that role elevations are authoritatively audited at the application service tier within atomic transactions, while direct DBA activity is recorded via engine-level `pgaudit`.
+15. Configure PostgreSQL database roles (`app_user`, `admin_service_role`, `audit_maintenance_role`) and column-level update privileges.
 
 ### Phase 4: Social & UGC Moderation Expansion (Future Phase Milestone)
-11. Provision `business_profiles`, `community_posts`, `destination_reviews`, `user_reports`, and `moderation_records`.
+16. Provision `business_profiles`, `community_posts`, `destination_reviews`, `user_reports`, and `moderation_records`.
 
 ### Zero-Downtime Schema Expansion Rules
 - New columns must be added as `NULL` or with safe default values.
@@ -1707,3 +1863,7 @@ CREATE INDEX idx_reports_status ON user_reports (status);
 ### 12.9 Single Authoritative Application Auditing vs. Redundant Triggers & Seeded System Identity
 - **Decision**: Centralize administrative role audit logging strictly in the server-side `AccountAdministrationService` within an atomic transaction, eliminate redundant in-database role triggers, enforce DBA auditing via engine-level `pgaudit`, and seed a deterministic root system account (`00000000-0000-4000-8000-000000000001`).
 - **Trade-Off**: In connection-pooled multi-tenant backend environments, a database trigger attached to `accounts.role` cannot reliably identify the human end-user behind a pooled connection without caller-controlled session GUCs (which are forgeable). The trigger fired on legitimate application promotions, creating duplicate, conflicting audit rows and raising false "critical out-of-band alerts". By removing the trigger and asserting authoritative human attribution at the application service tier (enforcing MFA and super-admin authorization in an atomic transaction), the system produces exactly one reliable, non-repudiable audit event per business promotion. For direct database queries executed by operational DBAs outside the application, accountability is achieved through infrastructure controls (bastion MFA, individual named DBA roles) and engine-level `pgaudit` logging streamed directly to immutable external WORM storage (CloudWatch/Splunk), which cannot be bypassed by database-level trigger manipulations. Finally, provisioning a seeded root system identity satisfies foreign key integrity across `audit_logs` without allowing automated compliance routines (e.g. Right-to-Erasure tombstones) to falsely attribute system events to the erased user.
+
+### 12.10 Multi-Layer Database Enforcement of Non-Interactive System Principal
+- **Decision**: Enforce the No-Credential and No-Profile invariant using static CHECK constraints on child tables (`ck_security_no_system_account`, `ck_profiles_no_system_account`, `ck_saved_no_system_account`) alongside dynamic cross-table trigger `trg_prevent_system_account_child_records()`.
+- **Trade-Off**: Implementing database-level CHECK constraints directly inside child tables adds explicit DDL definitions and prevents future reuse of the root UUID for human accounts. However, this trade-off is deliberate: static CHECK constraints execute with zero performance overhead on insert/update and cannot be circumvented by application bugs, ORM misconfigurations, or rogue seeders. Together with trigger-based inspection of `accounts.type = 'system'`, the architecture guarantees that internal system actors remain strictly non-interactive, credential-less, and profile-less across all present and future platform operations.
