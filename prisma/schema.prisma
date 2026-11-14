@@ -1,0 +1,339 @@
+// ==============================================================================
+// My Travelroad — Prisma Schema Specification
+// ==============================================================================
+// Authoritative physical data model for Stage A (Core Discovery & Governance).
+// Translates docs/architecture/database-architecture.md into Prisma ORM models.
+// Spatial PostGIS columns are represented as Unsupported("geography(Point, 4326)").
+// All primary keys are UUID v4. Temporal columns are TIMESTAMPTZ (UTC).
+// ==============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ------------------------------------------------------------------------------
+// 1. Identity & Credentials
+// ------------------------------------------------------------------------------
+
+model Account {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email         String    @unique @db.VarChar(255)
+  phone         String?   @unique @db.VarChar(32)
+  emailVerified Boolean   @default(false) @map("email_verified")
+  phoneVerified Boolean   @default(false) @map("phone_verified")
+  status        String    @default("pending_verification") @db.VarChar(32)
+  type          String    @default("individual") @db.VarChar(32)
+  role          String    @default("traveler") @db.VarChar(32)
+  lastLoginAt   DateTime? @map("last_login_at") @db.Timestamptz(6)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  // 1:1 Isolated Security Credentials & Profile
+  securityCredentials AccountSecurityCredential?
+  touristProfile      TouristProfile?
+
+  // Relations
+  savedDestinations     SavedDestination[]
+  assignedVerifications DestinationVerification[]
+  submittedEvidence     VerificationEvidence[]
+  certifiedRecords      VerificationRecord[]
+  executedAuditLogs     AuditLog[]
+
+  @@index([status], name: "idx_accounts_status")
+  @@index([role], name: "idx_accounts_role")
+  @@map("accounts")
+}
+
+model AccountSecurityCredential {
+  accountId           String    @id @map("account_id") @db.Uuid
+  passwordHash        String?   @map("password_hash") @db.VarChar(255)
+  mfaEnabled          Boolean   @default(false) @map("mfa_enabled")
+  mfaSecretEncrypted  String?   @map("mfa_secret_encrypted") @db.Text
+  failedLoginAttempts Int       @default(0) @map("failed_login_attempts")
+  lockedUntil         DateTime? @map("locked_until") @db.Timestamptz(6)
+  passwordChangedAt   DateTime? @map("password_changed_at") @db.Timestamptz(6)
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([lockedUntil], name: "idx_security_locked_until")
+  @@map("account_security_credentials")
+}
+
+model TouristProfile {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  accountId         String   @unique @map("account_id") @db.Uuid
+  displayName       String   @map("display_name") @db.VarChar(120)
+  handle            String   @unique @db.VarChar(50)
+  avatarUrl         String?  @map("avatar_url") @db.Text
+  bio               String?  @db.Text
+  homeRegion        String?  @map("home_region") @db.VarChar(120)
+  preferredLanguage String   @default("en") @map("preferred_language") @db.VarChar(10)
+  travelPreferences String[] @default([]) @map("travel_preferences")
+  isPublic          Boolean  @default(true) @map("is_public")
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@map("tourist_profiles")
+}
+
+// ------------------------------------------------------------------------------
+// 2. Taxonomy & Categorization
+// ------------------------------------------------------------------------------
+
+model DestinationCategory {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug         String   @unique @db.VarChar(100)
+  name         String   @db.VarChar(100)
+  description  String?  @db.Text
+  parentId     String?  @map("parent_id") @db.Uuid
+  displayOrder Int      @default(0) @map("display_order")
+  iconName     String?  @map("icon_name") @db.VarChar(50)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  parent   DestinationCategory?  @relation("CategoryHierarchy", fields: [parentId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  children DestinationCategory[] @relation("CategoryHierarchy")
+
+  primaryDestinations   Destination[]                  @relation("PrimaryCategory")
+  secondaryDestinations DestinationSecondaryCategory[]
+
+  @@index([parentId], name: "idx_categories_parent_id")
+  @@index([displayOrder], name: "idx_categories_display_order")
+  @@map("destination_categories")
+}
+
+// ------------------------------------------------------------------------------
+// 3. Core Destinations & Spatial Entities
+// ------------------------------------------------------------------------------
+
+model Destination {
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  title             String    @db.VarChar(200)
+  slug              String    @unique @db.VarChar(200)
+  shortDescription  String    @map("short_description") @db.VarChar(500)
+  longDescription   String    @map("long_description") @db.Text
+  primaryCategoryId String    @map("primary_category_id") @db.Uuid
+  tags              String[]  @default([])
+  publicationStatus String    @default("draft") @map("publication_status") @db.VarChar(32)
+  publishedAt       DateTime? @map("published_at") @db.Timestamptz(6)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  primaryCategory     DestinationCategory            @relation("PrimaryCategory", fields: [primaryCategoryId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  secondaryCategories DestinationSecondaryCategory[]
+
+  location     DestinationLocation?
+  media        DestinationMedia[]
+  openingHours DestinationOpeningHour?
+  verification DestinationVerification?
+  savedBy      SavedDestination[]
+
+  @@index([primaryCategoryId], name: "idx_destinations_category")
+  @@index([publicationStatus], name: "idx_destinations_status")
+  @@index([publishedAt], name: "idx_destinations_published_at")
+  @@map("destinations")
+}
+
+model DestinationSecondaryCategory {
+  destinationId String @map("destination_id") @db.Uuid
+  categoryId    String @map("category_id") @db.Uuid
+
+  destination Destination         @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  category    DestinationCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@id([destinationId, categoryId])
+  @@index([categoryId], name: "idx_dest_sec_cat_cat")
+  @@map("destination_secondary_categories")
+}
+
+model DestinationLocation {
+  id                           String                                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  destinationId                String                                @unique @map("destination_id") @db.Uuid
+  coordinates                  Unsupported("geography(Point, 4326)")
+  locality                     String                                @db.VarChar(120)
+  subDistrict                  String                                @map("sub_district") @db.VarChar(120)
+  district                     String                                @db.VarChar(120)
+  state                        String                                @default("Kerala") @db.VarChar(120)
+  country                      String                                @default("India") @db.VarChar(120)
+  postalCode                   String?                               @map("postal_code") @db.VarChar(20)
+  isRestricted                 Boolean                               @default(false) @map("is_restricted")
+  publicApproximateCentroid    Unsupported("geography(Point, 4326)")? @map("public_approximate_centroid")
+  publicApproximateDisplayName String?                               @map("public_approximate_display_name") @db.VarChar(200)
+  publicAccessInformation      String?                               @map("public_access_information") @db.Text
+  updatedAt                    DateTime                              @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([district], name: "idx_locations_district")
+  @@index([isRestricted], name: "idx_locations_restricted")
+  @@map("destination_locations")
+}
+
+model DestinationMedia {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  destinationId      String   @map("destination_id") @db.Uuid
+  url                String   @db.Text
+  thumbnailUrl       String?  @map("thumbnail_url") @db.Text
+  caption            String?  @db.VarChar(255)
+  altText            String   @map("alt_text") @db.VarChar(255)
+  mediaType          String   @map("media_type") @db.VarChar(32)
+  isCover            Boolean  @default(false) @map("is_cover")
+  sortOrder          Int      @default(0) @map("sort_order")
+  attributionName    String?  @map("attribution_name") @db.VarChar(150)
+  attributionLicense String?  @map("attribution_license") @db.VarChar(50)
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([destinationId], name: "idx_media_destination_id")
+  @@index([sortOrder], name: "idx_media_sort_order")
+  @@map("destination_media")
+}
+
+model DestinationOpeningHour {
+  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  destinationId       String   @unique @map("destination_id") @db.Uuid
+  weeklySchedule      Json     @map("weekly_schedule") @db.JsonB
+  feeStructure        Json     @map("fee_structure") @db.JsonB
+  seasonalNotes       String?  @map("seasonal_notes") @db.Text
+  isTemporarilyClosed Boolean  @default(false) @map("is_temporarily_closed")
+  closureReason       String?  @map("closure_reason") @db.VarChar(255)
+  updatedAt           DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@map("destination_opening_hours")
+}
+
+// ------------------------------------------------------------------------------
+// 4. Verification & Documentary Proof
+// ------------------------------------------------------------------------------
+
+model DestinationVerification {
+  id                       String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  destinationId            String    @unique @map("destination_id") @db.Uuid
+  overallStatus            String    @default("unverified") @map("overall_status") @db.VarChar(32)
+  lastVerifiedAt           DateTime? @map("last_verified_at") @db.Timestamptz(6)
+  assignedCuratorAccountId String?   @map("assigned_curator_account_id") @db.Uuid
+  recheckRequiredAt        DateTime? @map("recheck_required_at") @db.Timestamptz(6)
+  createdAt                DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  destination     Destination            @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  assignedCurator Account?               @relation(fields: [assignedCuratorAccountId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  evidence        VerificationEvidence[]
+  records         VerificationRecord[]
+
+  @@index([overallStatus], name: "idx_verifications_status")
+  @@index([recheckRequiredAt], name: "idx_verifications_recheck")
+  @@map("destination_verifications")
+}
+
+model VerificationEvidence {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  verificationId String   @map("verification_id") @db.Uuid
+  evidenceType   String   @map("evidence_type") @db.VarChar(32)
+  url            String   @db.Text
+  description    String   @db.VarChar(500)
+  submittedBy    String   @map("submitted_by") @db.Uuid
+  submittedAt    DateTime @default(now()) @map("submitted_at") @db.Timestamptz(6)
+
+  verification DestinationVerification @relation(fields: [verificationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  submitter    Account                 @relation(fields: [submittedBy], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([verificationId], name: "idx_evidence_verification_id")
+  @@index([submittedBy], name: "idx_evidence_submitted_by")
+  @@map("verification_evidence")
+}
+
+model VerificationRecord {
+  id                       String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  verificationId           String    @map("verification_id") @db.Uuid
+  field                    String    @db.VarChar(64)
+  status                   String    @db.VarChar(32)
+  verifiedBy               String    @map("verified_by") @db.Uuid
+  confidenceLevel          String    @map("confidence_level") @db.VarChar(32)
+  notes                    String?   @db.Text
+  validUntil               DateTime? @map("valid_until") @db.Timestamptz(6)
+  verifiedValueSnapshotHash String?   @map("verified_value_snapshot_hash") @db.VarChar(64)
+  timestamp                DateTime  @default(now()) @db.Timestamptz(6)
+
+  verification DestinationVerification @relation(fields: [verificationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  verifier     Account                 @relation(fields: [verifiedBy], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([verificationId, field], name: "idx_ver_records_field")
+  @@index([verifiedBy], name: "idx_ver_records_verifier")
+  @@index([timestamp], name: "idx_ver_records_timestamp")
+  @@map("verification_records")
+}
+
+// ------------------------------------------------------------------------------
+// 5. User Bookmarks / Saved Destinations
+// ------------------------------------------------------------------------------
+
+model SavedDestination {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  accountId      String   @map("account_id") @db.Uuid
+  destinationId  String   @map("destination_id") @db.Uuid
+  collectionName String?  @map("collection_name") @db.VarChar(100)
+  personalNotes  String?  @map("personal_notes") @db.Text
+  savedAt        DateTime @default(now()) @map("saved_at") @db.Timestamptz(6)
+
+  account     Account     @relation(fields: [accountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([accountId, destinationId], name: "uq_saved_destinations_account_dest")
+  @@index([accountId], name: "idx_saved_account_id")
+  @@index([destinationId], name: "idx_saved_destination_id")
+  @@map("saved_destinations")
+}
+
+// ------------------------------------------------------------------------------
+// 6. Audit Logging & Telemetry Privacy Architecture
+// ------------------------------------------------------------------------------
+
+model AuditLog {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  actorAccountId String   @map("actor_account_id") @db.Uuid
+  actorRole      String   @map("actor_role") @db.VarChar(32)
+  action         String   @db.VarChar(64)
+  entityType     String   @map("entity_type") @db.VarChar(64)
+  entityId       String   @map("entity_id") @db.VarChar(64)
+  timestamp      DateTime @default(now()) @db.Timestamptz(6)
+
+  actor     Account            @relation(fields: [actorAccountId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  telemetry AuditLogTelemetry?
+
+  @@index([actorAccountId], name: "idx_audit_actor")
+  @@index([entityType, entityId], name: "idx_audit_entity")
+  @@index([timestamp(sort: Desc)], name: "idx_audit_timestamp")
+  @@index([action], name: "idx_audit_action")
+  @@map("audit_logs")
+}
+
+model AuditLogTelemetry {
+  auditLogId            String    @id @map("audit_log_id") @db.Uuid
+  actorEmail            String?   @map("actor_email") @db.VarChar(255)
+  ipAddress             String?   @map("ip_address") @db.VarChar(45)
+  userAgent             String?   @map("user_agent") @db.Text
+  previousStateSnapshot Json?     @map("previous_state_snapshot") @db.JsonB
+  newStateSnapshot      Json?     @map("new_state_snapshot") @db.JsonB
+  contextNotes          String?   @map("context_notes") @db.Text
+  retentionExpiresAt    DateTime  @map("retention_expires_at") @db.Timestamptz(6)
+  isAnonymized          Boolean   @default(false) @map("is_anonymized")
+  anonymizedAt          DateTime? @map("anonymized_at") @db.Timestamptz(6)
+
+  auditLog AuditLog @relation(fields: [auditLogId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@map("audit_log_telemetry")
+}
