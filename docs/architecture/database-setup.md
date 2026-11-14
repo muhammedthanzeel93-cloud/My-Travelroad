@@ -5,21 +5,21 @@
 **My Travelroad** utilizes **PostgreSQL 16** with the **PostGIS 3.4** spatial extension as its primary relational and geospatial datastore. The database layer strictly implements the Stage A domain model and database architecture approved in [`docs/architecture/database-architecture.md`](file:///c:/Users/aysha/Downloads/My%20Travelroad/My%20Travelroad/docs/architecture/database-architecture.md) and [`docs/architecture/domain-model.md`](file:///c:/Users/aysha/Downloads/My%20Travelroad/My%20Travelroad/docs/architecture/domain-model.md).
 
 ### Stage A Schema Scope (15 Tables)
-1. `accounts` â€” Central identity registry decoupled from public profiles.
-2. `account_security_credentials` â€” Isolated 1:1 authentication secrets and security lockouts.
-3. `tourist_profiles` â€” Public and private user profile attributes and travel preferences.
-4. `destination_categories` â€” Hierarchical taxonomy classification with self-referencing subcategories.
-5. `destinations` â€” Core tourism destination storytelling entity.
-6. `destination_locations` â€” PostGIS spherical location data (`GEOGRAPHY(Point, 4326)`), administrative hierarchy, and coordinate sensitivity flags.
-7. `destination_media` â€” High-resolution media, licensing, and single-cover partial index.
-8. `destination_opening_hours` â€” Operating patterns, weekly schedule intervals, seasonal notes, and fee structures.
-9. `destination_verifications` â€” Overall verification container aggregating fact-level verifications and curator audit dates.
-10. `verification_evidence` â€” Physical or documentary evidence (gazettes, circulars, GPS tracks, photos) supporting fact claims.
-11. `verification_records` â€” Granular historical fact audit stamps per field (`location_coordinates`, `opening_hours`, etc.).
-12. `saved_destinations` â€” Traveler bookmarks and trip staging (strictly one bookmark per account/destination).
-13. `audit_logs` â€” Strictly append-only, immutable regulatory and administrative event ledger.
-14. `audit_log_telemetry` â€” Auxiliary privacy-protected audit telemetry (actor email, IP address, user agent, state snapshots).
-15. `destination_secondary_categories` â€” Many-to-many junction table supporting secondary cross-cutting category tags.
+1. `accounts` — Central identity registry decoupled from public profiles.
+2. `account_security_credentials` — Isolated 1:1 authentication secrets and security lockouts.
+3. `tourist_profiles` — Public and private user profile attributes and travel preferences.
+4. `destination_categories` — Hierarchical taxonomy classification with self-referencing subcategories.
+5. `destinations` — Core tourism destination storytelling entity.
+6. `destination_locations` — PostGIS spherical location data (`GEOGRAPHY(Point, 4326)`), administrative hierarchy, and coordinate sensitivity flags.
+7. `destination_media` — High-resolution media, licensing, and single-cover partial index.
+8. `destination_opening_hours` — Operating patterns, weekly schedule intervals, seasonal notes, and fee structures.
+9. `destination_verifications` — Overall verification container aggregating fact-level verifications and curator audit dates.
+10. `verification_evidence` — Physical or documentary evidence (gazettes, circulars, GPS tracks, photos) supporting fact claims.
+11. `verification_records` — Granular historical fact audit stamps per field (`location_coordinates`, `opening_hours`, etc.).
+12. `saved_destinations` — Traveler bookmarks and trip staging (strictly one bookmark per account/destination).
+13. `audit_logs` — Strictly append-only, immutable regulatory and administrative event ledger.
+14. `audit_log_telemetry` — Auxiliary privacy-protected audit telemetry (actor email, IP address, user agent, state snapshots).
+15. `destination_secondary_categories` — Many-to-many junction table supporting secondary cross-cutting category tags.
 
 ---
 
@@ -78,9 +78,47 @@ FROM destination_locations dl;
 
 ---
 
-## 3. Catalog of Intentionally SQL-Only Database Objects
+## 3. Prisma Schema & SQL Migration Constraint Mapping
 
-Prisma Schema provides high-level object-relational mapping, but PostgreSQL engine features are version-controlled in the SQL migrations under `prisma/migrations/`:
+Every unique constraint, composite unique constraint, and foreign key relationship is explicitly mapped in [`prisma/schema.prisma`](file:///c:/Users/aysha/Downloads/My%20Travelroad/My%20Travelroad/prisma/schema.prisma) to eliminate schema drift:
+
+| Table | SQL Migration Constraint Name | Prisma Declaration |
+| :--- | :--- | :--- |
+| `accounts` | `uq_accounts_email` | `email @unique(map: "uq_accounts_email")` |
+| `accounts` | `uq_accounts_phone` | `phone @unique(map: "uq_accounts_phone")` |
+| `account_security_credentials` | `fk_security_account` | `@relation(..., map: "fk_security_account")` |
+| `tourist_profiles` | `uq_profiles_account_id` | `accountId @unique(map: "uq_profiles_account_id")` |
+| `tourist_profiles` | `uq_profiles_handle` | `handle @unique(map: "uq_profiles_handle")` |
+| `tourist_profiles` | `fk_profiles_account` | `@relation(..., map: "fk_profiles_account")` |
+| `destination_categories` | `uq_categories_slug` | `slug @unique(map: "uq_categories_slug")` |
+| `destination_categories` | `fk_categories_parent` | `@relation(..., map: "fk_categories_parent")` |
+| `destinations` | `uq_destinations_slug` | `slug @unique(map: "uq_destinations_slug")` |
+| `destinations` | `fk_destinations_primary_category` | `@relation(..., map: "fk_destinations_primary_category")` |
+| `destination_secondary_categories` | `fk_sec_cat_destination` | `@relation(..., map: "fk_sec_cat_destination")` |
+| `destination_secondary_categories` | `fk_sec_cat_category` | `@relation(..., map: "fk_sec_cat_category")` |
+| `destination_locations` | `uq_locations_destination_id` | `destinationId @unique(map: "uq_locations_destination_id")` |
+| `destination_locations` | `fk_locations_destination` | `@relation(..., map: "fk_locations_destination")` |
+| `destination_media` | `fk_media_destination` | `@relation(..., map: "fk_media_destination")` |
+| `destination_opening_hours` | `uq_opening_hours_destination` | `destinationId @unique(map: "uq_opening_hours_destination")` |
+| `destination_opening_hours` | `fk_opening_hours_destination` | `@relation(..., map: "fk_opening_hours_destination")` |
+| `destination_verifications` | `uq_verifications_destination` | `destinationId @unique(map: "uq_verifications_destination")` |
+| `destination_verifications` | `fk_verifications_destination` | `@relation(..., map: "fk_verifications_destination")` |
+| `destination_verifications` | `fk_verifications_curator` | `@relation(..., map: "fk_verifications_curator")` |
+| `verification_evidence` | `fk_evidence_verification` | `@relation(..., map: "fk_evidence_verification")` |
+| `verification_evidence` | `fk_evidence_submitter` | `@relation(..., map: "fk_evidence_submitter")` |
+| `verification_records` | `fk_records_verification` | `@relation(..., map: "fk_records_verification")` |
+| `verification_records` | `fk_records_destination` | `@relation(..., map: "fk_records_destination")` |
+| `verification_records` | `fk_records_verifier` | `@relation(..., map: "fk_records_verifier")` |
+| `verification_records` | `fk_records_evidence` | `@relation(..., map: "fk_records_evidence")` |
+| `saved_destinations` | `uq_saved_destinations_account_dest` | `@@unique([accountId, destinationId], map: "uq_saved_destinations_account_dest")` |
+| `saved_destinations` | `fk_saved_account` | `@relation(..., map: "fk_saved_account")` |
+| `saved_destinations` | `fk_saved_destination` | `@relation(..., map: "fk_saved_destination")` |
+| `audit_logs` | `fk_audit_actor` | `@relation(..., map: "fk_audit_actor")` |
+| `audit_log_telemetry` | `fk_telemetry_audit` | `@relation(..., map: "fk_telemetry_audit")` |
+
+---
+
+## 4. Catalog of Intentionally SQL-Only Database Objects
 
 | Object Name | Type | Purpose / Invariant Enforced |
 | :--- | :--- | :--- |
@@ -89,6 +127,8 @@ Prisma Schema provides high-level object-relational mapping, but PostgreSQL engi
 | `idx_locations_public_centroid` | GiST Index (Partial) | Spatial index on `public_approximate_centroid WHERE public_approximate_centroid IS NOT NULL` |
 | `idx_locations_public_coord_expr` | GiST Index (Functional) | Expression index on `(CASE WHEN is_restricted THEN public_approximate_centroid ELSE coordinates END)` for view inlining pushdown |
 | `idx_media_single_cover` | B-Tree (Partial Unique) | Enforces only one cover media item per destination (`WHERE is_cover = TRUE`) |
+| `idx_security_locked_until` | B-Tree (Partial) | B-tree index on `(locked_until) WHERE locked_until IS NOT NULL` |
+| `idx_telemetry_actor_email` | B-Tree (Partial) | B-tree index on `(actor_email) WHERE actor_email IS NOT NULL` |
 | `ck_accounts_email_format` | CHECK Constraint | Regex validation for RFC-compliant email formatting |
 | `ck_locations_coord_range` | CHECK Constraint | Restricts longitude to `[-180.0, 180.0]` and latitude to `[-90.0, 90.0]` |
 | `ck_locations_coord_valid` | CHECK Constraint | Validates OGC Simple Features point geometry (`ST_IsValid`) |
@@ -108,7 +148,7 @@ Prisma Schema provides high-level object-relational mapping, but PostgreSQL engi
 
 ---
 
-## 4. Local Setup via Docker Compose
+## 5. Local Setup via Docker Compose
 
 ```yaml
 version: '3.8'
@@ -143,7 +183,7 @@ docker compose up -d
 
 ---
 
-## 5. Environment Configuration
+## 6. Environment Configuration
 
 Copy the template from `.env.example` to `.env`:
 
@@ -159,7 +199,7 @@ NODE_ENV="development"
 
 ---
 
-## 6. Migration & Seeding Execution
+## 7. Migration & Seeding Execution
 
 ```bash
 # 1. Generate Prisma Client
@@ -174,24 +214,34 @@ npm run db:seed
 
 ---
 
-## 7. Verification & Testing
+## 8. Verification & Testing
 
 ### 1. Automated Database Helper Unit Tests
 ```bash
-npx tsx tests/unit/db.test.ts
+npm run test:db
 ```
 *Validates coordinate bounds, NaN/Infinity rejection, bounding box envelopes, antimeridian crossing, and parameterized Prisma.sql builders.*
 
-### 2. Standalone SQL Test Suite
-When connected to a PostgreSQL 16 + PostGIS 3.4 database, execute the automated verification suite:
+### 2. Standalone SQL Test Suite (Stop-On-Error Guaranteed)
+When connected to a PostgreSQL 16 + PostGIS 3.4 database, execute the automated verification suite using either the direct `psql` command or the npm runner:
 ```bash
-psql -U postgres -d mytravelroad -f tests/sql/verification_tests.sql
+# Direct psql invocation with strict error stop:
+psql -v ON_ERROR_STOP=1 -U postgres -d mytravelroad -f tests/sql/verification_tests.sql
+
+# Or using the npm runner script:
+npm run test:sql
 ```
-*Tests all 11 requirements: extensions, 15 tables, 2 views, GiST indexes, root account immutability, child table guards, account-type transition checks, audit log immutability, 3-tier coordinate privacy, and spatial proximity queries.*
+*Tests all 11 requirements: extensions, 15 tables, 2 views, GiST indexes, root account immutability, child table guards, account-type transition checks, audit log immutability, 3-tier coordinate privacy, and spatial proximity queries. Any assertion failure immediately aborts the transaction and exits with a non-zero status code.*
+
+### 3. Prisma Schema Drift Check
+```bash
+npx prisma migrate diff --from-schema-datamodel prisma/schema.prisma --to-schema-datasource prisma/schema.prisma
+```
+*Verifies 0 drift across tables, columns, unique constraints, and foreign key relations.*
 
 ---
 
-## 8. TypeScript Application Integration
+## 9. TypeScript Application Integration
 
 ```typescript
 import { prisma, createPointGeographySql, createBoundingBoxWhereClause, BoundingBox } from "@/lib/db";

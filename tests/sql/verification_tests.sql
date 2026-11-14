@@ -1,4 +1,4 @@
-﻿-- ==============================================================================
+-- ==============================================================================
 -- My Travelroad - Automated SQL Verification & Security Invariant Test Suite
 -- ==============================================================================
 -- Executes against PostgreSQL 16 + PostGIS 3.4
@@ -9,9 +9,13 @@
 
 BEGIN;
 
-RAISE NOTICE '==============================================================================';
-RAISE NOTICE 'STARTING STAGE A DATABASE VERIFICATION & SECURITY INVARIANT SUITE';
-RAISE NOTICE '==============================================================================';
+DO $$
+BEGIN
+    RAISE NOTICE '==============================================================================';
+    RAISE NOTICE 'STARTING STAGE A DATABASE VERIFICATION & SECURITY INVARIANT SUITE';
+    RAISE NOTICE '==============================================================================';
+END;
+$$;
 
 -- ------------------------------------------------------------------------------
 -- Test 1: Verify PostGIS Extension
@@ -413,9 +417,13 @@ BEGIN
 END;
 $$;
 
-RAISE NOTICE '==============================================================================';
-RAISE NOTICE 'ALL 11 DATABASE TESTS PASSED SUCCESSFULLY!';
-RAISE NOTICE '==============================================================================';
+DO $$
+BEGIN
+    RAISE NOTICE '==============================================================================';
+    RAISE NOTICE 'ALL 11 DATABASE TESTS PASSED SUCCESSFULLY!';
+    RAISE NOTICE '==============================================================================';
+END;
+$$;
 
 -- Roll back test transaction to leave database clean
 ROLLBACK;

@@ -10,7 +10,8 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate deploy",
     "db:seed": "prisma db seed",
-    "test:db": "tsx tests/unit/db.test.ts"
+    "test:db": "tsx tests/unit/db.test.ts",
+    "test:sql": "tsx tests/sql/run_verification.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",

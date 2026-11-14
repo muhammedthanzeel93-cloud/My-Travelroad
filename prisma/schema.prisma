@@ -1,6 +1,6 @@
-﻿// ==============================================================================
-// My Travelroad - Authoritative Prisma Schema (Stage A Database Foundation)
 // ==============================================================================
+// My Travelroad - Authoritative Prisma Schema (Stage A Database Foundation)
+/// ==============================================================================
 // Authoritative Architecture Reference: docs/architecture/database-architecture.md
 // Domain Reference: docs/architecture/domain-model.md
 //
@@ -20,7 +20,7 @@
 // 13. audit_logs
 // 14. audit_log_telemetry
 // 15. destination_secondary_categories (Junction)
-// ==============================================================================
+/// ==============================================================================
 
 generator client {
   provider        = "prisma-client-js"
@@ -28,9 +28,10 @@ generator client {
 }
 
 datasource db {
-  provider  = "postgresql"
-  url       = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL")
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_URL")
+  extensions = [uuidOssp(map: "uuid-ossp"), postgis]
 }
 
 // ------------------------------------------------------------------------------
@@ -39,8 +40,8 @@ datasource db {
 
 model Account {
   id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  email         String    @unique @db.VarChar(255)
-  phone         String?   @unique @db.VarChar(32)
+  email         String    @unique(map: "uq_accounts_email") @db.VarChar(255)
+  phone         String?   @unique(map: "uq_accounts_phone") @db.VarChar(32)
   emailVerified Boolean   @default(false) @map("email_verified")
   phoneVerified Boolean   @default(false) @map("phone_verified")
   status        String    @default("pending_verification") @db.VarChar(32)
@@ -77,17 +78,16 @@ model AccountSecurityCredential {
   createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt           DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade, onUpdate: Cascade, map: "fk_security_account")
 
-  @@index([lockedUntil], name: "idx_security_locked_until")
   @@map("account_security_credentials")
 }
 
 model TouristProfile {
   id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  accountId         String   @unique @map("account_id") @db.Uuid
+  accountId         String   @unique(map: "uq_profiles_account_id") @map("account_id") @db.Uuid
   displayName       String   @map("display_name") @db.VarChar(120)
-  handle            String   @unique @db.VarChar(50)
+  handle            String   @unique(map: "uq_profiles_handle") @db.VarChar(50)
   avatarUrl         String?  @map("avatar_url") @db.Text
   bio               String?  @db.Text
   homeRegion        String?  @map("home_region") @db.VarChar(120)
@@ -97,8 +97,9 @@ model TouristProfile {
   createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt         DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade, onUpdate: Cascade, map: "fk_profiles_account")
 
+  @@index([travelPreferences], type: Gin, name: "idx_profiles_travel_preferences")
   @@map("tourist_profiles")
 }
 
@@ -108,7 +109,7 @@ model TouristProfile {
 
 model DestinationCategory {
   id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  slug         String   @unique @db.VarChar(100)
+  slug         String   @unique(map: "uq_categories_slug") @db.VarChar(100)
   name         String   @db.VarChar(100)
   shortLabel   String   @map("short_label") @db.VarChar(50)
   description  String   @db.Text
@@ -119,7 +120,7 @@ model DestinationCategory {
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  parent   DestinationCategory?  @relation("CategoryHierarchy", fields: [parentId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  parent   DestinationCategory?  @relation("CategoryHierarchy", fields: [parentId], references: [id], onDelete: Restrict, onUpdate: Cascade, map: "fk_categories_parent")
   children DestinationCategory[] @relation("CategoryHierarchy")
 
   primaryDestinations   Destination[]                  @relation("PrimaryCategory")
@@ -136,7 +137,7 @@ model DestinationCategory {
 
 model Destination {
   id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  slug              String    @unique @db.VarChar(120)
+  slug              String    @unique(map: "uq_destinations_slug") @db.VarChar(120)
   title             String    @db.VarChar(200)
   shortDescription  String    @map("short_description") @db.VarChar(500)
   fullDescription   String    @map("full_description") @db.Text
@@ -147,7 +148,7 @@ model Destination {
   updatedAt         DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
   publishedAt       DateTime? @map("published_at") @db.Timestamptz(6)
 
-  primaryCategory     DestinationCategory            @relation("PrimaryCategory", fields: [primaryCategoryId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  primaryCategory     DestinationCategory            @relation("PrimaryCategory", fields: [primaryCategoryId], references: [id], onDelete: Restrict, onUpdate: Cascade, map: "fk_destinations_primary_category")
   secondaryCategories DestinationSecondaryCategory[]
 
   location            DestinationLocation?
@@ -168,8 +169,8 @@ model DestinationSecondaryCategory {
   categoryId    String   @map("category_id") @db.Uuid
   createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  destination Destination         @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  category    DestinationCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  destination Destination         @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade, map: "fk_sec_cat_destination")
+  category    DestinationCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict, onUpdate: Cascade, map: "fk_sec_cat_category")
 
   @@id([destinationId, categoryId])
   @@index([categoryId], name: "idx_sec_cat_category")
@@ -178,7 +179,7 @@ model DestinationSecondaryCategory {
 
 model DestinationLocation {
   id                           String                                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  destinationId                String                                 @unique @map("destination_id") @db.Uuid
+  destinationId                String                                 @unique(map: "uq_locations_destination_id") @map("destination_id") @db.Uuid
   coordinates                  Unsupported("geography(Point, 4326)")
   altitudeMeters               Decimal?                               @map("altitude_meters") @db.Decimal(7, 2)
   accuracyMeters               Decimal?                               @map("accuracy_meters") @db.Decimal(6, 2)
@@ -197,8 +198,9 @@ model DestinationLocation {
   createdAt                    DateTime                               @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt                    DateTime                               @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade, map: "fk_locations_destination")
 
+  @@index([coordinates], type: Gist, name: "idx_locations_coordinates")
   @@index([district], name: "idx_locations_district")
   @@index([countryCode, stateOrProvince, district], name: "idx_locations_state_country")
   @@index([talukOrSubdivision], name: "idx_locations_taluk")
@@ -222,7 +224,7 @@ model DestinationMedia {
   createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade, map: "fk_media_destination")
 
   @@index([destinationId, displayOrder], name: "idx_media_destination_order")
   @@index([status], name: "idx_media_status")
@@ -231,7 +233,7 @@ model DestinationMedia {
 
 model DestinationOpeningHour {
   id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  destinationId  String   @unique @map("destination_id") @db.Uuid
+  destinationId  String   @unique(map: "uq_opening_hours_destination") @map("destination_id") @db.Uuid
   type           String   @default("always_open") @db.VarChar(32)
   weeklySchedule Json?    @map("weekly_schedule") @db.JsonB
   seasonalNotes  String?  @map("seasonal_notes") @db.Text
@@ -241,7 +243,7 @@ model DestinationOpeningHour {
   createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt      DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade, map: "fk_opening_hours_destination")
 
   @@index([entryFeePolicy], name: "idx_opening_hours_fee_policy")
   @@map("destination_opening_hours")
@@ -253,7 +255,7 @@ model DestinationOpeningHour {
 
 model DestinationVerification {
   id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  destinationId     String    @unique @map("destination_id") @db.Uuid
+  destinationId     String    @unique(map: "uq_verifications_destination") @map("destination_id") @db.Uuid
   overallStatus     String    @default("unverified") @map("overall_status") @db.VarChar(32)
   assignedCuratorId String?   @map("assigned_curator_id") @db.Uuid
   lastAuditedAt     DateTime? @map("last_audited_at") @db.Timestamptz(6)
@@ -263,8 +265,8 @@ model DestinationVerification {
   createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt         DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  destination     Destination            @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  assignedCurator Account?               @relation(fields: [assignedCuratorId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  destination     Destination            @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade, map: "fk_verifications_destination")
+  assignedCurator Account?               @relation(fields: [assignedCuratorId], references: [id], onDelete: SetNull, onUpdate: Cascade, map: "fk_verifications_curator")
   evidence        VerificationEvidence[]
   records         VerificationRecord[]
 
@@ -283,8 +285,8 @@ model VerificationEvidence {
   submittedBy           String   @map("submitted_by") @db.Uuid
   submittedAt           DateTime @default(now()) @map("submitted_at") @db.Timestamptz(6)
 
-  verification DestinationVerification @relation(fields: [verificationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  submitter    Account                 @relation(fields: [submittedBy], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  verification DestinationVerification @relation(fields: [verificationId], references: [id], onDelete: Cascade, onUpdate: Cascade, map: "fk_evidence_verification")
+  submitter    Account                 @relation(fields: [submittedBy], references: [id], onDelete: Restrict, onUpdate: Cascade, map: "fk_evidence_submitter")
   records      VerificationRecord[]
 
   @@index([verificationId], name: "idx_evidence_verification_id")
@@ -306,10 +308,10 @@ model VerificationRecord {
   timestamp                 DateTime  @default(now()) @db.Timestamptz(6)
   validUntil                DateTime? @map("valid_until") @db.Timestamptz(6)
 
-  verification DestinationVerification @relation(fields: [verificationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  destination  Destination             @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  verifier     Account                 @relation(fields: [verifiedBy], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  evidence     VerificationEvidence?   @relation(fields: [evidenceId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  verification DestinationVerification @relation(fields: [verificationId], references: [id], onDelete: Cascade, onUpdate: Cascade, map: "fk_records_verification")
+  destination  Destination             @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade, map: "fk_records_destination")
+  verifier     Account                 @relation(fields: [verifiedBy], references: [id], onDelete: Restrict, onUpdate: Cascade, map: "fk_records_verifier")
+  evidence     VerificationEvidence?   @relation(fields: [evidenceId], references: [id], onDelete: SetNull, onUpdate: Cascade, map: "fk_records_evidence")
 
   @@index([destinationId, field], name: "idx_records_dest_field")
   @@index([verificationId], name: "idx_records_verification_id")
@@ -329,10 +331,10 @@ model SavedDestination {
   personalNotes  String?  @map("personal_notes") @db.Text
   savedAt        DateTime @default(now()) @map("saved_at") @db.Timestamptz(6)
 
-  account     Account     @relation(fields: [accountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  account     Account     @relation(fields: [accountId], references: [id], onDelete: Cascade, onUpdate: Cascade, map: "fk_saved_account")
+  destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade, map: "fk_saved_destination")
 
-  @@unique([accountId, destinationId], name: "uq_saved_destinations_account_dest")
+  @@unique([accountId, destinationId], map: "uq_saved_destinations_account_dest")
   @@index([accountId], name: "idx_saved_account_id")
   @@index([destinationId], name: "idx_saved_destination_id")
   @@map("saved_destinations")
@@ -351,7 +353,7 @@ model AuditLog {
   entityId       String   @map("entity_id") @db.VarChar(64)
   timestamp      DateTime @default(now()) @db.Timestamptz(6)
 
-  actor     Account            @relation(fields: [actorAccountId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  actor     Account            @relation(fields: [actorAccountId], references: [id], onDelete: Restrict, onUpdate: Cascade, map: "fk_audit_actor")
   telemetry AuditLogTelemetry?
 
   @@index([actorAccountId], name: "idx_audit_actor")
@@ -362,10 +364,10 @@ model AuditLog {
 }
 
 model AuditLogTelemetry {
-  auditLogId            String    @id @map("audit_log_id") @db.Uuid
-  actorEmail            String?   @map("actor_email") @db.VarChar(255)
-  ipAddress             String?   @map("ip_address") @db.VarChar(45)
-  userAgent             String?   @map("user_agent") @db.Text
+  auditLogId            String                  @id @map("audit_log_id") @db.Uuid
+  actorEmail            String?                 @map("actor_email") @db.VarChar(255)
+  ipAddress             Unsupported("inet")?    @map("ip_address")
+  userAgent             String?                 @map("user_agent") @db.Text
   previousStateSnapshot Json?     @map("previous_state_snapshot") @db.JsonB
   newStateSnapshot      Json?     @map("new_state_snapshot") @db.JsonB
   contextNotes          String?   @map("context_notes") @db.Text
@@ -373,8 +375,7 @@ model AuditLogTelemetry {
   isAnonymized          Boolean   @default(false) @map("is_anonymized")
   anonymizedAt          DateTime? @map("anonymized_at") @db.Timestamptz(6)
 
-  auditLog AuditLog @relation(fields: [auditLogId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  auditLog AuditLog @relation(fields: [auditLogId], references: [id], onDelete: Cascade, onUpdate: Cascade, map: "fk_telemetry_audit")
 
-  @@index([actorEmail], name: "idx_telemetry_actor_email")
   @@map("audit_log_telemetry")
 }

@@ -1,4 +1,4 @@
-﻿-- ==============================================================================
+-- ==============================================================================
 -- Migration: 20261114000002_phase2_taxonomy_destinations
 -- Stage A: Phase 2 Taxonomy, Destinations, PostGIS Geography & Spatial Indexing
 -- Reference: docs/architecture/database-architecture.md (Sections 3.4 - 3.9)

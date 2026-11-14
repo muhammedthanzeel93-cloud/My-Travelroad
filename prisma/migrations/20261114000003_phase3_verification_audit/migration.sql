@@ -1,4 +1,4 @@
-﻿-- ==============================================================================
+-- ==============================================================================
 -- Migration: 20261114000003_phase3_verification_audit
 -- Stage A: Phase 3 Verification, Wishlists, Audit Ledger, Views & Role Separation
 -- Reference: docs/architecture/database-architecture.md (Sections 3.10 - 3.15, 4.2, 10, 11)
