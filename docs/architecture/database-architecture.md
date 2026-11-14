@@ -288,6 +288,17 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Trigger Attachment Note:
+-- The trigger attaching this function to `accounts` (`trg_guard_system_type_transition`)
+-- is created in Section 3.13 (Migration Phase 3, Step 13) immediately after all three
+-- referenced child tables (account_security_credentials, tourist_profiles, and saved_destinations)
+-- have been provisioned:
+--
+-- CREATE TRIGGER trg_guard_system_type_transition
+-- BEFORE UPDATE OF type ON accounts
+-- FOR EACH ROW
+-- EXECUTE FUNCTION trg_reject_system_type_with_children();
 ```
 
 ---
@@ -760,13 +771,12 @@ FOR EACH ROW
 EXECUTE FUNCTION trg_prevent_system_account_child_records();
 
 -- Attach after all protected child tables exist. PostgreSQL executes
--- same-event BEFORE ROW triggers in trigger-name alphabetical order, so the
--- existing root guard (trg_guard_system_account) runs before this transition
--- guard. The root guard remains authoritative for the reserved account.
+-- same-event BEFORE ROW triggers in trigger-name alphabetical order:
+-- 1. `trg_guard_system_account` runs first ('a' < 't') and protects the reserved root account.
+-- 2. `trg_guard_system_type_transition` runs second and prevents non-root accounts from becoming system while children exist.
 CREATE TRIGGER trg_guard_system_type_transition
 BEFORE UPDATE OF type ON accounts
 FOR EACH ROW
-WHEN (OLD.type IS DISTINCT FROM NEW.type AND NEW.type = 'system')
 EXECUTE FUNCTION trg_reject_system_type_with_children();
 ```
 
@@ -1732,7 +1742,7 @@ GRANT SELECT, UPDATE, DELETE ON audit_log_telemetry TO audit_maintenance_role;
 2. Provision `accounts` table with unique indexes and status/role check constraints.
 3. Provision Root System Account: Execute the idempotent PL/pgSQL seeding block with pre-execution conflict checks for `00000000-0000-4000-8000-000000000001` and `system-internal@mytravelroad.local`.
 4. Install `trg_guard_system_account` protection trigger on `accounts` locking down all 10 identity and security attributes.
-5. Install generalized `trg_prevent_system_account_child_records` function.
+5. Install generalized `trg_prevent_system_account_child_records` function and `trg_reject_system_type_with_children` transition guard function.
 6. Provision `account_security_credentials` (Argon2id without salt column) with static constraint `ck_security_no_system_account` and attach trigger `trg_guard_no_system_credentials`.
 7. Provision `tourist_profiles` with static constraint `ck_profiles_no_system_account` and attach trigger `trg_guard_no_system_profiles`.
 
@@ -1744,7 +1754,7 @@ GRANT SELECT, UPDATE, DELETE ON audit_log_telemetry TO audit_maintenance_role;
 ### Phase 3: Verification & Audit Layer (Stage A Completion)
 11. Provision `destination_verifications`, `verification_evidence`, `verification_records`.
 12. Provision `saved_destinations` with static constraint `ck_saved_no_system_account` and attach trigger `trg_guard_no_system_bookmarks`.
-13. Attach `trg_guard_system_type_transition` to `accounts` after `account_security_credentials`, `tourist_profiles`, and `saved_destinations` exist. It rejects a transition to `type = 'system'` if any protected child exists; parent-row locking serializes this check with child inserts and updates.
+13. Attach `trg_guard_system_type_transition` to `accounts` after all three child tables (`account_security_credentials`, `tourist_profiles`, and `saved_destinations`) exist (`CREATE TRIGGER trg_guard_system_type_transition BEFORE UPDATE OF type ON accounts FOR EACH ROW EXECUTE FUNCTION trg_reject_system_type_with_children();`). PostgreSQL executes same-event `BEFORE UPDATE` row triggers alphabetically: `trg_guard_system_account` runs first ('a' < 't') to protect the root account, then `trg_guard_system_type_transition` verifies child absence under READ COMMITTED.
 14. Provision `audit_logs` (core ledger) referencing `fk_audit_actor -> accounts(id)`, and `audit_log_telemetry` (auxiliary privacy extension).
 15. Apply immutability trigger (`trg_audit_logs_immutable`) on `audit_logs` and deploy secure projections (`v_public_destination_locations`, `v_domain_audit_logs`). Note that role elevations are authoritatively audited at the application service tier within atomic transactions, while direct DBA activity is recorded via engine-level `pgaudit`.
 16. Configure PostgreSQL database roles (`app_user`, `admin_service_role`, `audit_maintenance_role`) and column-level update privileges.
