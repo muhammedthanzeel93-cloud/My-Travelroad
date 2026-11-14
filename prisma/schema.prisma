@@ -1,14 +1,30 @@
+﻿// ==============================================================================
+// My Travelroad - Authoritative Prisma Schema (Stage A Database Foundation)
 // ==============================================================================
-// My Travelroad — Prisma Schema Specification
-// ==============================================================================
-// Authoritative physical data model for Stage A (Core Discovery & Governance).
-// Translates docs/architecture/database-architecture.md into Prisma ORM models.
-// Spatial PostGIS columns are represented as Unsupported("geography(Point, 4326)").
-// All primary keys are UUID v4. Temporal columns are TIMESTAMPTZ (UTC).
+// Authoritative Architecture Reference: docs/architecture/database-architecture.md
+// Domain Reference: docs/architecture/domain-model.md
+//
+// Stage A Tables Covered (15 total):
+// 1. accounts
+// 2. account_security_credentials
+// 3. tourist_profiles
+// 4. destination_categories
+// 5. destinations
+// 6. destination_locations
+// 7. destination_media
+// 8. destination_opening_hours
+// 9. destination_verifications
+// 10. verification_evidence
+// 11. verification_records
+// 12. saved_destinations
+// 13. audit_logs
+// 14. audit_log_telemetry
+// 15. destination_secondary_categories (Junction)
 // ==============================================================================
 
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
 }
 
 datasource db {
@@ -94,10 +110,12 @@ model DestinationCategory {
   id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   slug         String   @unique @db.VarChar(100)
   name         String   @db.VarChar(100)
-  description  String?  @db.Text
+  shortLabel   String   @map("short_label") @db.VarChar(50)
+  description  String   @db.Text
+  iconKey      String   @map("icon_key") @db.VarChar(50)
   parentId     String?  @map("parent_id") @db.Uuid
   displayOrder Int      @default(0) @map("display_order")
-  iconName     String?  @map("icon_name") @db.VarChar(50)
+  status       String   @default("active") @db.VarChar(20)
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
@@ -108,7 +126,7 @@ model DestinationCategory {
   secondaryDestinations DestinationSecondaryCategory[]
 
   @@index([parentId], name: "idx_categories_parent_id")
-  @@index([displayOrder], name: "idx_categories_display_order")
+  @@index([status, displayOrder], name: "idx_categories_status_order")
   @@map("destination_categories")
 }
 
@@ -118,162 +136,184 @@ model DestinationCategory {
 
 model Destination {
   id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug              String    @unique @db.VarChar(120)
   title             String    @db.VarChar(200)
-  slug              String    @unique @db.VarChar(200)
   shortDescription  String    @map("short_description") @db.VarChar(500)
-  longDescription   String    @map("long_description") @db.Text
+  fullDescription   String    @map("full_description") @db.Text
   primaryCategoryId String    @map("primary_category_id") @db.Uuid
-  tags              String[]  @default([])
   publicationStatus String    @default("draft") @map("publication_status") @db.VarChar(32)
-  publishedAt       DateTime? @map("published_at") @db.Timestamptz(6)
+  featuredRank      Int?      @map("featured_rank")
   createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt         DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  publishedAt       DateTime? @map("published_at") @db.Timestamptz(6)
 
   primaryCategory     DestinationCategory            @relation("PrimaryCategory", fields: [primaryCategoryId], references: [id], onDelete: Restrict, onUpdate: Cascade)
   secondaryCategories DestinationSecondaryCategory[]
 
-  location     DestinationLocation?
-  media        DestinationMedia[]
-  openingHours DestinationOpeningHour?
-  verification DestinationVerification?
-  savedBy      SavedDestination[]
+  location            DestinationLocation?
+  media               DestinationMedia[]
+  openingHours        DestinationOpeningHour?
+  verification        DestinationVerification?
+  verificationRecords VerificationRecord[]
+  savedBy             SavedDestination[]
 
-  @@index([primaryCategoryId], name: "idx_destinations_category")
+  @@index([primaryCategoryId], name: "idx_destinations_primary_cat")
   @@index([publicationStatus], name: "idx_destinations_status")
-  @@index([publishedAt], name: "idx_destinations_published_at")
+  @@index([createdAt(sort: Desc)], name: "idx_destinations_created_at")
   @@map("destinations")
 }
 
 model DestinationSecondaryCategory {
-  destinationId String @map("destination_id") @db.Uuid
-  categoryId    String @map("category_id") @db.Uuid
+  destinationId String   @map("destination_id") @db.Uuid
+  categoryId    String   @map("category_id") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
   destination Destination         @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  category    DestinationCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  category    DestinationCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   @@id([destinationId, categoryId])
-  @@index([categoryId], name: "idx_dest_sec_cat_cat")
+  @@index([categoryId], name: "idx_sec_cat_category")
   @@map("destination_secondary_categories")
 }
 
 model DestinationLocation {
-  id                           String                                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  destinationId                String                                @unique @map("destination_id") @db.Uuid
+  id                           String                                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  destinationId                String                                 @unique @map("destination_id") @db.Uuid
   coordinates                  Unsupported("geography(Point, 4326)")
-  locality                     String                                @db.VarChar(120)
-  subDistrict                  String                                @map("sub_district") @db.VarChar(120)
-  district                     String                                @db.VarChar(120)
-  state                        String                                @default("Kerala") @db.VarChar(120)
-  country                      String                                @default("India") @db.VarChar(120)
-  postalCode                   String?                               @map("postal_code") @db.VarChar(20)
-  isRestricted                 Boolean                               @default(false) @map("is_restricted")
+  altitudeMeters               Decimal?                               @map("altitude_meters") @db.Decimal(7, 2)
+  accuracyMeters               Decimal?                               @map("accuracy_meters") @db.Decimal(6, 2)
+  isRestricted                 Boolean                                @default(false) @map("is_restricted")
+  restrictionReason            String?                                @map("restriction_reason") @db.VarChar(50)
   publicApproximateCentroid    Unsupported("geography(Point, 4326)")? @map("public_approximate_centroid")
-  publicApproximateDisplayName String?                               @map("public_approximate_display_name") @db.VarChar(200)
-  publicAccessInformation      String?                               @map("public_access_information") @db.Text
-  updatedAt                    DateTime                              @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  publicApproximateDisplayName String?                                @map("public_approximate_display_name") @db.VarChar(150)
+  formattedAddress             String                                 @map("formatted_address") @db.Text
+  locality                     String?                                @db.VarChar(120)
+  talukOrSubdivision           String                                 @map("taluk_or_subdivision") @db.VarChar(100)
+  district                     String                                 @db.VarChar(100)
+  stateOrProvince              String                                 @map("state_or_province") @db.VarChar(100)
+  countryCode                  String                                 @default("IN") @map("country_code") @db.Char(2)
+  postalCode                   String?                                @map("postal_code") @db.VarChar(20)
+  nearestTransitHub            Json?                                  @map("nearest_transit_hub") @db.JsonB
+  createdAt                    DateTime                               @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                    DateTime                               @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@index([district], name: "idx_locations_district")
+  @@index([countryCode, stateOrProvince, district], name: "idx_locations_state_country")
+  @@index([talukOrSubdivision], name: "idx_locations_taluk")
   @@index([isRestricted], name: "idx_locations_restricted")
   @@map("destination_locations")
 }
 
 model DestinationMedia {
-  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  destinationId      String   @map("destination_id") @db.Uuid
-  url                String   @db.Text
-  thumbnailUrl       String?  @map("thumbnail_url") @db.Text
-  caption            String?  @db.VarChar(255)
-  altText            String   @map("alt_text") @db.VarChar(255)
-  mediaType          String   @map("media_type") @db.VarChar(32)
-  isCover            Boolean  @default(false) @map("is_cover")
-  sortOrder          Int      @default(0) @map("sort_order")
-  attributionName    String?  @map("attribution_name") @db.VarChar(150)
-  attributionLicense String?  @map("attribution_license") @db.VarChar(50)
-  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  destinationId String   @map("destination_id") @db.Uuid
+  type          String   @default("image") @db.VarChar(32)
+  url           String   @db.Text
+  thumbnailUrl  String?  @map("thumbnail_url") @db.Text
+  altText       String   @map("alt_text") @db.VarChar(255)
+  caption       String?  @db.Text
+  attribution   String?  @db.VarChar(200)
+  license       String   @default("cc_by") @db.VarChar(50)
+  isCover       Boolean  @default(false) @map("is_cover")
+  displayOrder  Int      @default(0) @map("display_order")
+  status        String   @default("pending_review") @db.VarChar(32)
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
-  @@index([destinationId], name: "idx_media_destination_id")
-  @@index([sortOrder], name: "idx_media_sort_order")
+  @@index([destinationId, displayOrder], name: "idx_media_destination_order")
+  @@index([status], name: "idx_media_status")
   @@map("destination_media")
 }
 
 model DestinationOpeningHour {
-  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  destinationId       String   @unique @map("destination_id") @db.Uuid
-  weeklySchedule      Json     @map("weekly_schedule") @db.JsonB
-  feeStructure        Json     @map("fee_structure") @db.JsonB
-  seasonalNotes       String?  @map("seasonal_notes") @db.Text
-  isTemporarilyClosed Boolean  @default(false) @map("is_temporarily_closed")
-  closureReason       String?  @map("closure_reason") @db.VarChar(255)
-  updatedAt           DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  destinationId  String   @unique @map("destination_id") @db.Uuid
+  type           String   @default("always_open") @db.VarChar(32)
+  weeklySchedule Json?    @map("weekly_schedule") @db.JsonB
+  seasonalNotes  String?  @map("seasonal_notes") @db.Text
+  entryFeePolicy String   @default("free") @map("entry_fee_policy") @db.VarChar(32)
+  feeStructure   Json?    @map("fee_structure") @db.JsonB
+  advisoryNote   String?  @map("advisory_note") @db.Text
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   destination Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
+  @@index([entryFeePolicy], name: "idx_opening_hours_fee_policy")
   @@map("destination_opening_hours")
 }
 
 // ------------------------------------------------------------------------------
-// 4. Verification & Documentary Proof
+// 4. Governance, Verification & Documentary Proof
 // ------------------------------------------------------------------------------
 
 model DestinationVerification {
-  id                       String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  destinationId            String    @unique @map("destination_id") @db.Uuid
-  overallStatus            String    @default("unverified") @map("overall_status") @db.VarChar(32)
-  lastVerifiedAt           DateTime? @map("last_verified_at") @db.Timestamptz(6)
-  assignedCuratorAccountId String?   @map("assigned_curator_account_id") @db.Uuid
-  recheckRequiredAt        DateTime? @map("recheck_required_at") @db.Timestamptz(6)
-  createdAt                DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt                DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  destinationId     String    @unique @map("destination_id") @db.Uuid
+  overallStatus     String    @default("unverified") @map("overall_status") @db.VarChar(32)
+  assignedCuratorId String?   @map("assigned_curator_id") @db.Uuid
+  lastAuditedAt     DateTime? @map("last_audited_at") @db.Timestamptz(6)
+  nextAuditDueAt    DateTime? @map("next_audit_due_at") @db.Timestamptz(6)
+  fieldStatuses     Json      @default("{}") @map("field_statuses") @db.JsonB
+  curatorQueueNotes String?   @map("curator_queue_notes") @db.Text
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   destination     Destination            @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  assignedCurator Account?               @relation(fields: [assignedCuratorAccountId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  assignedCurator Account?               @relation(fields: [assignedCuratorId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   evidence        VerificationEvidence[]
   records         VerificationRecord[]
 
   @@index([overallStatus], name: "idx_verifications_status")
-  @@index([recheckRequiredAt], name: "idx_verifications_recheck")
   @@map("destination_verifications")
 }
 
 model VerificationEvidence {
-  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  verificationId String   @map("verification_id") @db.Uuid
-  evidenceType   String   @map("evidence_type") @db.VarChar(32)
-  url            String   @db.Text
-  description    String   @db.VarChar(500)
-  submittedBy    String   @map("submitted_by") @db.Uuid
-  submittedAt    DateTime @default(now()) @map("submitted_at") @db.Timestamptz(6)
+  id                    String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  verificationId        String   @map("verification_id") @db.Uuid
+  evidenceType          String   @map("evidence_type") @db.VarChar(50)
+  documentUrl           String?  @map("document_url") @db.Text
+  sourceOrganization    String   @map("source_organization") @db.VarChar(150)
+  officialReferenceCode String?  @map("official_reference_code") @db.VarChar(100)
+  notes                 String?  @db.Text
+  submittedBy           String   @map("submitted_by") @db.Uuid
+  submittedAt           DateTime @default(now()) @map("submitted_at") @db.Timestamptz(6)
 
   verification DestinationVerification @relation(fields: [verificationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   submitter    Account                 @relation(fields: [submittedBy], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  records      VerificationRecord[]
 
   @@index([verificationId], name: "idx_evidence_verification_id")
-  @@index([submittedBy], name: "idx_evidence_submitted_by")
+  @@index([evidenceType], name: "idx_evidence_type")
   @@map("verification_evidence")
 }
 
 model VerificationRecord {
-  id                       String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  verificationId           String    @map("verification_id") @db.Uuid
-  field                    String    @db.VarChar(64)
-  status                   String    @db.VarChar(32)
-  verifiedBy               String    @map("verified_by") @db.Uuid
-  confidenceLevel          String    @map("confidence_level") @db.VarChar(32)
-  notes                    String?   @db.Text
-  validUntil               DateTime? @map("valid_until") @db.Timestamptz(6)
+  id                        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  verificationId            String    @map("verification_id") @db.Uuid
+  destinationId             String    @map("destination_id") @db.Uuid
+  field                     String    @db.VarChar(50)
+  status                    String    @default("unverified") @db.VarChar(32)
+  verifiedBy                String    @map("verified_by") @db.Uuid
+  evidenceId                String?   @map("evidence_id") @db.Uuid
   verifiedValueSnapshotHash String?   @map("verified_value_snapshot_hash") @db.VarChar(64)
-  timestamp                DateTime  @default(now()) @db.Timestamptz(6)
+  confidenceLevel           String    @map("confidence_level") @db.VarChar(50)
+  notes                     String?   @db.Text
+  timestamp                 DateTime  @default(now()) @db.Timestamptz(6)
+  validUntil                DateTime? @map("valid_until") @db.Timestamptz(6)
 
   verification DestinationVerification @relation(fields: [verificationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  destination  Destination             @relation(fields: [destinationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   verifier     Account                 @relation(fields: [verifiedBy], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  evidence     VerificationEvidence?   @relation(fields: [evidenceId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
-  @@index([verificationId, field], name: "idx_ver_records_field")
-  @@index([verifiedBy], name: "idx_ver_records_verifier")
-  @@index([timestamp], name: "idx_ver_records_timestamp")
+  @@index([destinationId, field], name: "idx_records_dest_field")
+  @@index([verificationId], name: "idx_records_verification_id")
+  @@index([timestamp(sort: Desc)], name: "idx_records_timestamp")
   @@map("verification_records")
 }
 
@@ -335,5 +375,6 @@ model AuditLogTelemetry {
 
   auditLog AuditLog @relation(fields: [auditLogId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
+  @@index([actorEmail], name: "idx_telemetry_actor_email")
   @@map("audit_log_telemetry")
 }

@@ -1,19 +1,53 @@
-import { PrismaClient } from "@prisma/client";
+﻿import { PrismaClient } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
 async function main() {
   console.log("Starting idempotent database seed...");
 
-  // 1. Provision Root System Account (if not already seeded by migration)
   const SYSTEM_ACCOUNT_ID = "00000000-0000-4000-8000-000000000001";
   const SYSTEM_EMAIL = "system-internal@mytravelroad.local";
 
-  const existingSystemAccount = await prisma.account.findUnique({
+  // 1. Conflict Pre-Check: Validate reserved Email collision
+  const existingByEmail = await prisma.account.findFirst({
+    where: {
+      email: {
+        equals: SYSTEM_EMAIL,
+        mode: "insensitive",
+      },
+    },
+  });
+
+  if (existingByEmail && existingByEmail.id !== SYSTEM_ACCOUNT_ID) {
+    throw new Error(
+      `CRITICAL SEED CONFLICT: Reserved root system email ${SYSTEM_EMAIL} is already occupied by a non-system UUID (${existingByEmail.id}). Manual DBA resolution required.`
+    );
+  }
+
+  // 2. Validate or Provision Root System Account
+  const existingById = await prisma.account.findUnique({
     where: { id: SYSTEM_ACCOUNT_ID },
   });
 
-  if (!existingSystemAccount) {
+  if (existingById) {
+    // Strict Invariant Check: Every identity and security attribute must match the specification
+    const isConflict =
+      existingById.email.toLowerCase() !== SYSTEM_EMAIL.toLowerCase() ||
+      existingById.type !== "system" ||
+      existingById.role !== "super_admin" ||
+      existingById.status !== "active" ||
+      existingById.phone !== null ||
+      existingById.emailVerified !== true ||
+      existingById.phoneVerified !== false ||
+      existingById.lastLoginAt !== null;
+
+    if (isConflict) {
+      throw new Error(
+        `CRITICAL SEED CONFLICT: Reserved root system UUID ${SYSTEM_ACCOUNT_ID} is occupied by conflicting attributes (email: ${existingById.email}, type: ${existingById.type}, role: ${existingById.role}, status: ${existingById.status}, phone: ${existingById.phone}, email_verified: ${existingById.emailVerified}, phone_verified: ${existingById.phoneVerified}, last_login_at: ${existingById.lastLoginAt}). Manual DBA resolution required.`
+      );
+    }
+    console.log(`Verified existing root system account: ${SYSTEM_ACCOUNT_ID} (${SYSTEM_EMAIL})`);
+  } else {
     await prisma.account.create({
       data: {
         id: SYSTEM_ACCOUNT_ID,
@@ -27,58 +61,73 @@ async function main() {
       },
     });
     console.log(`Provisioned root system account: ${SYSTEM_ACCOUNT_ID} (${SYSTEM_EMAIL})`);
-  } else {
-    console.log(`Root system account verified: ${SYSTEM_ACCOUNT_ID}`);
   }
 
-  // Invariant validation: Ensure root system account has zero credentials, profiles, or saved destinations
-  const credentialCheck = await prisma.accountSecurityCredential.findUnique({
+  // 3. Invariant Enforcement: Validate Root System Account has NO child records
+  const credentialCount = await prisma.accountSecurityCredential.count({
     where: { accountId: SYSTEM_ACCOUNT_ID },
   });
-  if (credentialCheck) {
-    throw new Error("SECURITY INVARIANT VIOLATION: Root system account has security credentials!");
+  if (credentialCount > 0) {
+    throw new Error("SECURITY INVARIANT VIOLATION: Root system account has security credentials provisioned!");
   }
 
-  const profileCheck = await prisma.touristProfile.findUnique({
+  const profileCount = await prisma.touristProfile.count({
     where: { accountId: SYSTEM_ACCOUNT_ID },
   });
-  if (profileCheck) {
-    throw new Error("SECURITY INVARIANT VIOLATION: Root system account has a tourist profile!");
+  if (profileCount > 0) {
+    throw new Error("SECURITY INVARIANT VIOLATION: Root system account has a tourist profile provisioned!");
   }
 
-  // 2. Provision Initial Malappuram Destination Categories
+  const savedCount = await prisma.savedDestination.count({
+    where: { accountId: SYSTEM_ACCOUNT_ID },
+  });
+  if (savedCount > 0) {
+    throw new Error("SECURITY INVARIANT VIOLATION: Root system account has saved destinations provisioned!");
+  }
+
+  console.log("Root system account invariant checks passed (0 credentials, 0 profiles, 0 saved destinations).");
+
+  // 4. Provision Initial Malappuram Destination Categories (Section 3.4)
   const initialCategories = [
     {
       slug: "nature-wildlife",
       name: "Nature & Wildlife",
+      shortLabel: "Wildlife",
       description:
-        "Forests, rivers, bird sanctuaries, ecotourism destinations, and protected wildlife reserves.",
+        "Forests, rivers, bird sanctuaries, ecotourism destinations, and protected wildlife reserves across Malappuram.",
+      iconKey: "trees",
       displayOrder: 10,
-      iconName: "trees",
+      status: "active",
     },
     {
       slug: "beaches-coastal",
       name: "Beaches & Estuaries",
+      shortLabel: "Beaches",
       description:
         "Coastal attractions, serene estuaries, river mouths, and tranquil beaches along the Arabian Sea.",
+      iconKey: "waves",
       displayOrder: 20,
-      iconName: "waves",
+      status: "active",
     },
     {
       slug: "hills-valleys",
       name: "Waterfalls & Hills",
+      shortLabel: "Hills",
       description:
         "Misty hillocks, verdant viewpoints, seasonal cascading waterfalls, and trekking pathways.",
+      iconKey: "mountain",
       displayOrder: 30,
-      iconName: "mountain",
+      status: "active",
     },
     {
       slug: "heritage-culture",
       name: "Heritage & Culture",
+      shortLabel: "Heritage",
       description:
         "Centuries-old temples, mosques, teak museums, historical architecture, and cultural landmarks.",
+      iconKey: "landmark",
       displayOrder: 40,
-      iconName: "landmark",
+      status: "active",
     },
   ];
 
@@ -87,16 +136,20 @@ async function main() {
       where: { slug: cat.slug },
       update: {
         name: cat.name,
+        shortLabel: cat.shortLabel,
         description: cat.description,
+        iconKey: cat.iconKey,
         displayOrder: cat.displayOrder,
-        iconName: cat.iconName,
+        status: cat.status,
       },
       create: {
         slug: cat.slug,
         name: cat.name,
+        shortLabel: cat.shortLabel,
         description: cat.description,
+        iconKey: cat.iconKey,
         displayOrder: cat.displayOrder,
-        iconName: cat.iconName,
+        status: cat.status,
       },
     });
     console.log(`Seeded destination category: ${category.name} (${category.slug}) [${category.id}]`);
@@ -107,7 +160,7 @@ async function main() {
 
 main()
   .catch((e) => {
-    console.error("Error during database seed:", e);
+    console.error("Error during database seed execution:", e);
     process.exit(1);
   })
   .finally(async () => {

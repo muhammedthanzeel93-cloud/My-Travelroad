@@ -1,46 +1,114 @@
-# Database Setup & Operations Runbook
+﻿# Database Setup & Operations Runbook
 
 ## 1. Overview
 
-**My Travelroad** utilizes **PostgreSQL 16** with the **PostGIS 3.4** spatial extension as its primary relational and geospatial datastore. The database layer is structured according to the Stage A domain model and database architecture approved in [`docs/architecture/database-architecture.md`](file:///c:/Users/aysha/Downloads/My%20Travelroad/My%20Travelroad/docs/architecture/database-architecture.md) and [`docs/architecture/domain-model.md`](file:///c:/Users/aysha/Downloads/My%20Travelroad/My%20Travelroad/docs/architecture/domain-model.md).
+**My Travelroad** utilizes **PostgreSQL 16** with the **PostGIS 3.4** spatial extension as its primary relational and geospatial datastore. The database layer strictly implements the Stage A domain model and database architecture approved in [`docs/architecture/database-architecture.md`](file:///c:/Users/aysha/Downloads/My%20Travelroad/My%20Travelroad/docs/architecture/database-architecture.md) and [`docs/architecture/domain-model.md`](file:///c:/Users/aysha/Downloads/My%20Travelroad/My%20Travelroad/docs/architecture/domain-model.md).
 
-### Stage A Schema Scope
-The foundation comprises **15 tables**:
-1. `accounts` — Central identity registry.
-2. `account_security_credentials` — Isolated 1:1 security credentials.
-3. `tourist_profiles` — Public and private user profile attributes.
-4. `destination_categories` — Hierarchical taxonomy.
-5. `destinations` — Core destination entity.
-6. `destination_locations` — Spatial coordinates (`GEOGRAPHY(Point, 4326)`), fuzzy precision flags, and geo-enrichment metadata.
-7. `destination_media` — Multi-resolution assets, licensing, and focal point geometry.
-8. `destination_opening_hours` — Weekly schedule, seasonal intervals, and operational statuses.
-9. `destination_verifications` — Governance lifecycle and reviewer assignments.
-10. `verification_evidence` — Audit trails and uploaded proof documents.
-11. `verification_records` — Immutable certified provenance snapshots.
-12. `saved_destinations` — Traveler bookmarks and trip staging.
-13. `audit_logs` — Immutable, append-only operational and security event log.
-14. `audit_log_telemetry` — Auxiliary privacy-protected audit telemetry (IP, client headers).
-15. `destination_secondary_categories` — Many-to-many junction table between destinations and categories.
-
-Additionally, the database layer provisions:
-- **Public Views**: `v_public_destination_locations` (geographic projection and coordinate fuzzing), `v_domain_audit_logs`.
-- **Database Roles**: `app_user` (least-privilege runtime), `admin_service_role` (administrative actions), `audit_maintenance_role` (compliance archiving).
-- **Security Triggers**: Root system account immutability, system child table prevention, account-type transition protection, and audit log immutability.
+### Stage A Schema Scope (15 Tables)
+1. `accounts` â€” Central identity registry decoupled from public profiles.
+2. `account_security_credentials` â€” Isolated 1:1 authentication secrets and security lockouts.
+3. `tourist_profiles` â€” Public and private user profile attributes and travel preferences.
+4. `destination_categories` â€” Hierarchical taxonomy classification with self-referencing subcategories.
+5. `destinations` â€” Core tourism destination storytelling entity.
+6. `destination_locations` â€” PostGIS spherical location data (`GEOGRAPHY(Point, 4326)`), administrative hierarchy, and coordinate sensitivity flags.
+7. `destination_media` â€” High-resolution media, licensing, and single-cover partial index.
+8. `destination_opening_hours` â€” Operating patterns, weekly schedule intervals, seasonal notes, and fee structures.
+9. `destination_verifications` â€” Overall verification container aggregating fact-level verifications and curator audit dates.
+10. `verification_evidence` â€” Physical or documentary evidence (gazettes, circulars, GPS tracks, photos) supporting fact claims.
+11. `verification_records` â€” Granular historical fact audit stamps per field (`location_coordinates`, `opening_hours`, etc.).
+12. `saved_destinations` â€” Traveler bookmarks and trip staging (strictly one bookmark per account/destination).
+13. `audit_logs` â€” Strictly append-only, immutable regulatory and administrative event ledger.
+14. `audit_log_telemetry` â€” Auxiliary privacy-protected audit telemetry (actor email, IP address, user agent, state snapshots).
+15. `destination_secondary_categories` â€” Many-to-many junction table supporting secondary cross-cutting category tags.
 
 ---
 
-## 2. Prerequisites
+## 2. Public Coordinate Privacy Architecture
 
-- **Node.js**: `v18.18+` or `v20.x`
-- **npm**: `v9+` or `v10+`
-- **PostgreSQL**: PostgreSQL 16+ with PostGIS 3.4+
-- **Docker & Docker Compose** (recommended for local development and CI testing)
+### The 3-Tier Coordinate Publication Hierarchy
+To prevent life-safety hazards (e.g. tourists navigating into hazardous terrain, active quarries, or river gorges) and eliminate mathematical triangulation attacks, **algorithmic pseudo-random Gaussian jitter is explicitly rejected**. Instead, coordinate privacy is governed by the database engine via a **3-Tier Publication Hierarchy**:
+
+1. **Priority 1: Approved Official Public Visitor Access Point**
+   - Curated visitor gateway: Forest Department checkpost, ticket counter, official parking area, boat jetty.
+   - Safe and legally accessible outside the protected ecological or tribal boundary.
+   - Projected via `public_approximate_centroid`.
+2. **Priority 2: Reviewed Safe Administrative-Area Centroid**
+   - Verified administrative buffer: Taluk headquarters, panchayat center, or designated buffer zone.
+   - Human-reviewed by a curator during verification.
+   - Projected via `public_approximate_centroid` with `public_approximate_display_name` (e.g. *"Nilambur Eco-Zone Buffer Area"*).
+3. **Priority 3: Complete Coordinate Suppression (No Map Pin)**
+   - When no safe gateway or reviewed centroid exists, `public_approximate_centroid` is `NULL`.
+   - The public projection view `v_public_destination_locations` projects `NULL` for `public_coordinates`.
+   - **Crucial Invariant**: Suppressed destinations **never fall back to exact coordinates**.
+
+### Public Projection View: `v_public_destination_locations`
+```sql
+CREATE OR REPLACE VIEW v_public_destination_locations AS
+SELECT
+    dl.destination_id,
+    dl.is_restricted,
+    dl.restriction_reason,
+    -- Projected coordinate: returns centroid if restricted, exact if public, or NULL if suppressed (Tier 3)
+    CASE
+        WHEN dl.is_restricted THEN dl.public_approximate_centroid
+        ELSE dl.coordinates
+    END AS public_coordinates,
+    CASE
+        WHEN dl.is_restricted THEN dl.public_approximate_display_name
+        ELSE dl.locality
+    END AS public_locality_name,
+    dl.taluk_or_subdivision,
+    dl.district,
+    dl.state_or_province,
+    dl.country_code,
+    dl.postal_code,
+    dl.nearest_transit_hub,
+    dl.created_at,
+    dl.updated_at
+FROM destination_locations dl;
+```
+
+### Database-Level Access Control
+- Raw `destination_locations` table access is revoked from the standard application role:
+  ```sql
+  REVOKE ALL ON destination_locations FROM app_user;
+  GRANT SELECT ON v_public_destination_locations TO app_user;
+  ```
+- Ordinary application queries cannot bypass the view to inspect raw coordinates of restricted destinations.
 
 ---
 
-## 3. Docker Compose Local Setup
+## 3. Catalog of Intentionally SQL-Only Database Objects
 
-For reproducible local development, use the following `docker-compose.yml` to provision a PostGIS-enabled PostgreSQL 16 instance.
+Prisma Schema provides high-level object-relational mapping, but PostgreSQL engine features are version-controlled in the SQL migrations under `prisma/migrations/`:
+
+| Object Name | Type | Purpose / Invariant Enforced |
+| :--- | :--- | :--- |
+| `uuid-ossp`, `pgcrypto`, `postgis` | Extensions | UUID generation and native spherical geodetic calculations |
+| `idx_locations_coordinates` | GiST Index | Spatial index on raw coordinates (`coordinates`) |
+| `idx_locations_public_centroid` | GiST Index (Partial) | Spatial index on `public_approximate_centroid WHERE public_approximate_centroid IS NOT NULL` |
+| `idx_locations_public_coord_expr` | GiST Index (Functional) | Expression index on `(CASE WHEN is_restricted THEN public_approximate_centroid ELSE coordinates END)` for view inlining pushdown |
+| `idx_media_single_cover` | B-Tree (Partial Unique) | Enforces only one cover media item per destination (`WHERE is_cover = TRUE`) |
+| `ck_accounts_email_format` | CHECK Constraint | Regex validation for RFC-compliant email formatting |
+| `ck_locations_coord_range` | CHECK Constraint | Restricts longitude to `[-180.0, 180.0]` and latitude to `[-90.0, 90.0]` |
+| `ck_locations_coord_valid` | CHECK Constraint | Validates OGC Simple Features point geometry (`ST_IsValid`) |
+| `ck_locations_restricted_centroid` | CHECK Constraint | Enforces that restricted destinations must carry an approved `public_approximate_display_name` |
+| `ck_security_no_system_account` | CHECK Constraint | Prevents root system account from acquiring security credentials |
+| `ck_profiles_no_system_account` | CHECK Constraint | Prevents root system account from acquiring tourist profiles |
+| `ck_saved_no_system_account` | CHECK Constraint | Prevents root system account from saving destination bookmarks |
+| `trg_guard_system_account` | Trigger | Protects all 8 identity fields of root system account and blocks deletion |
+| `trg_guard_no_system_credentials` | Trigger | Cross-table trigger preventing any `type = 'system'` account from having credentials |
+| `trg_guard_no_system_profiles` | Trigger | Cross-table trigger preventing any `type = 'system'` account from having tourist profiles |
+| `trg_guard_no_system_bookmarks` | Trigger | Cross-table trigger preventing any `type = 'system'` account from saving destinations |
+| `trg_guard_system_type_transition` | Trigger | Prevents non-system accounts from transitioning to `system` if child records exist |
+| `trg_audit_logs_immutable` | Trigger | Enforces append-only immutability on `audit_logs` (blocks `UPDATE` and `DELETE`) |
+| `v_public_destination_locations` | View | Projects sanitized 3-Tier public coordinates and masked locality names |
+| `v_domain_audit_logs` | View | Reconstructs composite domain audit log model with decrypted telemetry |
+| `app_user`, `admin_service_role`, `audit_maintenance_role` | Roles & Privileges | Enforces least-privilege role-based access control at the engine level |
+
+---
+
+## 4. Local Setup via Docker Compose
 
 ```yaml
 version: '3.8'
@@ -73,14 +141,9 @@ volumes:
 docker compose up -d
 ```
 
-### Checking Container Health
-```bash
-docker compose ps
-```
-
 ---
 
-## 4. Environment Configuration
+## 5. Environment Configuration
 
 Copy the template from `.env.example` to `.env`:
 
@@ -88,162 +151,63 @@ Copy the template from `.env.example` to `.env`:
 cp .env.example .env
 ```
 
-Ensure the connection strings are properly configured:
-
 ```env
-# Standard application connection pool URL (e.g. PgBouncer or direct pool)
 DATABASE_URL="postgresql://postgres:postgrespassword@localhost:5432/mytravelroad?schema=public&connection_limit=10"
-
-# Direct URL for schema migrations and administrative operations
 DIRECT_URL="postgresql://postgres:postgrespassword@localhost:5432/mytravelroad?schema=public"
-
 NODE_ENV="development"
 ```
 
 ---
 
-## 5. Migration Execution
-
-The schema migrations are fully version-controlled under `prisma/migrations/` and execute sequentially across three designated phases:
-
-1. **Phase 1: Core Foundation (`20261114000001_phase1_core_foundation`)**
-   - Enables `uuid-ossp`, `pgcrypto`, and `postgis` extensions.
-   - Creates `accounts`, `account_security_credentials`, `tourist_profiles`.
-   - Seeds the Root System Account (`00000000-0000-4000-8000-000000000001`).
-   - Attaches `trg_guard_system_account` and child credential/profile prevention triggers.
-
-2. **Phase 2: Taxonomy & Destinations (`20261114000002_phase2_taxonomy_destinations`)**
-   - Creates `destination_categories`, `destinations`, `destination_secondary_categories`.
-   - Creates `destination_locations` with native `GEOGRAPHY(Point, 4326)`.
-   - Provisions GiST spatial expression indexes (`idx_locations_public_coord_expr`).
-   - Creates `destination_media` and `destination_opening_hours`.
-
-3. **Phase 3: Verification, Audit & Security Roles (`20261114000003_phase3_verification_audit`)**
-   - Creates `destination_verifications`, `verification_evidence`, `verification_records`.
-   - Creates `saved_destinations`.
-   - Attaches `trg_guard_system_type_transition` to `accounts`.
-   - Creates `audit_logs` and `audit_log_telemetry` with immutability triggers.
-   - Provisions views `v_public_destination_locations` and `v_domain_audit_logs`.
-   - Grants least-privilege permissions to `app_user`, `admin_service_role`, and `audit_maintenance_role`.
-
-### Running Migrations
+## 6. Migration & Seeding Execution
 
 ```bash
-# Apply pending migrations to the database
-npm run db:migrate
-```
-
-### Generating Prisma Client
-
-```bash
-# Re-generate the TypeScript Prisma Client
+# 1. Generate Prisma Client
 npm run db:generate
-```
 
----
+# 2. Deploy version-controlled migrations
+npm run db:migrate
 
-## 6. Database Seeding
-
-The database seed script (`prisma/seed.ts`) is idempotent and safe to run multiple times:
-
-```bash
+# 3. Seed Root System Account & Baseline Taxonomy
 npm run db:seed
 ```
 
-### Seeding Invariants Enforced
-1. **Root System Account**:
-   - UUID: `00000000-0000-4000-8000-000000000001`
-   - Email: `system-internal@mytravelroad.local`
-   - Role: `super_admin`, Type: `system`, Status: `active`
-   - **Zero Credentials**: Explicitly validates that no `account_security_credentials`, `tourist_profiles`, or `saved_destinations` records exist for this account.
-2. **Taxonomy Baseline (Malappuram)**:
-   - `nature-wildlife` (Nature & Wildlife)
-   - `beaches-coastal` (Beaches & Estuaries)
-   - `hills-valleys` (Waterfalls & Hills)
-   - `heritage-culture` (Heritage & Culture)
-
 ---
 
-## 7. Verification & PostGIS Validation Queries
+## 7. Verification & Testing
 
-Once migrations and seeding have run against a live PostgreSQL instance, verify the installation with these administrative queries:
-
-### 1. Verify PostGIS Extension
-```sql
-SELECT PostGIS_Full_Version();
+### 1. Automated Database Helper Unit Tests
+```bash
+npx tsx tests/unit/db.test.ts
 ```
-*Expected Output*: Returns `POSTGIS="3.4.x" ... GEOS="3.x" ... PROJ="9.x"`.
+*Validates coordinate bounds, NaN/Infinity rejection, bounding box envelopes, antimeridian crossing, and parameterized Prisma.sql builders.*
 
-### 2. Verify Spatial Indexes
-```sql
-SELECT tablename, indexname, indexdef
-FROM pg_indexes
-WHERE tablename = 'destination_locations'
-  AND indexdef LIKE '%gist%';
+### 2. Standalone SQL Test Suite
+When connected to a PostgreSQL 16 + PostGIS 3.4 database, execute the automated verification suite:
+```bash
+psql -U postgres -d mytravelroad -f tests/sql/verification_tests.sql
 ```
-*Expected Output*: Returns `idx_destination_locations_coordinates` and `idx_locations_public_coord_expr`.
-
-### 3. Verify Public Spatial View
-```sql
-SELECT destination_id, published_longitude, published_latitude, is_exact
-FROM v_public_destination_locations
-LIMIT 5;
-```
-
-### 4. Verify Root System Account Immutability Trigger
-```sql
--- Attempting to alter root system account email MUST fail
-UPDATE accounts
-SET email = 'malicious@external.com'
-WHERE id = '00000000-0000-4000-8000-000000000001';
--- Expected: ERROR: CRITICAL SECURITY VIOLATION: Root system account attributes are immutable (id=00000000-0000-4000-8000-000000000001)
-```
-
-### 5. Verify System Account Child-Table Prevention Trigger
-```sql
--- Attempting to add credentials to a system account MUST fail
-INSERT INTO account_security_credentials (account_id, password_hash)
-VALUES ('00000000-0000-4000-8000-000000000001', 'hashed_pw_attempt');
--- Expected: ERROR: INVARIANT VIOLATION: System accounts cannot possess authentication credentials (account_id=00000000-0000-4000-8000-000000000001)
-```
-
-### 6. Verify Audit Log Immutability Trigger
-```sql
--- Attempting to update an audit log record MUST fail
-UPDATE audit_logs
-SET action = 'TAMPERED'
-WHERE id = (SELECT id FROM audit_logs LIMIT 1);
--- Expected: ERROR: INVARIANT VIOLATION: audit_logs records are strictly append-only and cannot be updated or deleted.
-```
+*Tests all 11 requirements: extensions, 15 tables, 2 views, GiST indexes, root account immutability, child table guards, account-type transition checks, audit log immutability, 3-tier coordinate privacy, and spatial proximity queries.*
 
 ---
 
 ## 8. TypeScript Application Integration
 
-Application code interacts with the database using the singleton Prisma Client and spatial helper functions exported from `src/lib/db.ts`:
-
 ```typescript
-import { prisma, toPointWkt, getBoundingBoxEnvelopes } from "@/lib/db";
+import { prisma, createPointGeographySql, createBoundingBoxWhereClause, BoundingBox } from "@/lib/db";
 
-// Example spatial proximity query using Prisma raw queries
-const nearbyDestinations = await prisma.$queryRaw`
-  SELECT 
-    d.id, 
-    d.title, 
-    d.slug,
-    ST_Distance(
-      dl.coordinates, 
-      ST_SetSRID(ST_MakePoint(${longitude}, ${latitude}), 4326)::geography
-    ) AS distance_meters
-  FROM destinations d
-  JOIN destination_locations dl ON dl.destination_id = d.id
-  WHERE d.publication_status = 'published'
-    AND ST_DWithin(
-      dl.coordinates, 
-      ST_SetSRID(ST_MakePoint(${longitude}, ${latitude}), 4326)::geography, 
-      ${radiusMeters}
-    )
-  ORDER BY distance_meters ASC
-  LIMIT 20;
+// Spatial bounding box query using parameterized Prisma tagged templates
+const box: BoundingBox = { minLon: 75.8, minLat: 10.8, maxLon: 76.4, maxLat: 11.4 };
+const whereClause = createBoundingBoxWhereClause(box);
+
+const nearbyLocations = await prisma.$queryRaw`
+  SELECT
+    destination_id,
+    public_locality_name,
+    is_restricted,
+    ST_AsGeoJSON(public_coordinates) AS geojson
+  FROM v_public_destination_locations dl
+  WHERE ${whereClause}
+  LIMIT 50;
 `;
 ```
