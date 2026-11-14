@@ -96,12 +96,13 @@ CREATE INDEX idx_accounts_role ON accounts (role);
 -- foreign keys (fk_audit_actor), or triggers are evaluated.
 --
 -- Migration Idempotency & Conflict Strategy:
--- 1. If 00000000-0000-4000-8000-000000000001 already exists with identical attributes,
---    the script is a safe no-op.
--- 2. If 00000000-0000-4000-8000-000000000001 exists with conflicting identity or security
---    attributes, migration halts immediately with RAISE EXCEPTION, preventing silent corruption.
--- 3. If system-internal@mytravelroad.local is occupied by a different UUID, migration halts
---    with RAISE EXCEPTION for manual DBA investigation.
+-- 1. The reserved UUID is a no-op only if every protected attribute matches:
+--    UUID, exact reserved email, system type, super_admin role, active status,
+--    NULL phone, email_verified = TRUE, phone_verified = FALSE, and NULL last_login_at.
+-- 2. Any mismatch halts migration with RAISE EXCEPTION; no existing row is updated.
+-- 3. If another UUID owns the reserved email, migration halts for DBA review. A
+--    concurrent insert racing these pre-checks is rejected by unique constraints
+--    and aborts migration; it is never silently overwritten.
 
 DO $$
 DECLARE
@@ -111,15 +112,18 @@ BEGIN
     SELECT * INTO v_existing_by_id FROM accounts WHERE id = '00000000-0000-4000-8000-000000000001'::uuid;
     SELECT * INTO v_existing_by_email FROM accounts WHERE LOWER(email) = LOWER('system-internal@mytravelroad.local');
 
-    -- 1. Validate reserved UUID state
+    -- 1. Validate every protected reserved-UUID attribute. IS DISTINCT FROM is
+    --    intentional: NULL is treated as a mismatch rather than bypassing a check.
     IF v_existing_by_id.id IS NOT NULL THEN
-        IF v_existing_by_id.email != 'system-internal@mytravelroad.local' 
-           OR v_existing_by_id.type != 'system' 
-           OR v_existing_by_id.role != 'super_admin' 
-           OR v_existing_by_id.status != 'active'
+        IF v_existing_by_id.id IS DISTINCT FROM '00000000-0000-4000-8000-000000000001'::uuid
+           OR v_existing_by_id.email IS DISTINCT FROM 'system-internal@mytravelroad.local'
+           OR v_existing_by_id.type IS DISTINCT FROM 'system'
+           OR v_existing_by_id.role IS DISTINCT FROM 'super_admin'
+           OR v_existing_by_id.status IS DISTINCT FROM 'active'
            OR v_existing_by_id.phone IS NOT NULL
-           OR v_existing_by_id.email_verified != TRUE
-           OR v_existing_by_id.phone_verified != FALSE THEN
+           OR v_existing_by_id.email_verified IS DISTINCT FROM TRUE
+           OR v_existing_by_id.phone_verified IS DISTINCT FROM FALSE
+           OR v_existing_by_id.last_login_at IS NOT NULL THEN
             RAISE EXCEPTION 'MIGRATION CONFLICT: Reserved root system UUID 00000000-0000-4000-8000-000000000001 is already occupied by a conflicting record (email: %, type: %, role: %, status: %). Manual DBA resolution required.', 
                 v_existing_by_id.email, v_existing_by_id.type, v_existing_by_id.role, v_existing_by_id.status;
         END IF;
@@ -243,9 +247,43 @@ RETURNS TRIGGER AS $$
 DECLARE
     v_account_type VARCHAR(32);
 BEGIN
-    SELECT type INTO v_account_type FROM accounts WHERE id = NEW.account_id;
+    SELECT type INTO v_account_type
+      FROM accounts
+     WHERE id = NEW.account_id
+     FOR UPDATE;
     IF v_account_type = 'system' THEN
         RAISE EXCEPTION 'INTEGRITY VIOLATION: System accounts (type = system) are strictly barred from possessing security credentials, tourist profiles, or saved destinations.';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Reject conversion to system while any protected child exists. The UPDATE of
+-- accounts already holds its row lock before this BEFORE ROW trigger runs.
+-- The matching child triggers take FOR UPDATE on that same parent row, so a
+-- racing child INSERT/UPDATE either commits first and is seen by these EXISTS
+-- checks, or waits and then sees type = 'system' and fails. Locks last to the
+-- end of the transaction. Attach this trigger only after all three child tables
+-- exist, as specified in the migration sequence.
+CREATE OR REPLACE FUNCTION trg_reject_system_type_with_children()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.type IS DISTINCT FROM 'system' AND NEW.type = 'system' THEN
+        -- Under REPEATABLE READ, the transaction snapshot can predate a child
+        -- insert that committed while this trigger waited on the parent lock.
+        -- Require READ COMMITTED for this transition so each SPI EXISTS query
+        -- sees commits completed before it runs; other isolation levels fail closed.
+        IF current_setting('transaction_isolation') <> 'read committed' THEN
+            RAISE EXCEPTION
+                'Account type transition to system requires READ COMMITTED isolation; retry in a READ COMMITTED transaction.';
+        END IF;
+        IF EXISTS (SELECT 1 FROM account_security_credentials WHERE account_id = NEW.id)
+           OR EXISTS (SELECT 1 FROM tourist_profiles WHERE account_id = NEW.id)
+           OR EXISTS (SELECT 1 FROM saved_destinations WHERE account_id = NEW.id) THEN
+            RAISE EXCEPTION
+                'INTEGRITY VIOLATION: Account % cannot become type system while credentials, a tourist profile, or saved destinations exist.',
+                NEW.id;
+        END IF;
     END IF;
     RETURN NEW;
 END;
@@ -720,6 +758,16 @@ CREATE TRIGGER trg_guard_no_system_bookmarks
 BEFORE INSERT OR UPDATE ON saved_destinations
 FOR EACH ROW
 EXECUTE FUNCTION trg_prevent_system_account_child_records();
+
+-- Attach after all protected child tables exist. PostgreSQL executes
+-- same-event BEFORE ROW triggers in trigger-name alphabetical order, so the
+-- existing root guard (trg_guard_system_account) runs before this transition
+-- guard. The root guard remains authoritative for the reserved account.
+CREATE TRIGGER trg_guard_system_type_transition
+BEFORE UPDATE OF type ON accounts
+FOR EACH ROW
+WHEN (OLD.type IS DISTINCT FROM NEW.type AND NEW.type = 'system')
+EXECUTE FUNCTION trg_reject_system_type_with_children();
 ```
 
 ---
@@ -1696,12 +1744,13 @@ GRANT SELECT, UPDATE, DELETE ON audit_log_telemetry TO audit_maintenance_role;
 ### Phase 3: Verification & Audit Layer (Stage A Completion)
 11. Provision `destination_verifications`, `verification_evidence`, `verification_records`.
 12. Provision `saved_destinations` with static constraint `ck_saved_no_system_account` and attach trigger `trg_guard_no_system_bookmarks`.
-13. Provision `audit_logs` (core ledger) referencing `fk_audit_actor -> accounts(id)`, and `audit_log_telemetry` (auxiliary privacy extension).
-14. Apply immutability trigger (`trg_audit_logs_immutable`) on `audit_logs` and deploy secure projections (`v_public_destination_locations`, `v_domain_audit_logs`). Note that role elevations are authoritatively audited at the application service tier within atomic transactions, while direct DBA activity is recorded via engine-level `pgaudit`.
-15. Configure PostgreSQL database roles (`app_user`, `admin_service_role`, `audit_maintenance_role`) and column-level update privileges.
+13. Attach `trg_guard_system_type_transition` to `accounts` after `account_security_credentials`, `tourist_profiles`, and `saved_destinations` exist. It rejects a transition to `type = 'system'` if any protected child exists; parent-row locking serializes this check with child inserts and updates.
+14. Provision `audit_logs` (core ledger) referencing `fk_audit_actor -> accounts(id)`, and `audit_log_telemetry` (auxiliary privacy extension).
+15. Apply immutability trigger (`trg_audit_logs_immutable`) on `audit_logs` and deploy secure projections (`v_public_destination_locations`, `v_domain_audit_logs`). Note that role elevations are authoritatively audited at the application service tier within atomic transactions, while direct DBA activity is recorded via engine-level `pgaudit`.
+16. Configure PostgreSQL database roles (`app_user`, `admin_service_role`, `audit_maintenance_role`) and column-level update privileges.
 
 ### Phase 4: Social & UGC Moderation Expansion (Future Phase Milestone)
-16. Provision `business_profiles`, `community_posts`, `destination_reviews`, `user_reports`, and `moderation_records`.
+17. Provision `business_profiles`, `community_posts`, `destination_reviews`, `user_reports`, and `moderation_records`.
 
 ### Zero-Downtime Schema Expansion Rules
 - New columns must be added as `NULL` or with safe default values.
@@ -1866,4 +1915,9 @@ CREATE INDEX idx_reports_status ON user_reports (status);
 
 ### 12.10 Multi-Layer Database Enforcement of Non-Interactive System Principal
 - **Decision**: Enforce the No-Credential and No-Profile invariant using static CHECK constraints on child tables (`ck_security_no_system_account`, `ck_profiles_no_system_account`, `ck_saved_no_system_account`) alongside dynamic cross-table trigger `trg_prevent_system_account_child_records()`.
-- **Trade-Off**: Implementing database-level CHECK constraints directly inside child tables adds explicit DDL definitions and prevents future reuse of the root UUID for human accounts. However, this trade-off is deliberate: static CHECK constraints execute with zero performance overhead on insert/update and cannot be circumvented by application bugs, ORM misconfigurations, or rogue seeders. Together with trigger-based inspection of `accounts.type = 'system'`, the architecture guarantees that internal system actors remain strictly non-interactive, credential-less, and profile-less across all present and future platform operations.
+- **Account creation and child writes**: An account may be created with `type = 'system'`, but credential, profile, and bookmark INSERT/UPDATE triggers lock the target account row `FOR UPDATE` and reject a system type. The static UUID CHECK constraints separately forbid the reserved root UUID in all three child tables.
+- **Type transitions and trigger order**: `trg_guard_system_type_transition` is a `BEFORE UPDATE OF type` row trigger attached after all three child tables exist. PostgreSQL runs same-event BEFORE ROW triggers alphabetically: the existing `trg_guard_system_account` root guard runs first, then the transition guard. On a non-root account changing into `system`, the transition guard checks all three child tables inside the update transaction and raises an exception if any row exists. For this transition, it fails closed unless isolation is READ COMMITTED so each trigger-side existence query sees commits made while waiting for the parent lock.
+- **Concurrency protocol**: The account UPDATE holds its row lock before the transition trigger runs. Every child INSERT/UPDATE trigger takes `FOR UPDATE` on the parent before checking its type; this lock conflicts with the account UPDATE lock and is held through transaction end. If the child write wins, the type update waits and then sees the committed child under READ COMMITTED, so it fails. If the type update wins, the child write waits, then reads `type = 'system'` and fails. A child reassignment locks and checks its new parent. This is a database guardrail for ordinary DML; no application-only validation is relied upon.
+- **Deletion and audit references**: Deleting a non-root account cascades to its credentials, tourist profile, and saved destinations. The parent-row lock serializes deletion against child writes; if the delete commits first, the later child write finds no FK parent and fails. `ON DELETE RESTRICT` audit and verification foreign keys prevent physical deletion when retained history references the account; the documented tombstone/anonymization path preserves those references. The root account's own BEFORE DELETE guard prevents its deletion independently of audit rows.
+- **Provisioning and login identity**: The seed block treats the reserved UUID as a no-op only after validating all protected columns and exact reserved email; it performs no conflict update. A unique-constraint race aborts rather than overwriting. The root trigger keeps its type, role, active status, verified email, NULL phone and `last_login_at`, and false phone verification immutable. Its UUID is excluded from each child table, so the root can never gain interactive credentials or a tourist identity.
+- **Security boundary**: These constraints and triggers protect against normal SQL paths under the configured application roles. A superuser, table owner, or similarly privileged operator can disable triggers or alter the schema and can bypass the guards; database triggers cannot prevent their own privileged removal. Restrict ownership, separate migration/operations roles, use named audited DBA access, and send engine audit logs to immutable external storage. Other `type = 'system'` rows may be explicitly reclassified to a human type when childless; the invariant applies while their type is `system`, while the reserved root is permanently protected.
