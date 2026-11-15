@@ -1,0 +1,2559 @@
+openapi: 3.1.0
+info:
+  title: My Travelroad REST API
+  description: |
+    Authoritative Stage A REST API specification for **My Travelroad**, a high-assurance tourism discovery and verified information platform for Kerala, scaling from Malappuram to statewide destinations.
+
+    ### Key Architectural Principles
+    - **Resource-Oriented REST**: Standard HTTP methods, predictable kebab-case paths, and unified JSON response envelopes.
+    - **Split-Identity**: Complete decoupling of authentication credentials (`Account`) from user-facing projections (`TouristProfile`).
+    - **3-Tier Coordinate Privacy**: Ecologically sensitive locations strictly project approximate centroids or null coordinates to public consumers via `v_public_destination_locations`.
+    - **Fact-Level Verification Decoupling**: Independent verification of destination attributes (`opening_hours`, `entry_fees`, `coordinates`, `safety`) backed by immutable audit trails.
+    - **Zero System Account Credentialing**: System accounts (`type = 'system'`) are barred from interactive authentication.
+  version: 1.0.0
+  contact:
+    name: My Travelroad Engineering & Architecture Team
+    url: https://mytravelroad.com
+  license:
+    name: Proprietary
+    url: https://mytravelroad.com/terms
+
+servers:
+  - url: https://api.mytravelroad.com/api/v1
+    description: Production API Gateway
+  - url: https://staging-api.mytravelroad.com/api/v1
+    description: Staging Environment
+  - url: http://localhost:3000/api/v1
+    description: Local Development Server
+
+paths:
+  # ============================================================================
+  # Module A: Authentication (/auth)
+  # ============================================================================
+  /auth/register:
+    post:
+      summary: Register Tourist Account
+      description: Creates a new tourist identity account and linked tourist profile.
+      tags: [Authentication]
+      operationId: registerTourist
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: Registration successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+        '422':
+          $ref: '#/components/responses/422ValidationError'
+
+  /auth/login:
+    post:
+      summary: Login Account
+      description: Authenticates user credentials via Argon2id, issues a short-lived JWT access token, and sets an HttpOnly refresh cookie.
+      tags: [Authentication]
+      operationId: loginAccount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login successful
+          headers:
+            Set-Cookie:
+              description: Rotating HttpOnly refresh token cookie
+              schema:
+                type: string
+                example: refreshToken=rt_01JB8...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '423':
+          description: Account locked due to repeated authentication failures
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardErrorResponse'
+
+  /auth/logout:
+    post:
+      summary: Logout Account
+      description: Invalidates caller session and clears refresh token cookies.
+      tags: [Authentication]
+      operationId: logoutAccount
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+      responses:
+        '200':
+          description: Logout successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+
+  /auth/refresh:
+    post:
+      summary: Refresh Access Token
+      description: Consumes valid HttpOnly refresh cookie, performs token family rotation, and returns a new 15-minute access token.
+      tags: [Authentication]
+      operationId: refreshSession
+      security:
+        - CookieAuth: []
+      responses:
+        '200':
+          description: Token rotated successfully
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenRefreshResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+
+  /auth/me:
+    get:
+      summary: Get Current Authenticated Identity
+      description: Returns account metadata and linked tourist profile summary for caller.
+      tags: [Authentication]
+      operationId: getCurrentUser
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Identity details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurrentUserResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+
+  /auth/verify-email:
+    post:
+      summary: Verify Email Address
+      description: Confirms email verification token and marks account email as verified.
+      tags: [Authentication]
+      operationId: verifyEmail
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  example: emv_01JB89Z8H1K4V9Z0P9R8E7W6T2
+      responses:
+        '200':
+          description: Email verified successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+
+  /auth/forgot-password:
+    post:
+      summary: Request Password Reset
+      description: Dispatches password reset link to user email with anti-enumeration protection.
+      tags: [Authentication]
+      operationId: forgotPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: traveler@example.com
+      responses:
+        '200':
+          description: Generic confirmation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+
+  /auth/reset-password:
+    post:
+      summary: Reset Password
+      description: Consumes password reset token and updates password hash via Argon2id.
+      tags: [Authentication]
+      operationId: resetPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetPasswordRequest'
+      responses:
+        '200':
+          description: Password reset successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+
+  # ============================================================================
+  # Module B: Tourist Profiles (/profiles)
+  # ============================================================================
+  /profiles/me:
+    get:
+      summary: Get Own Profile
+      description: Retrieves full tourist profile including private travel preference tags.
+      tags: [Tourist Profiles]
+      operationId: getOwnProfile
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Own profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TouristProfileEnvelope'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+    patch:
+      summary: Update Own Profile
+      description: Updates caller's display name, bio, home region, language, and travel preferences.
+      tags: [Tourist Profiles]
+      operationId: updateOwnProfile
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProfileRequest'
+      responses:
+        '200':
+          description: Profile updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TouristProfileEnvelope'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '422':
+          $ref: '#/components/responses/422ValidationError'
+
+  /profiles/me/visibility:
+    patch:
+      summary: Update Profile Visibility
+      description: Toggles whether tourist profile is publicly discoverable in community feeds.
+      tags: [Tourist Profiles]
+      operationId: updateProfileVisibility
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [isPublic]
+              properties:
+                isPublic:
+                  type: boolean
+                  example: false
+      responses:
+        '200':
+          description: Visibility updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessResponse'
+
+  /profiles/{handle}:
+    get:
+      summary: View Public Tourist Profile
+      description: Retrieves public profile for a traveler by handle.
+      tags: [Tourist Profiles]
+      operationId: getPublicProfile
+      parameters:
+        - name: handle
+          in: path
+          required: true
+          schema:
+            type: string
+            example: amina_explorer
+      responses:
+        '200':
+          description: Public profile details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicTouristProfileEnvelope'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
+  # ============================================================================
+  # Module C: Destination Categories (/categories)
+  # ============================================================================
+  /categories:
+    get:
+      summary: List Categories
+      description: Lists active taxonomy categories in sequential display order.
+      tags: [Destination Categories]
+      operationId: listCategories
+      parameters:
+        - name: tree
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Category listing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoryListEnvelope'
+
+  /categories/{slug}:
+    get:
+      summary: Get Category Details
+      description: Retrieves category details and immediate subcategories.
+      tags: [Destination Categories]
+      operationId: getCategory
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+            example: nature-forests
+      responses:
+        '200':
+          description: Category details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoryDetailEnvelope'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
+  /categories/{slug}/destinations:
+    get:
+      summary: List Category Destinations
+      description: Retrieves paginated published destinations belonging to a category.
+      tags: [Destination Categories]
+      operationId: listCategoryDestinations
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+            example: nature-forests
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - $ref: '#/components/parameters/SortParam'
+      responses:
+        '200':
+          description: Paginated destinations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DestinationSummaryListEnvelope'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
+  # ============================================================================
+  # Module D: Destinations (/destinations)
+  # ============================================================================
+  /destinations:
+    get:
+      summary: List Published Destinations
+      description: Public destination discovery endpoint with district and category filtering.
+      tags: [Destinations]
+      operationId: listDestinations
+      parameters:
+        - name: category
+          in: query
+          required: false
+          schema:
+            type: string
+            example: nature-forests
+        - name: district
+          in: query
+          required: false
+          schema:
+            type: string
+            example: Malappuram
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - $ref: '#/components/parameters/SortParam'
+      responses:
+        '200':
+          description: Destination list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DestinationSummaryListEnvelope'
+
+  /destinations/search:
+    get:
+      summary: Search Destinations
+      description: Multi-modal search supporting text queries, PostGIS proximity radius, and bounding box envelopes.
+      tags: [Destinations]
+      operationId: searchDestinations
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+            example: teak
+        - name: near
+          in: query
+          description: Canonical longitude,latitude pair
+          required: false
+          schema:
+            type: string
+            example: '76.22,11.28'
+        - name: radiusKm
+          in: query
+          required: false
+          schema:
+            type: number
+            default: 15
+            maximum: 100
+        - name: bbox
+          in: query
+          description: Bounding box minLon,minLat,maxLon,maxLat
+          required: false
+          schema:
+            type: string
+            example: '75.8,10.8,76.5,11.5'
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DestinationSummaryListEnvelope'
+
+  /destinations/{slug}:
+    get:
+      summary: Get Destination by Slug
+      description: Retrieves complete editorial and geographical profile of a published destination.
+      tags: [Destinations]
+      operationId: getDestinationBySlug
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+            example: nilambur-teak-reserve
+      responses:
+        '200':
+          description: Full destination profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DestinationDetailEnvelope'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
+  /destinations/{slug}/location:
+    get:
+      summary: Retrieve Public Destination Location
+      description: Returns location data strictly projected through the 3-Tier Coordinate Privacy model (view v_public_destination_locations).
+      tags: [Destinations]
+      operationId: getDestinationLocation
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+            example: nilambur-teak-reserve
+      responses:
+        '200':
+          description: Projected location data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DestinationLocationEnvelope'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
+  /destinations/{slug}/media:
+    get:
+      summary: Retrieve Destination Media
+      description: Lists approved gallery media assets in sequence order.
+      tags: [Destinations]
+      operationId: getDestinationMedia
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+            example: nilambur-teak-reserve
+      responses:
+        '200':
+          description: Gallery media assets
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DestinationMediaListEnvelope'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
+  /destinations/{slug}/opening-hours:
+    get:
+      summary: Retrieve Destination Opening Hours & Fees
+      description: Operating schedule intervals, seasonal closures, and admission tariffs.
+      tags: [Destinations]
+      operationId: getDestinationOpeningHours
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+            example: nilambur-teak-reserve
+      responses:
+        '200':
+          description: Opening hours and fee policies
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DestinationOpeningHoursEnvelope'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
+  # ============================================================================
+  # Module E: Saved Destinations (/saved-destinations)
+  # ============================================================================
+  /saved-destinations:
+    get:
+      summary: List Saved Destinations
+      description: Retrieves bookmarked destinations for authenticated traveler.
+      tags: [Saved Destinations]
+      operationId: listSavedDestinations
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: collectionName
+          in: query
+          required: false
+          schema:
+            type: string
+            example: Monsoon 2027
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Saved destination bookmarks
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SavedDestinationListEnvelope'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+    post:
+      summary: Save Destination Bookmark
+      description: Bookmarks a destination. Enforces unique constraint per account.
+      tags: [Saved Destinations]
+      operationId: saveDestination
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSavedDestinationRequest'
+      responses:
+        '201':
+          description: Bookmark saved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SavedDestinationEnvelope'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+
+  /saved-destinations/{destinationId}:
+    delete:
+      summary: Remove Saved Destination Bookmark
+      description: Removes bookmark for a destination.
+      tags: [Saved Destinations]
+      operationId: removeSavedDestination
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: destinationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Bookmark deleted
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
+  # ============================================================================
+  # Module F: Administration (/admin)
+  # ============================================================================
+  /admin/dashboard:
+    get:
+      summary: Admin Dashboard Summary
+      description: Aggregated operational counts across destinations, verification queue, and categories.
+      tags: [Administration]
+      operationId: getAdminDashboard
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Dashboard summary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminDashboardEnvelope'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+
+  /admin/destinations:
+    get:
+      summary: List All Destinations (Admin View)
+      description: Lists destinations across all publication statuses (draft, in_review, published, archived).
+      tags: [Administration]
+      operationId: listAdminDestinations
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [draft, submitted, in_review, published, archived, suspended]
+        - name: district
+          in: query
+          required: false
+          schema:
+            type: string
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Admin destination list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminDestinationListEnvelope'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+    post:
+      summary: Create Destination Draft
+      description: Creates a new destination draft and records an AuditLog entry.
+      tags: [Administration]
+      operationId: createDestinationDraft
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDestinationRequest'
+      responses:
+        '201':
+          description: Destination draft created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+
+  /admin/destinations/{id}:
+    patch:
+      summary: Update Destination
+      description: Updates destination fields and records an AuditLog entry.
+      tags: [Administration]
+      operationId: updateDestination
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDestinationRequest'
+      responses:
+        '200':
+          description: Destination updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
+  /admin/destinations/{id}/publish:
+    post:
+      summary: Publish Destination
+      description: Sets publicationStatus to published. Requires super_admin.
+      tags: [Administration]
+      operationId: publishDestination
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Destination published
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
+  /admin/destinations/{id}/archive:
+    post:
+      summary: Archive Destination
+      description: Sets publicationStatus to archived. Requires super_admin.
+      tags: [Administration]
+      operationId: archiveDestination
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Destination archived
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
+  /admin/categories:
+    post:
+      summary: Create Destination Category
+      description: Defines a new taxonomy category. Requires super_admin.
+      tags: [Administration]
+      operationId: createCategory
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCategoryRequest'
+      responses:
+        '201':
+          description: Category created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '409':
+          $ref: '#/components/responses/409Conflict'
+
+  /admin/categories/{id}:
+    patch:
+      summary: Update Destination Category
+      description: Updates category details. Requires super_admin.
+      tags: [Administration]
+      operationId: updateCategory
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCategoryRequest'
+      responses:
+        '200':
+          description: Category updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
+  /admin/destinations/{id}/media:
+    post:
+      summary: Attach Destination Media
+      description: Uploads or associates media asset with a destination.
+      tags: [Administration]
+      operationId: attachDestinationMedia
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AttachMediaRequest'
+      responses:
+        '201':
+          description: Media attached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+
+  /admin/media/{id}:
+    patch:
+      summary: Update Media Asset
+      description: Modifies cover status, display sequence, or moderation approval.
+      tags: [Administration]
+      operationId: updateMedia
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMediaRequest'
+      responses:
+        '200':
+          description: Media updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+    delete:
+      summary: Delete Media Asset
+      description: Removes a media asset from the destination gallery.
+      tags: [Administration]
+      operationId: deleteMedia
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Media deleted
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+
+  /admin/destinations/{id}/opening-hours:
+    put:
+      summary: Configure Destination Opening Hours & Fees
+      description: Creates or replaces operating schedules, seasonal advisories, and admission tariffs.
+      tags: [Administration]
+      operationId: setDestinationOpeningHours
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetOpeningHoursRequest'
+      responses:
+        '200':
+          description: Opening hours saved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+
+  # ============================================================================
+  # Module G: Destination Verification (/admin/verification)
+  # ============================================================================
+  /admin/verification/queue:
+    get:
+      summary: List Verification Queue
+      description: Triage queue of destination verifications requiring review or audit.
+      tags: [Destination Verification]
+      operationId: listVerificationQueue
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [unverified, in_review, needs_update, partially_verified, verified, flagged]
+        - name: assignedCuratorId
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Verification queue
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerificationQueueEnvelope'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+
+  /admin/verification/{destinationId}:
+    get:
+      summary: Retrieve Verification Details
+      description: Full fact status breakdown, attached evidence, and audit metadata.
+      tags: [Destination Verification]
+      operationId: getVerificationDetails
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: destinationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Verification container details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerificationContainerEnvelope'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
+  /admin/verification/{destinationId}/assign:
+    post:
+      summary: Assign Curator
+      description: Assigns a curator to audit this destination.
+      tags: [Destination Verification]
+      operationId: assignCurator
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: destinationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignCuratorRequest'
+      responses:
+        '200':
+          description: Curator assigned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+
+  /admin/verification/{destinationId}/evidence:
+    post:
+      summary: Submit Verification Evidence
+      description: Attaches a supporting evidentiary document, gazette circular, or field survey.
+      tags: [Destination Verification]
+      operationId: submitVerificationEvidence
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: destinationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitEvidenceRequest'
+      responses:
+        '201':
+          description: Evidence attached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+
+  /admin/verification/{destinationId}/verify-field:
+    post:
+      summary: Certify Individual Destination Field
+      description: Records an official VerificationRecord certifying an individual fact.
+      tags: [Destination Verification]
+      operationId: verifyField
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: destinationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyFieldRequest'
+      responses:
+        '200':
+          description: Field verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+
+  /admin/verification/{destinationId}/dispute-field:
+    post:
+      summary: Dispute or Request Field Update
+      description: Flags an existing fact as disputed or in need of re-audit.
+      tags: [Destination Verification]
+      operationId: disputeField
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: destinationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DisputeFieldRequest'
+      responses:
+        '200':
+          description: Field disputed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardSuccessResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+
+  /admin/verification/{destinationId}/history:
+    get:
+      summary: Retrieve Verification History
+      description: Full historical audit trail of verification records for this destination.
+      tags: [Destination Verification]
+      operationId: getVerificationHistory
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: destinationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Historical records
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerificationHistoryEnvelope'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+
+# ==============================================================================
+# Components
+# ==============================================================================
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Short-lived JSON Web Token (15m lifespan)
+    CookieAuth:
+      type: apiKey
+      in: cookie
+      name: refreshToken
+      description: HttpOnly cryptographic refresh token cookie
+
+  parameters:
+    PageParam:
+      name: page
+      in: query
+      required: false
+      schema:
+        type: integer
+        default: 1
+        minimum: 1
+    LimitParam:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        default: 20
+        minimum: 1
+        maximum: 100
+    SortParam:
+      name: sort
+      in: query
+      required: false
+      schema:
+        type: string
+        example: createdAt:desc
+
+  responses:
+    400BadRequest:
+      description: Bad request syntax or malformed parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StandardErrorResponse'
+    401Unauthorized:
+      description: Missing or invalid authentication token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StandardErrorResponse'
+    403Forbidden:
+      description: Caller lacks required permissions or fails ownership assertion
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StandardErrorResponse'
+    404NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StandardErrorResponse'
+    409Conflict:
+      description: Resource uniqueness conflict
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StandardErrorResponse'
+    422ValidationError:
+      description: Request body validation failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StandardErrorResponse'
+
+  schemas:
+    # --------------------------------------------------------------------------
+    # Base Envelopes & Diagnostics
+    # --------------------------------------------------------------------------
+    StandardSuccessResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    StandardErrorResponse:
+      type: object
+      required: [success, error]
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          $ref: '#/components/schemas/ErrorPayload'
+
+    ErrorPayload:
+      type: object
+      required: [code, message, requestId, timestamp]
+      properties:
+        code:
+          type: string
+          example: VALIDATION_FAILED
+        message:
+          type: string
+          example: The request payload failed schema validation.
+        details:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErrorDetail'
+        requestId:
+          type: string
+          example: req_01JB89Z8H1K4V9Z0P9R8E7W6T2
+        timestamp:
+          type: string
+          format: date-time
+          example: '2026-11-15T15:00:00.000Z'
+
+    ErrorDetail:
+      type: object
+      required: [field, issue]
+      properties:
+        field:
+          type: string
+          example: email
+        issue:
+          type: string
+          example: Invalid email address format
+
+    ResponseMeta:
+      type: object
+      properties:
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        timestamp:
+          type: string
+          format: date-time
+
+    PaginationMeta:
+      type: object
+      required: [page, limit, totalItems, totalPages, hasNextPage, hasPrevPage]
+      properties:
+        page:
+          type: integer
+          example: 1
+        limit:
+          type: integer
+          example: 20
+        totalItems:
+          type: integer
+          example: 48
+        totalPages:
+          type: integer
+          example: 3
+        hasNextPage:
+          type: boolean
+          example: true
+        hasPrevPage:
+          type: boolean
+          example: false
+
+    MessageResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [message]
+          properties:
+            message:
+              type: string
+              example: Operation successful.
+
+    # --------------------------------------------------------------------------
+    # Auth & Identity Schemas
+    # --------------------------------------------------------------------------
+    RegisterRequest:
+      type: object
+      required: [email, password, displayName, handle]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 255
+          example: amina.rahman@example.com
+        password:
+          type: string
+          minLength: 8
+          maxLength: 72
+          example: Password123!
+        displayName:
+          type: string
+          minLength: 2
+          maxLength: 120
+          example: Amina Rahman
+        handle:
+          type: string
+          minLength: 3
+          maxLength: 50
+          pattern: '^[a-z0-9_]+$'
+          example: amina_explorer
+        preferredLanguage:
+          type: string
+          default: en
+          example: en
+
+    RegisterResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [account, profile]
+          properties:
+            account:
+              $ref: '#/components/schemas/AccountSummary'
+            profile:
+              $ref: '#/components/schemas/TouristProfileSummary'
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          example: amina.rahman@example.com
+        password:
+          type: string
+          example: Password123!
+
+    LoginResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [accessToken, tokenType, expiresIn, account]
+          properties:
+            accessToken:
+              type: string
+              example: eyJhbGciOiJSUzI1NiIs...
+            tokenType:
+              type: string
+              example: Bearer
+            expiresIn:
+              type: integer
+              example: 900
+            account:
+              $ref: '#/components/schemas/AccountSummary'
+
+    TokenRefreshResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [accessToken, tokenType, expiresIn]
+          properties:
+            accessToken:
+              type: string
+              example: eyJhbGciOiJSUzI1NiIs...
+            tokenType:
+              type: string
+              example: Bearer
+            expiresIn:
+              type: integer
+              example: 900
+
+    CurrentUserResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [account, profile]
+          properties:
+            account:
+              $ref: '#/components/schemas/AccountSummary'
+            profile:
+              $ref: '#/components/schemas/TouristProfileSummary'
+
+    ResetPasswordRequest:
+      type: object
+      required: [token, newPassword]
+      properties:
+        token:
+          type: string
+          example: pwr_01JB89Z8H1K4V9Z0P9R8E7W6T2
+        newPassword:
+          type: string
+          minLength: 8
+          maxLength: 72
+          example: NewSecurePassword456!
+
+    AccountSummary:
+      type: object
+      required: [id, email, role, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: e7b0a880-922c-47b2-9a57-0b1a78e7f101
+        email:
+          type: string
+          format: email
+          example: amina.rahman@example.com
+        role:
+          type: string
+          enum: [traveler, contributor, curator, moderator, super_admin]
+          example: traveler
+        status:
+          type: string
+          enum: [active, suspended, pending_verification, deactivated]
+          example: active
+        emailVerified:
+          type: boolean
+          example: true
+        createdAt:
+          type: string
+          format: date-time
+
+    TouristProfileSummary:
+      type: object
+      required: [id, displayName, handle]
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: f8c1b991-033d-58c3-ab68-1c2b89f8a202
+        displayName:
+          type: string
+          example: Amina Rahman
+        handle:
+          type: string
+          example: amina_explorer
+        avatarUrl:
+          type: string
+          nullable: true
+          example: https://assets.mytravelroad.com/avatars/amina.jpg
+
+    # --------------------------------------------------------------------------
+    # Profile Schemas
+    # --------------------------------------------------------------------------
+    UpdateProfileRequest:
+      type: object
+      properties:
+        displayName:
+          type: string
+          minLength: 2
+          maxLength: 120
+        bio:
+          type: string
+          maxLength: 500
+        homeRegion:
+          type: string
+          maxLength: 120
+        preferredLanguage:
+          type: string
+          maxLength: 10
+        travelPreferences:
+          type: array
+          items:
+            type: string
+            enum:
+              - ecotourism_nature
+              - cultural_heritage
+              - waterfalls_trekking
+              - coastal_estuaries
+              - ayurvedic_wellness
+              - culinary_food_trails
+              - wildlife_birdwatching
+              - photography
+              - family_friendly
+
+    TouristProfileEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [id, displayName, handle, travelPreferences, isPublic]
+          properties:
+            id:
+              type: string
+              format: uuid
+            displayName:
+              type: string
+            handle:
+              type: string
+            avatarUrl:
+              type: string
+              nullable: true
+            bio:
+              type: string
+              nullable: true
+            homeRegion:
+              type: string
+              nullable: true
+            preferredLanguage:
+              type: string
+            travelPreferences:
+              type: array
+              items:
+                type: string
+            isPublic:
+              type: boolean
+            createdAt:
+              type: string
+              format: date-time
+            updatedAt:
+              type: string
+              format: date-time
+
+    PublicTouristProfileEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [displayName, handle, travelPreferences]
+          properties:
+            displayName:
+              type: string
+            handle:
+              type: string
+            avatarUrl:
+              type: string
+              nullable: true
+            bio:
+              type: string
+              nullable: true
+            homeRegion:
+              type: string
+              nullable: true
+            travelPreferences:
+              type: array
+              items:
+                type: string
+            createdAt:
+              type: string
+              format: date-time
+
+    # --------------------------------------------------------------------------
+    # Taxonomy Schemas
+    # --------------------------------------------------------------------------
+    CategoryResponse:
+      type: object
+      required: [id, slug, name, shortLabel, description, iconKey, displayOrder, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          type: string
+        name:
+          type: string
+        shortLabel:
+          type: string
+        description:
+          type: string
+        iconKey:
+          type: string
+        parentId:
+          type: string
+          format: uuid
+          nullable: true
+        displayOrder:
+          type: integer
+        status:
+          type: string
+          enum: [active, inactive, archived]
+
+    CategoryListEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CategoryResponse'
+
+    CategoryDetailEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          allOf:
+            - $ref: '#/components/schemas/CategoryResponse'
+            - type: object
+              properties:
+                subcategories:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/CategoryResponse'
+
+    CreateCategoryRequest:
+      type: object
+      required: [name, slug, shortLabel, description, iconKey]
+      properties:
+        name:
+          type: string
+          maxLength: 100
+        slug:
+          type: string
+          maxLength: 100
+        shortLabel:
+          type: string
+          maxLength: 50
+        description:
+          type: string
+        iconKey:
+          type: string
+          maxLength: 50
+        parentId:
+          type: string
+          format: uuid
+          nullable: true
+        displayOrder:
+          type: integer
+          default: 0
+
+    UpdateCategoryRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        shortLabel:
+          type: string
+        description:
+          type: string
+        iconKey:
+          type: string
+        displayOrder:
+          type: integer
+        status:
+          type: string
+          enum: [active, inactive, archived]
+
+    # --------------------------------------------------------------------------
+    # Destination Schemas
+    # --------------------------------------------------------------------------
+    DestinationSummary:
+      type: object
+      required: [id, slug, title, shortDescription, district]
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          type: string
+        title:
+          type: string
+        shortDescription:
+          type: string
+        district:
+          type: string
+        talukOrSubdivision:
+          type: string
+        primaryCategory:
+          type: object
+          properties:
+            slug:
+              type: string
+            name:
+              type: string
+        coverMedia:
+          type: object
+          properties:
+            url:
+              type: string
+            thumbnailUrl:
+              type: string
+              nullable: true
+            altText:
+              type: string
+        verificationStatus:
+          type: string
+        distanceKm:
+          type: number
+          nullable: true
+
+    DestinationSummaryListEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/DestinationSummary'
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    DestinationDetailEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [id, slug, title, shortDescription, fullDescription, primaryCategory, locationSummary]
+          properties:
+            id:
+              type: string
+              format: uuid
+            slug:
+              type: string
+            title:
+              type: string
+            shortDescription:
+              type: string
+            fullDescription:
+              type: string
+            primaryCategory:
+              $ref: '#/components/schemas/CategoryResponse'
+            secondaryCategories:
+              type: array
+              items:
+                $ref: '#/components/schemas/CategoryResponse'
+            locationSummary:
+              type: object
+              required: [formattedAddress, talukOrSubdivision, district, stateOrProvince, countryCode, isRestricted]
+              properties:
+                formattedAddress:
+                  type: string
+                locality:
+                  type: string
+                  nullable: true
+                talukOrSubdivision:
+                  type: string
+                district:
+                  type: string
+                stateOrProvince:
+                  type: string
+                countryCode:
+                  type: string
+                isRestricted:
+                  type: boolean
+            verificationSummary:
+              type: object
+              properties:
+                overallStatus:
+                  type: string
+                lastAuditedAt:
+                  type: string
+                  format: date-time
+                  nullable: true
+            publishedAt:
+              type: string
+              format: date-time
+              nullable: true
+
+    DestinationLocationEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [destinationId, isRestricted, district, stateOrProvince, countryCode]
+          properties:
+            destinationId:
+              type: string
+              format: uuid
+            isRestricted:
+              type: boolean
+            restrictionReason:
+              type: string
+              nullable: true
+            publicCoordinates:
+              type: array
+              description: Projected WGS 84 [longitude, latitude] or null if restricted without centroid
+              items:
+                type: number
+              nullable: true
+              minItems: 2
+              maxItems: 2
+              example: [76.22, 11.28]
+            publicLocalityName:
+              type: string
+              nullable: true
+            talukOrSubdivision:
+              type: string
+            district:
+              type: string
+            stateOrProvince:
+              type: string
+            countryCode:
+              type: string
+            nearestTransitHub:
+              type: object
+              nullable: true
+
+    DestinationMediaListEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/DestinationMediaResponse'
+
+    DestinationMediaResponse:
+      type: object
+      required: [id, type, url, altText, license, isCover, displayOrder]
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [image, video, panorama_360]
+        url:
+          type: string
+        thumbnailUrl:
+          type: string
+          nullable: true
+        altText:
+          type: string
+        caption:
+          type: string
+          nullable: true
+        attribution:
+          type: string
+          nullable: true
+        license:
+          type: string
+        isCover:
+          type: boolean
+        displayOrder:
+          type: integer
+
+    DestinationOpeningHoursEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [type, entryFeePolicy]
+          properties:
+            type:
+              type: string
+              enum: [always_open, seasonal, scheduled, temporarily_closed]
+            weeklySchedule:
+              type: array
+              nullable: true
+              items:
+                type: object
+                properties:
+                  dayOfWeek:
+                    type: integer
+                  isClosed:
+                    type: boolean
+                  openTime:
+                    type: string
+                    nullable: true
+                  closeTime:
+                    type: string
+                    nullable: true
+            seasonalNotes:
+              type: string
+              nullable: true
+            entryFeePolicy:
+              type: string
+              enum: [free, paid, partially_paid, restricted_permit]
+            feeStructure:
+              type: object
+              nullable: true
+            advisoryNote:
+              type: string
+              nullable: true
+
+    # --------------------------------------------------------------------------
+    # Saved Destination Schemas
+    # --------------------------------------------------------------------------
+    CreateSavedDestinationRequest:
+      type: object
+      required: [destinationId]
+      properties:
+        destinationId:
+          type: string
+          format: uuid
+        collectionName:
+          type: string
+          maxLength: 100
+        personalNotes:
+          type: string
+          maxLength: 1000
+
+    SavedDestinationResponse:
+      type: object
+      required: [id, destinationId, savedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        destinationId:
+          type: string
+          format: uuid
+        collectionName:
+          type: string
+          nullable: true
+        personalNotes:
+          type: string
+          nullable: true
+        savedAt:
+          type: string
+          format: date-time
+        destination:
+          type: object
+          properties:
+            slug:
+              type: string
+            title:
+              type: string
+            district:
+              type: string
+            coverUrl:
+              type: string
+              nullable: true
+
+    SavedDestinationEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          $ref: '#/components/schemas/SavedDestinationResponse'
+
+    SavedDestinationListEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/SavedDestinationResponse'
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    # --------------------------------------------------------------------------
+    # Admin & Management Schemas
+    # --------------------------------------------------------------------------
+    AdminDashboardEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [destinations, verificationQueue, mediaModeration, categories]
+          properties:
+            destinations:
+              type: object
+            verificationQueue:
+              type: object
+            mediaModeration:
+              type: object
+            categories:
+              type: object
+
+    AdminDestinationListEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: array
+          items:
+            type: object
+            required: [id, slug, title, publicationStatus]
+            properties:
+              id:
+                type: string
+                format: uuid
+              slug:
+                type: string
+              title:
+                type: string
+              publicationStatus:
+                type: string
+              featuredRank:
+                type: integer
+                nullable: true
+              verificationOverallStatus:
+                type: string
+              createdAt:
+                type: string
+                format: date-time
+              updatedAt:
+                type: string
+                format: date-time
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    CreateDestinationRequest:
+      type: object
+      required: [title, slug, shortDescription, fullDescription, primaryCategoryId, location]
+      properties:
+        title:
+          type: string
+          maxLength: 200
+        slug:
+          type: string
+          maxLength: 120
+        shortDescription:
+          type: string
+          maxLength: 500
+        fullDescription:
+          type: string
+        primaryCategoryId:
+          type: string
+          format: uuid
+        secondaryCategoryIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        featuredRank:
+          type: integer
+          nullable: true
+        location:
+          type: object
+          required: [coordinates, formattedAddress, talukOrSubdivision, district, stateOrProvince]
+          properties:
+            coordinates:
+              type: array
+              items:
+                type: number
+              minItems: 2
+              maxItems: 2
+              example: [76.3125, 11.3412]
+            altitudeMeters:
+              type: number
+              nullable: true
+            accuracyMeters:
+              type: number
+              nullable: true
+            isRestricted:
+              type: boolean
+              default: false
+            restrictionReason:
+              type: string
+              nullable: true
+            publicApproximateCentroid:
+              type: array
+              items:
+                type: number
+              minItems: 2
+              maxItems: 2
+              nullable: true
+            publicApproximateDisplayName:
+              type: string
+              nullable: true
+            formattedAddress:
+              type: string
+            locality:
+              type: string
+              nullable: true
+            talukOrSubdivision:
+              type: string
+            district:
+              type: string
+            stateOrProvince:
+              type: string
+            countryCode:
+              type: string
+              default: IN
+            postalCode:
+              type: string
+              nullable: true
+
+    UpdateDestinationRequest:
+      type: object
+      properties:
+        title:
+          type: string
+        shortDescription:
+          type: string
+        fullDescription:
+          type: string
+        primaryCategoryId:
+          type: string
+          format: uuid
+        featuredRank:
+          type: integer
+          nullable: true
+
+    AttachMediaRequest:
+      type: object
+      required: [type, url, altText, license]
+      properties:
+        type:
+          type: string
+          enum: [image, video, panorama_360]
+        url:
+          type: string
+        thumbnailUrl:
+          type: string
+          nullable: true
+        altText:
+          type: string
+        caption:
+          type: string
+          nullable: true
+        attribution:
+          type: string
+          nullable: true
+        license:
+          type: string
+        isCover:
+          type: boolean
+          default: false
+        displayOrder:
+          type: integer
+          default: 0
+
+    UpdateMediaRequest:
+      type: object
+      properties:
+        altText:
+          type: string
+        caption:
+          type: string
+        isCover:
+          type: boolean
+        displayOrder:
+          type: integer
+        status:
+          type: string
+          enum: [pending_review, approved, rejected]
+
+    SetOpeningHoursRequest:
+      type: object
+      required: [type, entryFeePolicy]
+      properties:
+        type:
+          type: string
+          enum: [always_open, seasonal, scheduled, temporarily_closed]
+        weeklySchedule:
+          type: array
+          items:
+            type: object
+            required: [dayOfWeek, isClosed]
+            properties:
+              dayOfWeek:
+                type: integer
+              isClosed:
+                type: boolean
+              openTime:
+                type: string
+                nullable: true
+              closeTime:
+                type: string
+                nullable: true
+        seasonalNotes:
+          type: string
+          nullable: true
+        entryFeePolicy:
+          type: string
+          enum: [free, paid, partially_paid, restricted_permit]
+        feeStructure:
+          type: object
+          nullable: true
+        advisoryNote:
+          type: string
+          nullable: true
+
+    # --------------------------------------------------------------------------
+    # Verification Schemas
+    # --------------------------------------------------------------------------
+    VerificationQueueEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: array
+          items:
+            type: object
+            required: [verificationId, destinationId, destinationTitle, overallStatus]
+            properties:
+              verificationId:
+                type: string
+                format: uuid
+              destinationId:
+                type: string
+                format: uuid
+              destinationTitle:
+                type: string
+              overallStatus:
+                type: string
+              assignedCuratorId:
+                type: string
+                format: uuid
+                nullable: true
+              lastAuditedAt:
+                type: string
+                format: date-time
+                nullable: true
+              nextAuditDueAt:
+                type: string
+                format: date-time
+                nullable: true
+              curatorQueueNotes:
+                type: string
+                nullable: true
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    VerificationContainerEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [id, destinationId, overallStatus, fieldStatuses]
+          properties:
+            id:
+              type: string
+              format: uuid
+            destinationId:
+              type: string
+              format: uuid
+            overallStatus:
+              type: string
+            assignedCuratorId:
+              type: string
+              format: uuid
+              nullable: true
+            fieldStatuses:
+              type: object
+            evidence:
+              type: array
+              items:
+                $ref: '#/components/schemas/VerificationEvidenceResponse'
+
+    VerificationEvidenceResponse:
+      type: object
+      required: [id, evidenceType, sourceOrganization, submittedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        evidenceType:
+          type: string
+        documentUrl:
+          type: string
+          nullable: true
+        sourceOrganization:
+          type: string
+        officialReferenceCode:
+          type: string
+          nullable: true
+        submittedAt:
+          type: string
+          format: date-time
+        notes:
+          type: string
+          nullable: true
+
+    AssignCuratorRequest:
+      type: object
+      required: [curatorAccountId]
+      properties:
+        curatorAccountId:
+          type: string
+          format: uuid
+        queueNotes:
+          type: string
+          maxLength: 1000
+
+    SubmitEvidenceRequest:
+      type: object
+      required: [evidenceType, sourceOrganization]
+      properties:
+        evidenceType:
+          type: string
+          enum:
+            - government_gazette
+            - department_circular
+            - official_website
+            - on_site_gps_track
+            - photographic_proof
+            - curator_affidavit
+            - field_survey_sheet
+        sourceOrganization:
+          type: string
+          maxLength: 150
+        officialReferenceCode:
+          type: string
+          maxLength: 100
+        documentUrl:
+          type: string
+        notes:
+          type: string
+
+    VerifyFieldRequest:
+      type: object
+      required: [field, confidenceLevel]
+      properties:
+        field:
+          type: string
+          enum:
+            - location_coordinates
+            - opening_hours
+            - entry_fees
+            - safety_advisories
+            - accessibility
+            - contact_info
+            - historical_facts
+            - governing_authority
+        confidenceLevel:
+          type: string
+          enum:
+            - official_authority
+            - on_site_inspection
+            - documentary_cross_reference
+            - community_consensus
+        evidenceId:
+          type: string
+          format: uuid
+        notes:
+          type: string
+        validUntil:
+          type: string
+          format: date-time
+
+    DisputeFieldRequest:
+      type: object
+      required: [field, notes]
+      properties:
+        field:
+          type: string
+        notes:
+          type: string
+
+    VerificationHistoryEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: array
+          items:
+            type: object
+            required: [id, field, status, confidenceLevel, verifiedBy, timestamp]
+            properties:
+              id:
+                type: string
+                format: uuid
+              field:
+                type: string
+              status:
+                type: string
+              confidenceLevel:
+                type: string
+              verifiedBy:
+                type: string
+                format: uuid
+              notes:
+                type: string
+                nullable: true
+              timestamp:
+                type: string
+                format: date-time
+              validUntil:
+                type: string
+                format: date-time
+                nullable: true
