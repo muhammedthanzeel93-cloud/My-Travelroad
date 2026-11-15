@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-**My Travelroad** utilizes **PostgreSQL 16** with the **PostGIS 3.4** spatial extension as its primary relational and geospatial datastore. The database layer strictly implements the Stage A domain model and database architecture approved in [`docs/architecture/database-architecture.md`](file:///c:/Users/aysha/Downloads/My%20Travelroad/My%20Travelroad/docs/architecture/database-architecture.md) and [`docs/architecture/domain-model.md`](file:///c:/Users/aysha/Downloads/My%20Travelroad/My%20Travelroad/docs/architecture/domain-model.md).
+**My Travelroad** utilizes **PostgreSQL 16** with the **PostGIS 3.4** spatial extension as its primary relational and geospatial datastore. The database layer strictly implements the Stage A domain model and database architecture approved in [`docs/architecture/database-architecture.md`](./database-architecture.md) and [`docs/architecture/domain-model.md`](./domain-model.md).
 
 ### Stage A Schema Scope (15 Tables)
 1. `accounts` — Central identity registry decoupled from public profiles.
@@ -80,7 +80,7 @@ FROM destination_locations dl;
 
 ## 3. Prisma Schema & SQL Migration Constraint Mapping
 
-Every unique constraint, composite unique constraint, and foreign key relationship is explicitly mapped in [`prisma/schema.prisma`](file:///c:/Users/aysha/Downloads/My%20Travelroad/My%20Travelroad/prisma/schema.prisma) to eliminate schema drift:
+Every unique constraint, composite unique constraint, and foreign key relationship is explicitly mapped in [`prisma/schema.prisma`](../../prisma/schema.prisma) to eliminate schema drift:
 
 | Table | SQL Migration Constraint Name | Prisma Declaration |
 | :--- | :--- | :--- |
@@ -161,7 +161,7 @@ services:
     environment:
       POSTGRES_DB: mytravelroad
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_PASSWORD: <your_secure_password>
     ports:
       - "5432:5432"
     volumes:
@@ -192,8 +192,8 @@ cp .env.example .env
 ```
 
 ```env
-DATABASE_URL="postgresql://postgres:postgrespassword@localhost:5432/mytravelroad?schema=public&connection_limit=10"
-DIRECT_URL="postgresql://postgres:postgrespassword@localhost:5432/mytravelroad?schema=public"
+DATABASE_URL="postgresql://postgres:<your_secure_password>@localhost:5432/mytravelroad?schema=public&connection_limit=10"
+DIRECT_URL="postgresql://postgres:<your_secure_password>@localhost:5432/mytravelroad?schema=public"
 NODE_ENV="development"
 ```
 
@@ -228,9 +228,14 @@ When connected to a PostgreSQL 16 + PostGIS 3.4 database, execute the automated 
 # Direct psql invocation with strict error stop:
 psql -v ON_ERROR_STOP=1 -U postgres -d mytravelroad -f tests/sql/verification_tests.sql
 
-# Or using the npm runner script:
+# Or using the portable npm runner script (resolves psql from system PATH):
 npm run test:sql
+
+# Or specifying a custom PostgreSQL client binary path via PSQL_BIN:
+PSQL_BIN=/path/to/psql npm run test:sql
 ```
+*Authentication Note: The runner never supplies a hardcoded fallback password. It authenticates through standard PostgreSQL client configuration (the `PGPASSWORD` environment variable, `~/.pgpass` file, peer authentication, or an interactive prompt).*
+
 *Tests all 11 requirements: extensions, 15 tables, 2 views, GiST indexes, root account immutability, child table guards, account-type transition checks, audit log immutability, 3-tier coordinate privacy, and spatial proximity queries. Any assertion failure immediately aborts the transaction and exits with a non-zero status code.*
 
 ### 3. Prisma Schema Drift Check

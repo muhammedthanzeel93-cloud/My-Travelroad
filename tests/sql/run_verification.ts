@@ -8,9 +8,10 @@ function main() {
 
   const sqlFilePath = path.join(__dirname, "verification_tests.sql");
 
-  // Locate psql binary
-  const customPsql = "C:\\Users\\aysha\\.gemini\\antigravity\\brain\\b2df7124-c0e8-42e5-8422-2d4f5a11366d\\scratch\\pg16\\pgsql\\bin\\psql.exe";
-  const psqlBin = require("fs").existsSync(customPsql) ? customPsql : "psql";
+  // Determine psql executable:
+  // 1. Explicitly configured PSQL_BIN environment variable
+  // 2. Default to 'psql' in system PATH
+  const psqlBin = process.env.PSQL_BIN || "psql";
 
   const host = process.env.PGHOST || "127.0.0.1";
   const port = process.env.PGPORT || "5432";
@@ -18,6 +19,7 @@ function main() {
   const dbname = process.env.PGDATABASE || "mytravelroad";
 
   console.log(`Connecting to: ${user}@${host}:${port}/${dbname}`);
+  console.log(`Using executable: ${psqlBin}`);
   console.log(`Executing SQL script: ${sqlFilePath}\n`);
 
   const result = spawnSync(
@@ -26,13 +28,27 @@ function main() {
     {
       stdio: "inherit",
       encoding: "utf-8",
-      env: { ...process.env, PGPASSWORD: process.env.PGPASSWORD || "postgrespassword" },
+      env: process.env,
     }
   );
 
+  if (result.error) {
+    if ((result.error as NodeJS.ErrnoException).code === "ENOENT") {
+      console.error(
+        `\nError: PostgreSQL client executable '${psqlBin}' was not found.\n` +
+          "Please ensure PostgreSQL client tools are installed and 'psql' is added to your system PATH,\n" +
+          "or specify the executable path via the PSQL_BIN environment variable.\n" +
+          "Example: PSQL_BIN=/usr/local/bin/psql npm run test:sql\n"
+      );
+    } else {
+      console.error(`\nError executing psql: ${result.error.message}`);
+    }
+    process.exit(1);
+  }
+
   if (result.status !== 0) {
     console.error(`\nSQL verification tests failed with exit code: ${result.status}`);
-    process.exit(result.status || 1);
+    process.exit(result.status ?? 1);
   }
 
   console.log("\n=======================================================");
