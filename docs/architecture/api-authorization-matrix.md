@@ -72,6 +72,7 @@ graph TD
 | `POST /auth/refresh` | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | Cookie owner | Refresh token family validation. | `401 TOKEN_INVALID` |
 | `GET /auth/me` | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | Self (`Account.id`) | Excludes password hash & MFA secrets. | `401 AUTHENTICATION_REQUIRED` |
 | `POST /auth/verify-email` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Token-based | Token verified against database. | `400 BAD_REQUEST` |
+| `POST /auth/resend-verification` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Dual (Token/Session) | Generates new verification token. Anti-enumeration. | `429 RATE_LIMIT_EXCEEDED` |
 | `POST /auth/forgot-password` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | No | Never confirms if email exists (anti-enumeration). | `429 RATE_LIMIT_EXCEEDED` |
 | `POST /auth/reset-password` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Token-based | Single-use token invalidation. | `400 / 401 TOKEN_INVALID` |
 
@@ -128,12 +129,13 @@ graph TD
 | `GET /admin/dashboard` | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | No | High-level summary metrics. | `401 / 403 FORBIDDEN_ACCESS` |
 | `GET /admin/destinations` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | All statuses (`draft`, `in_review`, `published`, `archived`). | `401 / 403 FORBIDDEN_ACCESS` |
 | `POST /admin/destinations` | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | No | Creates `draft`. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
-| `GET /admin/destinations/:id` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Privileged administrative view: unmasked coordinates, altitude, accuracy, restriction parameters. Produces `AuditLog` (`action: 'destination.privileged_location_read'`). | `401 / 403 FORBIDDEN_ACCESS` |
+| `GET /admin/destinations/:id` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Privileged administrative view: unmasked coordinates, altitude, accuracy, restriction parameters. Produces `AuditLog` (`action: 'destination.privileged_location_read'`). Fail-closed: returns `500 AUDIT_LOG_FAILURE` and suppresses coordinates if audit write fails. Telemetry metadata sanitized (no raw coordinates). | `401 / 403 FORBIDDEN_ACCESS` |
 | `PATCH /admin/destinations/:id` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Updates metadata. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
 | `POST /admin/destinations/:id/publish` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | No | Requires `super_admin`. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
 | `POST /admin/destinations/:id/archive` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | No | Requires `super_admin`. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
 | `POST /admin/categories` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | No | Taxonomy creation. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
 | `PATCH /admin/categories/:id` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | No | Taxonomy mutation. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
+| `POST /admin/uploads/presign` | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | No | Issues short-lived SigV4 PUT URL. Media vs private evidence scoping. | `401 / 403 FORBIDDEN_ACCESS` |
 | `POST /admin/destinations/:id/media` | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | No | Contributors create `pending_review` media. | `401 / 403 FORBIDDEN_ACCESS` |
 | `PATCH /admin/media/:id` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Set cover, moderate, reorder. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
 | `DELETE /admin/media/:id` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Disassociates media asset. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
@@ -185,6 +187,12 @@ In addition to role-based evaluations, caller permissions are strictly modulated
   - Fully permitted according to role and ownership checks.
 - **`suspended`**:
   - Login (`POST /auth/login`) rejected with `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'`).
-  - Refresh (`POST /auth/refresh`) rejected with `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'`) and active refresh sessions are revoked.
+  - Refresh (`POST /auth/refresh`) rejected with `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'`) and active refresh sessions are revoked immediately from Redis.
 - **`deactivated`**:
   - Login and token refresh rejected with `403 Forbidden` (`code: 'ACCOUNT_DEACTIVATED'`).
+
+### 4.5 Immediate Stateless JWT Revocation Mechanics
+While short-lived JWT access tokens have a maximum 15-minute lifespan, status changes (suspension, deactivation, or role demotion) take effect immediately:
+1. **Privileged & Mutating Live Checks**: Every mutating route (POST, PATCH, PUT, DELETE) and privileged route (`curator`, `moderator`, `super_admin`) asserts live database status (`SELECT status, role FROM accounts WHERE id = :id`) within the execution pipeline. If account status is not `active`, the request is immediately rejected (`403 ACCOUNT_SUSPENDED` or `403 ACCOUNT_DEACTIVATED`).
+2. **High-Performance Gateway Blocklist**: When an administrator suspends or deactivates an account, the backend writes a tombstone key to Redis: `revoked_accounts:{accountId}` with a TTL matching the 15-minute token lifetime. Edge middleware and gateway proxies assert this key in sub-millisecond time, rejecting all cached JWTs before hitting downstream services.
+3. **Session Invalidation**: All active refresh token families belonging to the account are purged from Redis (`token_lookup:*` and session indexes) and marked as revoked in family structures.

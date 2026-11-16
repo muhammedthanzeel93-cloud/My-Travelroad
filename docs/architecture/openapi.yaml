@@ -70,7 +70,7 @@ paths:
               $ref: '#/components/schemas/LoginRequest'
       responses:
         '200':
-          description: Login successful
+          description: Login successful. Sets rotating HttpOnly refresh token cookie.
           headers:
             Set-Cookie:
               description: Rotating HttpOnly refresh token cookie
@@ -81,6 +81,37 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/LoginResponse'
+              examples:
+                activeAccount:
+                  summary: Active account login
+                  value:
+                    success: true
+                    data:
+                      accessToken: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+                      tokenType: Bearer
+                      expiresIn: 900
+                      account:
+                        id: 550e8400-e29b-41d4-a716-446655440001
+                        email: traveler@example.com
+                        role: traveler
+                        status: active
+                        emailVerified: true
+                        createdAt: "2026-11-15T12:00:00.000Z"
+                pendingVerificationAccount:
+                  summary: Pending verification account login (restricted permissions)
+                  value:
+                    success: true
+                    data:
+                      accessToken: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+                      tokenType: Bearer
+                      expiresIn: 900
+                      account:
+                        id: 550e8400-e29b-41d4-a716-446655440002
+                        email: pending.traveler@example.com
+                        role: traveler
+                        status: pending_verification
+                        emailVerified: false
+                        createdAt: "2026-11-15T12:00:00.000Z"
         '401':
           $ref: '#/components/responses/401Unauthorized'
         '423':
@@ -185,6 +216,33 @@ paths:
                 $ref: '#/components/schemas/MessageResponse'
         '400':
           $ref: '#/components/responses/400BadRequest'
+
+  /auth/resend-verification:
+    post:
+      summary: Resend Email Verification Token
+      description: Issues a fresh verification email token. Supports both unauthenticated requests with an email address and authenticated requests from pending-verification sessions. Implements strict anti-enumeration and rate limiting.
+      tags: [Authentication]
+      operationId: resendVerificationEmail
+      security:
+        - {}
+        - BearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResendVerificationRequest'
+      responses:
+        '200':
+          description: Verification token dispatched or anti-enumeration confirmation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResendVerificationResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
 
   /auth/forgot-password:
     post:
@@ -734,7 +792,8 @@ paths:
   /admin/destinations/{id}:
     get:
       summary: Get Privileged Destination Details
-      description: Retrieves complete administrative representation of a destination including unmasked exact coordinates, altitude, accuracy, and ecological restriction parameters. Restricted to curator and super_admin. Generates an AuditLog telemetry entry.
+      description: >-
+        Retrieves complete administrative representation of a destination including unmasked exact coordinates, altitude, accuracy, and ecological restriction parameters. Restricted to curator and super_admin. Generates an AuditLog entry (action: destination.privileged_location_read). Fail-closed: if the audit log insertion fails, the transaction rolls back, returns 500 AUDIT_LOG_FAILURE, and unmasked coordinates are NEVER exposed. Telemetry snapshot metadata excludes raw coordinates, altitude, accuracy, and geometry.
       tags: [Administration]
       operationId: getPrivilegedDestinationDetail
       security:
@@ -759,6 +818,8 @@ paths:
           $ref: '#/components/responses/403Forbidden'
         '404':
           $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalServerError'
 
     patch:
       summary: Update Destination
@@ -914,6 +975,36 @@ paths:
           $ref: '#/components/responses/403Forbidden'
         '404':
           $ref: '#/components/responses/404NotFound'
+
+  /admin/uploads/presign:
+    post:
+      summary: Request Presigned Upload URL
+      description: Issues short-lived (15-minute) presigned SigV4 PUT URL allowing administrative actors to upload binary assets directly to cloud object storage (S3/R2) without server buffering.
+      tags: [Administration]
+      operationId: requestUploadPresign
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PresignUploadRequest'
+      responses:
+        '200':
+          description: Presigned upload URL generated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresignUploadResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
 
   /admin/destinations/{id}/media:
     post:
@@ -1348,6 +1439,18 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/StandardErrorResponse'
+    429TooManyRequests:
+      description: Rate limit exceeded
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StandardErrorResponse'
+    500InternalServerError:
+      description: Internal server error or transactional audit failure
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StandardErrorResponse'
 
   schemas:
     # --------------------------------------------------------------------------
@@ -1588,6 +1691,33 @@ components:
           minLength: 8
           maxLength: 72
           example: NewSecurePassword456!
+
+    ResendVerificationRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+          example: traveler@example.com
+          description: Required if caller is unauthenticated; optional if caller presents a valid Bearer token for a pending_verification account.
+
+    ResendVerificationResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [message, dispatched]
+          properties:
+            message:
+              type: string
+              example: If the account exists and is pending verification, a new confirmation link has been dispatched.
+            dispatched:
+              type: boolean
+              example: true
 
     AccountSummary:
       type: object
@@ -2442,10 +2572,71 @@ components:
           type: integer
           nullable: true
 
+    PresignUploadRequest:
+      type: object
+      required: [purpose, destinationId, filename, mimeType, fileSizeBytes]
+      properties:
+        purpose:
+          type: string
+          enum: [destination_media, verification_evidence]
+          example: destination_media
+        destinationId:
+          type: string
+          format: uuid
+          example: 550e8400-e29b-41d4-a716-446655440003
+        filename:
+          type: string
+          example: waterfall.jpg
+        mimeType:
+          type: string
+          example: image/jpeg
+        fileSizeBytes:
+          type: integer
+          example: 2450880
+
+    PresignUploadResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [uploadTicketId, presignedUrl, objectKey, expiresAt, maxSizeBytes]
+          properties:
+            uploadTicketId:
+              type: string
+              format: uuid
+              example: ticket-uuid-001
+            presignedUrl:
+              type: string
+              format: uri
+              example: https://s3.ap-south-1.amazonaws.com/quarantine.mytravelroad.com/quarantine/media/550e8400-e29b-41d4-a716-446655440003/asset-uuid-002.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&...
+            objectKey:
+              type: string
+              example: quarantine/media/550e8400-e29b-41d4-a716-446655440003/asset-uuid-002.jpg
+            publicAssetUrl:
+              type: string
+              format: uri
+              example: https://assets.mytravelroad.com/destinations/adyanpara/waterfall.jpg
+            expiresAt:
+              type: string
+              format: date-time
+              example: "2026-11-15T16:05:00.000Z"
+            maxSizeBytes:
+              type: integer
+              example: 10485760
+
     AttachMediaRequest:
       type: object
       required: [type, url, altText, license]
       properties:
+        uploadTicketId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Presigned upload ticket identifier for S3 object assertion and magic-byte validation.
         type:
           type: string
           enum: [image, video, panorama_360]
@@ -2635,6 +2826,11 @@ components:
       type: object
       required: [evidenceType, sourceOrganization]
       properties:
+        uploadTicketId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Presigned upload ticket identifier for S3 object assertion and magic-byte validation in private evidence bucket.
         evidenceType:
           type: string
           enum:

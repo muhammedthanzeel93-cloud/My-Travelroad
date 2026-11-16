@@ -85,7 +85,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
   "password": "Password123!"
 }
 ```
-- **Successful Response (`200 OK`)**:
+- **Successful Response — Active Account (`200 OK`)**:
   - **Headers**: `Set-Cookie: refreshToken=rt_01JB8...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`
 ```json
 {
@@ -98,7 +98,27 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
       "id": "e7b0a880-922c-47b2-9a57-0b1a78e7f101",
       "email": "amina.rahman@example.com",
       "role": "traveler",
-      "status": "active"
+      "status": "active",
+      "emailVerified": true
+    }
+  }
+}
+```
+- **Successful Response — Pending Verification Account (`200 OK`)**:
+  - **Headers**: `Set-Cookie: refreshToken=rt_01JB8...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`
+```json
+{
+  "success": true,
+  "data": {
+    "accessToken": "eyJhbGciOiJSUzI1NiIs...",
+    "tokenType": "Bearer",
+    "expiresIn": 900,
+    "account": {
+      "id": "e7b0a880-922c-47b2-9a57-0b1a78e7f101",
+      "email": "amina.rahman@example.com",
+      "role": "traveler",
+      "status": "pending_verification",
+      "emailVerified": false
     }
   }
 }
@@ -211,7 +231,36 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 7. Forgot Password
+### 7. Resend Email Verification Token
+- **Endpoint**: `POST /api/v1/auth/resend-verification`
+- **Purpose**: Issues a replacement 24-hour verification token to an unverified account. Overrides any prior active verification token in Redis.
+- **Authentication**: None (Public with email payload) OR Bearer Access Token (for `pending_verification` accounts).
+- **Permissions**: Public or authenticated `pending_verification` user.
+- **Rate Limit**: 3 requests / 15 minutes per IP or Account ID (strict flooding prevention).
+- **Anti-Enumeration Design**: Always returns `200 OK` regardless of whether the email is registered, active, or suspended.
+- **Request Body (Unauthenticated)**:
+```json
+{
+  "email": "amina.rahman@example.com"
+}
+```
+*Note: If invoked with an authenticated `pending_verification` Bearer access token, the request body is optional; the target email is extracted directly from the verified account identity.*
+- **Successful Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "data": {
+    "message": "If an eligible unverified account exists for this email, a new verification link has been dispatched."
+  }
+}
+```
+- **Error Responses**:
+  - `422 Unprocessable Entity`: `VALIDATION_FAILED` (Invalid email format).
+  - `429 Too Many Requests`: `RATE_LIMIT_EXCEEDED` (Exceeded 3 requests per 15 minutes).
+
+---
+
+### 8. Forgot Password
 - **Endpoint**: `POST /api/v1/auth/forgot-password`
 - **Purpose**: Dispatches a password reset email containing a single-use 15-minute token if the account exists.
 - **Token Specifications**: 256-bit CSPRNG token stored as SHA-256 hash in Redis (`password_reset:{tokenHash}`, TTL: 900s).
@@ -234,7 +283,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 8. Reset Password
+### 9. Reset Password
 - **Endpoint**: `POST /api/v1/auth/reset-password`
 - **Purpose**: Consumes a valid password reset token atomically, sets a new Argon2id password hash, and revokes all active refresh sessions across all devices for the account.
 - **Request Body**:
@@ -261,7 +310,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ## Module B: Tourist Profiles
 
-### 9. Get Own Profile
+### 10. Get Own Profile
 - **Endpoint**: `GET /api/v1/profiles/me`
 - **Purpose**: Retrieves full profile for the authenticated traveler, including travel preferences and privacy settings.
 - **Authentication**: Bearer Access Token.
@@ -292,7 +341,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 10. Update Own Profile
+### 11. Update Own Profile
 - **Endpoint**: `PATCH /api/v1/profiles/me`
 - **Purpose**: Modifies user-facing profile attributes.
 - **Authentication**: Bearer Access Token.
@@ -321,7 +370,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 11. Update Profile Visibility
+### 12. Update Profile Visibility
 - **Endpoint**: `PATCH /api/v1/profiles/me/visibility`
 - **Purpose**: Sets whether profile is discoverable publicly.
 - **Request Body**:
@@ -343,7 +392,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 12. View Public Profile
+### 13. View Public Profile
 - **Endpoint**: `GET /api/v1/profiles/:handle`
 - **Purpose**: Retrieves public traveler profile by handle.
 - **Authentication**: None.
@@ -369,7 +418,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ## Module C: Destination Categories
 
-### 13. List Categories
+### 14. List Categories
 - **Endpoint**: `GET /api/v1/categories`
 - **Purpose**: Lists all active categories in display order.
 - **Query Parameters**:
@@ -407,7 +456,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 14. Get Category Details
+### 15. Get Category Details
 - **Endpoint**: `GET /api/v1/categories/:slug`
 - **Purpose**: Retrieves a specific category and its immediate child subcategories.
 - **Successful Response (`200 OK`)**:
@@ -431,7 +480,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 15. List Category Destinations
+### 16. List Category Destinations
 - **Endpoint**: `GET /api/v1/categories/:slug/destinations`
 - **Purpose**: Retrieves paginated published destinations belonging to this category.
 - **Query Parameters**: `page` (default 1), `limit` (default 20), `sort` (default `featuredRank:asc`).
@@ -470,7 +519,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ## Module D: Destinations
 
-### 16. List Published Destinations
+### 17. List Published Destinations
 - **Endpoint**: `GET /api/v1/destinations`
 - **Purpose**: Public discovery listing with district and category filters.
 - **Query Parameters**:
@@ -518,7 +567,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 17. Get Destination by Slug
+### 18. Get Destination by Slug
 - **Endpoint**: `GET /api/v1/destinations/:slug`
 - **Purpose**: Comprehensive published destination profile.
 - **Path Parameters**: `slug`: Destination slug (e.g., `nilambur-teak-reserve`).
@@ -558,7 +607,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 18. Search Destinations
+### 19. Search Destinations
 - **Endpoint**: `GET /api/v1/destinations/search`
 - **Purpose**: Multi-modal search: text keyword matching, radial geographic proximity, or bounding box window.
 - **Query Parameters**:
@@ -589,7 +638,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 19. Retrieve Public Destination Location
+### 20. Retrieve Public Destination Location
 - **Endpoint**: `GET /api/v1/destinations/:slug/location`
 - **Purpose**: Returns geographic location strictly projected through the 3-Tier Coordinate Privacy model.
 - **Privacy Enforcement**:
@@ -621,7 +670,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 20. Retrieve Destination Media Gallery
+### 21. Retrieve Destination Media Gallery
 - **Endpoint**: `GET /api/v1/destinations/:slug/media`
 - **Purpose**: Returns approved media assets in display sequence order.
 - **Successful Response (`200 OK`)**:
@@ -647,7 +696,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 21. Retrieve Destination Opening Hours & Fees
+### 22. Retrieve Destination Opening Hours & Fees
 - **Endpoint**: `GET /api/v1/destinations/:slug/opening-hours`
 - **Purpose**: Operating schedules, season advisories, and admission fee structure.
 - **Successful Response (`200 OK`)**:
@@ -685,7 +734,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ## Module E: Saved Destinations
 
-### 22. List Saved Destinations
+### 23. List Saved Destinations
 - **Endpoint**: `GET /api/v1/saved-destinations`
 - **Purpose**: Retrieves the authenticated traveler's bookmarked destinations.
 - **Authentication**: Bearer Access Token.
@@ -715,7 +764,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 23. Save Destination (Bookmark)
+### 24. Save Destination (Bookmark)
 - **Endpoint**: `POST /api/v1/saved-destinations`
 - **Purpose**: Bookmarks a destination. Enforces unique constraint per account/destination.
 - **Authentication**: Bearer Access Token.
@@ -743,7 +792,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 24. Remove Saved Destination
+### 25. Remove Saved Destination
 - **Endpoint**: `DELETE /api/v1/saved-destinations/:destinationId`
 - **Purpose**: Removes a bookmarked destination from the traveler's wishlist.
 - **Authentication**: Bearer Access Token.
@@ -754,7 +803,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ## Module F: Administration
 
-### 25. Admin Dashboard Summary
+### 26. Admin Dashboard Summary
 - **Endpoint**: `GET /api/v1/admin/dashboard`
 - **Purpose**: Aggregated operational counts for administrators and curators.
 - **Authentication**: Bearer Access Token (`curator`, `moderator`, `super_admin`).
@@ -792,7 +841,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 26. List Destinations (Admin View)
+### 27. List Destinations (Admin View)
 - **Endpoint**: `GET /api/v1/admin/destinations`
 - **Purpose**: Lists destinations with any publication status (`draft`, `in_review`, `published`, `archived`).
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).
@@ -819,7 +868,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 27. Create Destination Draft
+### 28. Create Destination Draft
 - **Endpoint**: `POST /api/v1/admin/destinations`
 - **Purpose**: Creates an initial destination draft with location and taxonomy. Produces an `AuditLog` entry.
 - **Authentication**: Bearer Access Token (`contributor`, `curator`, `super_admin`).
@@ -859,9 +908,11 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 28. Get Privileged Destination Details
+### 29. Get Privileged Destination Details
 - **Endpoint**: `GET /api/v1/admin/destinations/:id`
-- **Purpose**: Complete administrative entity representation including unmasked exact coordinates, altitude, accuracy, and ecological restriction parameters. Restricted to curator and super_admin for spatial verification. Produces an `AuditLog` telemetry entry (`action: 'destination.privileged_location_read'`).
+- **Purpose**: Complete administrative entity representation including unmasked exact coordinates, altitude, accuracy, and ecological restriction parameters. Restricted to curator and super_admin for spatial verification. Produces an immutable `AuditLog` entry (`action: 'destination.privileged_location_read'`).
+- **Fail-Closed Security Guarantee**: The database transaction that records the privileged access `AuditLog` entry MUST succeed. If the audit log insertion fails, the entire transaction rolls back immediately, returning `500 INTERNAL_SERVER_ERROR` with error code `AUDIT_LOG_FAILURE`, and unmasked coordinates are NEVER exposed.
+- **Telemetry Sanitization**: The associated `AuditLogTelemetry` snapshot captures request headers and client context strictly sanitized: unmasked coordinates, PostGIS geometry, altitude, and accuracy are explicitly excluded from telemetry metadata.
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).
 - **Permissions**: Curator or Super Admin.
 - **Successful Response (`200 OK`)**:
@@ -916,10 +967,11 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
   - `401 Unauthorized`: `AUTHENTICATION_REQUIRED`.
   - `403 Forbidden`: `FORBIDDEN_ACCESS` (Traveler and Contributor tiers cannot view privileged coordinates).
   - `404 Not Found`: `RESOURCE_NOT_FOUND`.
+  - `500 Internal Server Error`: `AUDIT_LOG_FAILURE` (Audit log write failed; privileged access prevented).
 
 ---
 
-### 29. Update Destination Fields
+### 30. Update Destination Fields
 - **Endpoint**: `PATCH /api/v1/admin/destinations/:id`
 - **Purpose**: Updates editorial fields, location, or secondary categories. Produces an `AuditLog` entry.
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).
@@ -945,7 +997,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 30. Publish Destination
+### 31. Publish Destination
 - **Endpoint**: `POST /api/v1/admin/destinations/:id/publish`
 - **Purpose**: Elevates destination lifecycle status to `published`. Produces an `AuditLog` entry (`action: 'destination.publish'`).
 - **Authentication**: Bearer Access Token (`super_admin` only).
@@ -963,7 +1015,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 31. Archive Destination
+### 32. Archive Destination
 - **Endpoint**: `POST /api/v1/admin/destinations/:id/archive`
 - **Purpose**: Transitions a destination to `archived` status, unpublishing it from public views. Produces an `AuditLog` entry.
 - **Authentication**: Bearer Access Token (`super_admin` only).
@@ -981,7 +1033,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 32. Create Destination Category
+### 33. Create Destination Category
 - **Endpoint**: `POST /api/v1/admin/categories`
 - **Purpose**: Defines a new taxonomy classification. Produces an `AuditLog` entry.
 - **Authentication**: Bearer Access Token (`super_admin` only).
@@ -1012,7 +1064,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 33. Update Destination Category
+### 34. Update Destination Category
 - **Endpoint**: `PATCH /api/v1/admin/categories/:id`
 - **Purpose**: Modifies taxonomy category attributes. Produces an `AuditLog` entry.
 - **Authentication**: Bearer Access Token (`super_admin` only).
@@ -1038,10 +1090,53 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 34. Attach Destination Media Asset
+### 35. Request Presigned Upload URL
+- **Endpoint**: `POST /api/v1/admin/uploads/presign`
+- **Purpose**: Authorizes and issues a short-lived (15-minute) presigned SigV4 PUT URL allowing administrative actors to upload binary assets directly to cloud object storage (S3/R2) without server buffering.
+- **Authentication**: Bearer Access Token (`contributor`, `curator`, `super_admin`).
+- **Authorization Scoping**:
+  - `purpose: 'destination_media'`: Allowed for `contributor`, `curator`, `super_admin`. Key routed to quarantine bucket: `quarantine/media/{destinationId}/{assetUuid}.{ext}`.
+  - `purpose: 'verification_evidence'`: Strictly restricted to `curator` and `super_admin`. Key routed to private evidence bucket: `evidence/{destinationId}/{assetUuid}.{ext}`.
+- **Security & Integrity Controls**:
+  - Generates a Redis upload ticket (`upload_ticket:{ticketId}`) storing `{ accountId, destinationId, purpose, mimeType, maxSizeBytes, s3Key, createdAt, expiresAt }` with 15-minute TTL.
+  - Subsequent registration endpoints assert the ticket, perform S3 `HeadObject` checks, and verify file magic bytes.
+  - Rate limited to 20 requests / 15 minutes per account.
+- **Request Body**:
+```json
+{
+  "purpose": "destination_media",
+  "destinationId": "550e8400-e29b-41d4-a716-446655440003",
+  "filename": "waterfall.jpg",
+  "mimeType": "image/jpeg",
+  "fileSizeBytes": 2450880
+}
+```
+- **Successful Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "data": {
+    "uploadTicketId": "ticket-uuid-001",
+    "presignedUrl": "https://s3.ap-south-1.amazonaws.com/quarantine.mytravelroad.com/quarantine/media/550e8400-e29b-41d4-a716-446655440003/asset-uuid-002.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&...",
+    "objectKey": "quarantine/media/550e8400-e29b-41d4-a716-446655440003/asset-uuid-002.jpg",
+    "publicAssetUrl": "https://assets.mytravelroad.com/destinations/adyanpara/waterfall.jpg",
+    "expiresAt": "2026-11-15T16:05:00.000Z",
+    "maxSizeBytes": 10485760
+  }
+}
+```
+- **Error Responses**:
+  - `400 Bad Request`: `INVALID_MIME_TYPE` or `FILE_SIZE_EXCEEDED`.
+  - `401 Unauthorized`: `AUTHENTICATION_REQUIRED`.
+  - `403 Forbidden`: `FORBIDDEN_ACCESS` (e.g. contributor attempting verification evidence upload).
+  - `429 Too Many Requests`: `RATE_LIMIT_EXCEEDED`.
+
+---
+
+### 36. Attach Destination Media Asset
 - **Endpoint**: `POST /api/v1/admin/destinations/:id/media`
 - **Purpose**: Associates a previously uploaded media asset with a destination's gallery.
-- **Upload Workflow**: Clients upload binary files directly to cloud object storage (S3/R2) via pre-signed URLs. The backend accepts pre-validated asset URLs, preventing server SSRF or high memory buffering.
+- **Upload Workflow**: Validates the upload using either an authorized `uploadTicketId` (verifying S3 `HeadObject` metadata and magic byte headers against the quarantine bucket) or a direct approved CDN URL (`^https://assets\.mytravelroad\.com/.*$`). Prevents server SSRF and ensures no unvetted binaries enter the system.
 - **Validation Rules**:
   - `url` & `thumbnailUrl`: Must match approved CDN domain (`^https://assets\.mytravelroad\.com/.*$`).
   - Allowed MIME: `image/jpeg`, `image/png`, `image/webp`. File size ceiling: 10MB.
@@ -1049,6 +1144,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 - **Request Body**:
 ```json
 {
+  "uploadTicketId": "ticket-uuid-001",
   "type": "image",
   "url": "https://assets.mytravelroad.com/destinations/adyanpara/waterfall.jpg",
   "thumbnailUrl": "https://assets.mytravelroad.com/destinations/adyanpara/waterfall_thumb.jpg",
@@ -1076,7 +1172,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 35. Update Media Asset
+### 37. Update Media Asset
 - **Endpoint**: `PATCH /api/v1/admin/media/:id`
 - **Purpose**: Reorders media, changes cover status, or moderates review status.
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).
@@ -1103,7 +1199,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 36. Delete Media Asset
+### 38. Delete Media Asset
 - **Endpoint**: `DELETE /api/v1/admin/media/:id`
 - **Purpose**: Removes a media asset from the destination gallery.
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).
@@ -1112,7 +1208,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 37. Configure Destination Opening Hours & Fees
+### 39. Configure Destination Opening Hours & Fees
 - **Endpoint**: `PUT /api/v1/admin/destinations/:id/opening-hours`
 - **Purpose**: Creates or replaces destination operating schedules and tariffs. Produces an atomic `AuditLog` entry (`action: 'destination.opening_hours_update'`) committed within the same database transaction.
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).
@@ -1157,7 +1253,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ## Module G: Destination Verification
 
-### 38. List Verification Queue
+### 40. List Verification Queue
 - **Endpoint**: `GET /api/v1/admin/verification/queue`
 - **Purpose**: Triage queue of destinations awaiting initial verification or periodic re-audit.
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).
@@ -1184,7 +1280,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 39. Retrieve Verification Details
+### 41. Retrieve Verification Details
 - **Endpoint**: `GET /api/v1/admin/verification/:destinationId`
 - **Purpose**: Complete fact-level verification container, field-level status map, attached evidence, and history.
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).
@@ -1218,7 +1314,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 40. Assign Curator
+### 42. Assign Curator
 - **Endpoint**: `POST /api/v1/admin/verification/:destinationId/assign`
 - **Purpose**: Assigns or reassigns an editorial curator to a destination's verification audit.
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).
@@ -1244,14 +1340,15 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 41. Submit Verification Evidence
+### 43. Submit Verification Evidence
 - **Endpoint**: `POST /api/v1/admin/verification/:destinationId/evidence`
 - **Purpose**: Attaches documentary proof (gazette circular, field survey, photo) substantiating a fact.
-- **Confidentiality & Security**: Evidence documents are internal, confidential to `curator` and `super_admin`, and never exposed on public endpoints. Uploads are direct-to-S3/R2 with domain whitelisting (`https://assets.mytravelroad.com/...`). Allowed MIME: `image/*`, `application/pdf`. Max size: 25MB.
+- **Confidentiality & Storage Security**: Evidence documents are internal, confidential to `curator` and `super_admin`, and never exposed on public endpoints. Uploads are direct-to-S3/R2 with presigned ticket validation (`uploadTicketId`) targeting private storage without public CDN mapping. Allowed MIME: `image/*`, `application/pdf`. Max size: 25MB.
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).
 - **Request Body**:
 ```json
 {
+  "uploadTicketId": "ticket-uuid-002",
   "evidenceType": "government_gazette",
   "sourceOrganization": "Kerala Forest & Wildlife Department",
   "officialReferenceCode": "GO(Rt)No.412/2026/F&WLD",
@@ -1275,7 +1372,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 42. Verify Individual Destination Field
+### 44. Verify Individual Destination Field
 - **Endpoint**: `POST /api/v1/admin/verification/:destinationId/verify-field`
 - **Purpose**: Certifies a specific fact field as verified based on supporting evidence. Generates a `VerificationRecord` and updates aggregate field statuses.
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).
@@ -1308,7 +1405,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 43. Dispute or Request Field Update
+### 45. Dispute or Request Field Update
 - **Endpoint**: `POST /api/v1/admin/verification/:destinationId/dispute-field`
 - **Purpose**: Flags an existing fact as outdated or disputed, scheduling it for curator review.
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).
@@ -1335,7 +1432,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
-### 44. Retrieve Verification History
+### 46. Retrieve Verification History
 - **Endpoint**: `GET /api/v1/admin/verification/:destinationId/history`
 - **Purpose**: Retrieves the complete immutable historical audit trail of all field verification records for a destination.
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).

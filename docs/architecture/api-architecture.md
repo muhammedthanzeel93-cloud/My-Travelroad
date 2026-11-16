@@ -284,37 +284,82 @@ To guarantee token rotation, session persistence, and replay detection across mu
 #### Primary Architecture: Redis Key-Value Session Store
 The production deployment utilizes Redis (or Valkey) as the primary session and token state store:
 
-1. **Key Schema & Data Structures**:
+1. **Opaque Token Format & Information Hiding**:
+   - The client holds an opaque, unguessable bearer token in the `refreshToken` HttpOnly cookie: `rt_<64hex>` (256 bits of CSPRNG entropy generated via `crypto.randomBytes(32).toString('hex')`).
+   - The token contains **no account ID, user role, email, or sensitive identifiers**.
+   - Raw tokens are transmitted exclusively over secure HTTPS cookies and are **never stored in plaintext** in Redis or application logs.
+
+2. **Key Schema & Data Structures**:
+   - **Inverted Token Lookup Index**: `token_lookup:{tokenHash}` (Redis String/Hash, TTL: 30 days / 2,592,000s)
+     - Maps `SHA256(rawRefreshToken)` $\rightarrow$ JSON `{ familyId, sessionId, accountId }`.
+     - Enables instant $O(1)$ identification of the session, family lineage, and account owner before or during the atomic rotation transaction.
    - **Session Key**: `session:{sessionId}` (Redis Hash, TTL: 30 days / 2,592,000s)
      - `accountId`: UUID of the authenticated account.
-     - `tokenHash`: SHA-256 hash of the currently valid refresh token (`SHA256(rawRefreshToken)`). Plaintext tokens are **never** stored.
-     - `familyId`: UUID identifying the token rotation lineage / device session.
+     - `tokenHash`: SHA-256 hash of the currently active refresh token.
+     - `familyId`: UUID identifying the device session / token lineage.
      - `rotationSeq`: Integer sequence counter incremented on each rotation.
      - `createdAt`: ISO 8601 creation timestamp.
      - `expiresAt`: ISO 8601 expiry timestamp.
      - `ipAddress`: Client IP address at issuance.
      - `userAgent`: Client user-agent string at issuance.
-   - **Account Sessions Index**: `account_sessions:{accountId}` (Redis Set)
-     - Contains all active `sessionId`s for the account. Facilitates instant revocation of all sessions on password change or account suspension.
    - **Token Family Tracker**: `family:{familyId}` (Redis Hash, TTL: 30 days)
      - `activeSessionId`: Current valid session ID.
      - `activeTokenHash`: Current valid token SHA-256 hash.
+     - `rotationSeq`: Current sequence integer.
      - `isCompromised`: Boolean flag (true if replay detected).
+   - **Account Sessions Index**: `account_sessions:{accountId}` (Redis Set)
+     - Contains all active `sessionId`s for the account. Facilitates instant global revocation of all sessions on password change or account suspension.
+   - **Revoked Token Tombstone**: `revoked_token:{tokenHash}` (Redis String, TTL: 86,400s / 24 hours)
+     - Maps previously rotated token hashes $\rightarrow$ `familyId`. Allows immediate replay detection if an old token is reused within 24 hours.
 
-2. **Atomic Token Rotation & Replay Detection**:
-   - When `POST /api/v1/auth/refresh` is called, an atomic Redis Lua script executes:
-     1. Verifies that `SHA256(presentedRefreshToken)` matches `family:{familyId}.activeTokenHash`.
-     2. **Replay Detection**: If the presented token hash was previously rotated or does not match the active hash, the entire `familyId` is flagged as compromised. All sessions associated with `familyId` and listed in `account_sessions:{accountId}` are immediately deleted from Redis. The request is rejected with `401 Unauthorized` (`code: 'TOKEN_INVALID'`).
-     3. **Successful Rotation**: If valid, the Lua script generates a new random token, updates `tokenHash` to the new token's SHA-256 hash, increments `rotationSeq`, resets the 30-day sliding TTL on `session:{sessionId}` and `family:{familyId}`, and deletes the old token hash.
-   - A new `refreshToken` cookie is dispatched to the client along with a fresh 15-minute JWT.
+3. **Application-Driven Token Generation & Deterministic Atomic Lua Rotation**:
+   - **Strict Entropy Boundary**: The Node.js application layer is strictly responsible for cryptographic token generation. **Redis Lua scripts MUST NOT generate cryptographic tokens.**
+   - When `POST /api/v1/auth/refresh` is received:
+     1. The application computes `presentedTokenHash = crypto.createHash('sha256').update(rawToken).digest('hex')`.
+     2. The application pre-generates the replacement token credentials in Node.js memory:
+        - `replacementRawToken = crypto.randomBytes(32).toString('hex')` (256-bit CSPRNG)
+        - `replacementTokenHash = crypto.createHash('sha256').update(replacementRawToken).digest('hex')`
+        - `newSessionId = crypto.randomUUID()`
+     3. The application executes a deterministic atomic Lua script on Redis passing:
+        - `KEYS[1]`: `token_lookup:{presentedTokenHash}`
+        - `ARGV`: `presentedTokenHash`, `replacementTokenHash`, `newSessionId`, `ipAddress`, `userAgent`, `timestamp`, `ttl` (2,592,000s)
+     4. **Lua Script Execution Logic**:
+        - **Lookup Validation**: Script checks if `token_lookup:{presentedTokenHash}` exists.
+          - *If Missing*: Script checks `revoked_token:{presentedTokenHash}`.
+            - *If Found in Revoked Tombstone*: **REPLAY ATTACK DETECTED**. The Lua script immediately marks `family:{familyId}.isCompromised = 1`, deletes `family:{familyId}`, and deletes all session keys listed in `account_sessions:{accountId}`. The script returns error `TOKEN_REPLAY_DETECTED`.
+            - *If Not Found Anywhere*: Script returns error `TOKEN_INVALID_OR_EXPIRED`.
+          - *If Present*:
+            - Parse `{ familyId, sessionId: oldSessionId, accountId }`.
+            - Check `family:{familyId}`: verify `activeTokenHash == presentedTokenHash` and `isCompromised == 0`.
+            - Read current `rotationSeq` ($k$).
+            - **Atomic Swap & State Transition**:
+              1. Delete `token_lookup:{presentedTokenHash}`.
+              2. Delete `session:{oldSessionId}`.
+              3. Store tombstone `revoked_token:{presentedTokenHash} = familyId` with a 24-hour TTL (86,400s).
+              4. Create `token_lookup:{replacementTokenHash} = { familyId, sessionId: newSessionId, accountId }` (TTL: 2,592,000s).
+              5. Create `session:{newSessionId}` with `tokenHash = replacementTokenHash`, `rotationSeq = k + 1`, and client telemetry (TTL: 2,592,000s).
+              6. Update `family:{familyId}` with `activeSessionId = newSessionId`, `activeTokenHash = replacementTokenHash`, and `rotationSeq = k + 1` (TTL: 2,592,000s).
+              7. Update `account_sessions:{accountId}`: remove `oldSessionId`, add `newSessionId`.
+              8. Return success payload: `{ familyId, accountId, rotationSeq: k + 1 }`.
+     5. The API dispatches the new `refreshToken` cookie containing `replacementRawToken` and returns a fresh 15-minute access token.
 
-3. **Session Revocation & Lifecycle Cascade**:
-   - **Logout (`POST /api/v1/auth/logout`)**: Deletes `session:{sessionId}` from Redis and removes `sessionId` from `account_sessions:{accountId}`. The browser cookie is cleared (`Max-Age=0`).
+4. **Concurrency Race Condition Prevention**:
+   - Because `token_lookup:{presentedTokenHash}` is deleted atomically on the very first instruction of the Lua script, **it is impossible for concurrent requests presenting the same token to rotate twice**.
+   - Any concurrent request arriving even 1 millisecond later will find `token_lookup:{presentedTokenHash}` absent and immediately hit the `revoked_token` check, failing with replay detection.
+
+5. **Cleanup of Expired Session Indexes & Family Records**:
+   - **Native Key Expiration**: `token_lookup`, `session`, and `family` records enforce a strict 30-day sliding TTL (`EXPIRE ... 2592000`). If idle, Redis natively evicts them.
+   - **Tombstone Expiration**: `revoked_token` keys natively expire after 24 hours.
+   - **Set Pruning**: The set `account_sessions:{accountId}` is pruned during rotation or login by removing any `sessionId` where `EXISTS session:{sessionId}` is false.
+
+6. **Session Revocation & Lifecycle Cascade**:
+   - **Logout (`POST /api/v1/auth/logout`)**: Deletes `session:{sessionId}`, deletes `token_lookup:{tokenHash}`, and removes `sessionId` from `account_sessions:{accountId}`. The browser cookie is cleared (`Max-Age=0`).
    - **Password Reset / Change**: Iterates and deletes all `sessionId`s in `account_sessions:{accountId}`, terminating all existing sessions across all client devices.
-   - **Account Suspension / Deactivation**: All sessions in `account_sessions:{accountId}` are immediately purged. Subsequent refresh calls fail.
+   - **Account Suspension / Deactivation**: All sessions in `account_sessions:{accountId}` are immediately purged.
 
-4. **Failure Behavior**:
-   - **Fail-Closed**: If the Redis cluster is unreachable or encounters an operational failure, token refresh operations **fail closed** returning `503 Service Unavailable` (`code: 'SERVICE_UNAVAILABLE'`). Under no circumstance does the API fail open to unverified tokens.
+7. **Failure Behavior & Redis Outage Resilience**:
+   - **Fail-Closed on Refresh**: If Redis is unreachable, token refresh operations **fail closed** returning `503 Service Unavailable` (`code: 'SERVICE_UNAVAILABLE'`).
+   - **Database Status Override**: If Redis is degraded or down and an administrator suspends or deactivates an account, PostgreSQL `accounts.status` governs access. Because all privileged and mutating operations execute an active live database status query, compromised accounts are blocked immediately regardless of Redis status.
 
 #### Relational Alternative Architecture (Future Database Migration Design)
 For single-instance or strictly relational architectures where Redis is unavailable, the session store can be represented as an additional PostgreSQL table. This relational schema is documented as a future architectural migration proposal and requires separate database approval before implementation:
@@ -384,27 +429,79 @@ stateDiagram-v2
 ```
 
 1. **`pending_verification`**:
-   - **Login Allowed**: The user can log in with their email and password to avoid frustrating registration drop-offs.
-   - **Scoped Access Token**: The issued JWT contains claim `"emailVerified": false`.
+   - **Login Allowed**: The user can log in with their email and password to prevent onboarding drop-offs.
+   - **Scoped Access Token**: The issued JWT carries claims `"emailVerified": false` and `"status": "pending_verification"`.
    - **Allowed Endpoints**:
      - `GET /api/v1/auth/me` (Identity inspection)
      - `GET /api/v1/profiles/me` (View own profile)
      - `POST /api/v1/auth/verify-email` (Confirm token)
-     - `POST /api/v1/auth/resend-verification` (Request new verification email)
+     - `POST /api/v1/auth/resend-verification` (Request replacement verification email)
      - `POST /api/v1/auth/logout` (End session)
    - **Blocked Operations**: All state-modifying business actions (updating profile, saving destinations, creating destination drafts, or invoking admin routes) are blocked. Mutating requests return `403 Forbidden` with error code `EMAIL_VERIFICATION_REQUIRED`.
 
 2. **`active`**:
-   - Standard verified account. Fully authorized for all endpoints permitted by their assigned role.
+   - Standard verified account (`"emailVerified": true`, `"status": "active"`). Fully authorized for all endpoints permitted by their assigned role.
 
 3. **`suspended`**:
    - Temporarily barred due to community safety or terms violations.
    - **Login Blocked**: `POST /api/v1/auth/login` returns `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'`).
-   - **Refresh Blocked**: `POST /api/v1/auth/refresh` returns `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'`), and active refresh sessions are purged.
+   - **Refresh Blocked**: `POST /api/v1/auth/refresh` returns `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'`), and active refresh sessions in Redis are purged.
 
 4. **`deactivated`**:
    - Permanently or indefinitely disabled by the user or super administrator.
    - **Authentication Blocked**: All login and refresh requests return `403 Forbidden` (`code: 'ACCOUNT_DEACTIVATED'`).
+
+#### Dual Login Response Contracts
+The `POST /api/v1/auth/login` endpoint produces distinct envelopes based on account status:
+- **Active Account**: Returns HTTP `200 OK` with full permissions envelope:
+  ```json
+  {
+    "success": true,
+    "data": {
+      "accessToken": "eyJhbGciOiJSUzI1NiIs...",
+      "tokenType": "Bearer",
+      "expiresIn": 900,
+      "account": {
+        "id": "e7b0a880-922c-47b2-9a57-0b1a78e7f101",
+        "email": "amina.rahman@example.com",
+        "role": "traveler",
+        "status": "active",
+        "emailVerified": true
+      }
+    }
+  }
+  ```
+- **Pending Verification Account**: Returns HTTP `200 OK` with scoped envelope:
+  ```json
+  {
+    "success": true,
+    "data": {
+      "accessToken": "eyJhbGciOiJSUzI1NiIs...",
+      "tokenType": "Bearer",
+      "expiresIn": 900,
+      "account": {
+        "id": "e7b0a880-922c-47b2-9a57-0b1a78e7f101",
+        "email": "amina.rahman@example.com",
+        "role": "traveler",
+        "status": "pending_verification",
+        "emailVerified": false
+      }
+    }
+  }
+  ```
+
+#### Stateless JWT Revocation & Live Status Assertion Mechanics
+Because JSON Web Tokens are stateless, deleting Redis refresh sessions prevents subsequent token rotation but does not automatically destroy already-minted access tokens held by clients during their 15-minute validity window. To guarantee immediate enforcement of account suspensions, role demotions, or deactivations:
+
+1. **Upper Bound Exposure Window**: Access tokens enforce a strict **15-minute maximum lifespan** ($900\text{ seconds}$).
+2. **Live Database Status Assertion on All Mutations & Privileged Routes**:
+   - The backend **never trusts stale JWT claims alone** for state-modifying or privileged operations.
+   - Every administrative call under `/api/v1/admin/*`, profile update (`PATCH /profiles/me`), and bookmark operation (`POST /saved-destinations`) executes an active database lookup (`SELECT status, role FROM accounts WHERE id = :id`) within the execution transaction.
+   - If the account is marked `suspended` or `deactivated`, or if the caller's database role no longer matches the JWT role claim, the request is aborted immediately with `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'` or `'ACCOUNT_DEACTIVATED'`).
+3. **Gateway Fast-Revocation Blocklist for High-Volume Read Endpoints**:
+   - When an account is suspended or deactivated by an administrator, the security service sets an ephemeral blocklist key in Redis:
+     `revoked_accounts:{accountId}` (TTL: 900s / 15 minutes, matching the access token lifespan).
+   - The API Gateway authentication middleware checks `EXISTS revoked_accounts:{accountId}` on every incoming request. This rejects even cached read requests within milliseconds of an administrative action, without burdening the primary PostgreSQL database with queries on high-concurrency read traffic.
 
 ---
 
@@ -480,13 +577,18 @@ flowchart TD
 - **Tier 1 & 2 (Restricted with Centroid)**: Replaces exact coordinates with the approved approximate public centroid (e.g., forest entry gate or district range office) and masks locality names.
 - **Tier 3 (Restricted Suppressed)**: Coordinates are returned strictly as `null`. Under no circumstances does the API fall back to exact coordinates.
 - **Database Boundary**: Public destination location queries consume the secure definer view `v_public_destination_locations`.
-- **Privileged Administrative Access**: To support editorial fact verification and ecological perimeter monitoring, authorized callers with role `curator` or `super_admin` can access unmasked, exact coordinates and sensitivity metadata through the administrative endpoint `GET /api/v1/admin/destinations/:id`. Every access to this privileged endpoint generates an immutable audit telemetry log entry (`action: 'destination.privileged_location_read'`). All public-facing endpoints continue strictly enforcing the `v_public_destination_locations` view.
+- **Privileged Administrative Access & Fail-Closed Audit Logging**:
+  - To support editorial fact verification and ecological perimeter monitoring, authorized callers with role `curator` or `super_admin` can access unmasked exact coordinates and sensitivity metadata through the administrative endpoint `GET /api/v1/admin/destinations/:id`.
+  - **Audit Ledger Insertion**: Every read of this privileged endpoint writes an immutable business event to `audit_logs` (`actorAccountId: callerUuid`, `actorRole: curator|super_admin`, `action: 'destination.privileged_location_read'`, `entityType: 'destination'`, `entityId: destinationUuid`, `state_before: null`, `state_after: null`).
+  - **Telemetry Separation & Sanitization**: Operational telemetry (`ipAddress`, `userAgent`, `contextNotes: "Privileged coordinate inspection"`, `retentionExpiresAt: 90 days`) is written to `audit_log_telemetry`. **Raw GPS coordinates, PostGIS geometry, altitude, accuracy, and sensitive evidence files are STRICTLY PROHIBITED from telemetry snapshots.**
+  - **Fail-Closed Transactional Behavior**: The audit record creation and privileged coordinate read execute within the same atomic database transaction. If the audit log insertion cannot be committed, the transaction rolls back, and the API **fails closed** with `500 Internal Server Error` (`code: 'INTERNAL_SERVER_ERROR'`), returning NO coordinates. Public-facing endpoints continue strictly enforcing the `v_public_destination_locations` view.
 
 ### 9.2 Audit Logging Invariants
-Every state-modifying administrative action (`POST`, `PUT`, `PATCH`, `DELETE` under `/api/v1/admin/*`) generates an immutable server-side `AuditLog` entry matching the domain `AdminAction` taxonomy (`destination.create`, `destination.publish`, `destination.opening_hours_update`, `verification.field_verify`, etc.).
+Every state-modifying administrative action (`POST`, `PUT`, `PATCH`, `DELETE` under `/api/v1/admin/*`) and privileged coordinate read generates an immutable server-side `AuditLog` entry matching the domain `AdminAction` taxonomy (`destination.create`, `destination.publish`, `destination.opening_hours_update`, `destination.privileged_location_read`, `verification.field_verify`, etc.).
 - **Atomic Transaction Logging**: State modifications and their corresponding `AuditLog` records are committed within the same atomic database transaction. Specifically, `PUT /api/v1/admin/destinations/:id/opening-hours` atomically commits the operating hours upsert and an `AuditLog` record (`action: 'destination.opening_hours_update'`).
-- Telemetry (`ipAddress`, `userAgent`) is captured in `audit_log_telemetry` and decoupled from the immutable ledger.
-- Telemetry retention is governed by a 90-day privacy policy (`retentionExpiresAt`) supporting GDPR Right-to-Erasure anonymization.
+- **Ledger vs. Telemetry Separation**:
+  - `audit_logs`: Permanent, immutable business audit ledger with zero PII retention constraints.
+  - `audit_log_telemetry`: Ephemeral operational context (`ipAddress`, `userAgent`) decoupled from the ledger and governed by a 90-day privacy retention lifecycle (`retentionExpiresAt`). Telemetry snapshots never store coordinates or sensitive evidence.
 
 ### 9.3 Content Security, CORS, and CSRF Policies
 - **CORS**: Restricted strictly to authorized platform origins (e.g., `https://mytravelroad.com` and staging domains). Pre-flight `OPTIONS` requests are cached for 1 hour (`Access-Control-Max-Age: 3600`).
@@ -499,24 +601,60 @@ Every state-modifying administrative action (`POST`, `PUT`, `PATCH`, `DELETE` un
   - `Strict-Transport-Security: max-age=31536000; includeSubDomains; preload`
   - `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`
 
-### 9.4 Media & Evidence Upload Security
-To prevent server memory exhaustion, resource denial-of-service, and Server-Side Request Forgery (SSRF) vulnerabilities, the platform enforces strict upload and artifact management policies:
-1. **Direct-to-Object-Storage Upload Workflow**:
-   - Binary asset uploads (photos, videos, verification documents) never stream directly through the Next.js API server.
-   - Clients request a pre-signed, time-limited upload URL from the object storage service (AWS S3 or Cloudflare R2).
-   - The client uploads the binary directly to the storage bucket.
-   - Once uploaded, the client registers the asset metadata with the API (`POST /api/v1/admin/destinations/:id/media` or `POST /api/v1/admin/verification/:destinationId/evidence`).
-2. **Anti-SSRF & Domain Whitelisting**:
-   - The backend API **never fetches arbitrary remote URLs** supplied in request payloads.
-   - Asset URLs provided in registration payloads are strictly validated against the approved CDN/storage bucket domain (e.g., `^https://assets\.mytravelroad\.com/.*$`). Any foreign or non-whitelisted domain is rejected with `422 Unprocessable Entity` (`code: 'VALIDATION_FAILED'`).
-3. **Strict Content-Type Whitelist & Size Ceilings**:
-   - **Destination Media**: Restricted to `image/jpeg`, `image/png`, `image/webp`. File size ceiling: **10 MB**.
-   - **Verification Evidence**: Restricted to `image/jpeg`, `image/png`, `image/webp`, and `application/pdf`. File size ceiling: **25 MB**.
-4. **Cryptographic Storage Key Isolation**:
-   - Storage keys are generated server-side using cryptographically secure UUIDs (`destinations/{id}/media/{uuid}.webp`, `evidence/{id}/{uuid}.pdf`). User-provided filenames are completely discarded to prevent directory traversal (`../`) and path injection.
+### 9.4 Complete Media & Evidence Upload Authorization Workflow
+To prevent server memory exhaustion, resource denial-of-service, and Server-Side Request Forgery (SSRF) vulnerabilities, the platform enforces an end-to-end authorized direct-upload architecture:
+
+1. **Upload Authorization API (`POST /api/v1/admin/uploads/presign`)**:
+   - Clients never upload binaries directly through the Next.js API server.
+   - Before uploading, the client requests an authorized upload ticket and presigned S3/R2 URL.
+   - **Role & Target Validation**:
+     - `contributor`: Allowed only for `targetType: 'destination_media'` on draft destinations. Forbidden from uploading verification evidence.
+     - `curator` & `super_admin`: Authorized for both `destination_media` and `verification_evidence`.
+     - Validates that `targetId` exists in the database.
+   - **MIME & Size Ceilings**:
+     - Destination media: Restricted to `image/jpeg`, `image/png`, `image/webp`. File size ceiling: **10 MB** ($10,485,760\text{ bytes}$).
+     - Verification evidence: Restricted to `image/jpeg`, `image/png`, `image/webp`, and `application/pdf`. File size ceiling: **25 MB** ($26,214,400\text{ bytes}$).
+   - **Server-Generated Bound Keys**:
+     - Client filenames are discarded to prevent directory traversal (`../`).
+     - Storage keys are bound to the target entity:
+       - Media: `quarantine/destinations/{destinationId}/media/{uuid}.{ext}`
+       - Evidence: `private/verification/{verificationId}/evidence/{uuid}.pdf`
+   - **Presigned URL Policy**:
+     - Generates a signed AWS SigV4 `PUT` URL with a strict **15-minute expiration** ($900\text{ seconds}$).
+     - Presigned policy enforces exact `Content-Type`, `Content-Length`, and metadata headers (`x-amz-meta-target-id`, `x-amz-meta-uploader-id`).
+   - **Upload Ticket Tracking**:
+     - The server stores an upload ticket in Redis:
+       `upload_ticket:{ticketId} = { targetType, targetId, storageKey, uploaderId, mimeType, fileSizeBytes }` (TTL: 900s).
+
+2. **Direct Binary Upload**:
+   - The client performs an HTTP `PUT` directly to the cloud object storage bucket (`uploadUrl`) with the exact `Content-Type` and binary payload.
+
+3. **Asset Registration & Server-Side Verification**:
+   - Once the binary upload finishes, the client invokes the registration endpoint:
+     - `POST /api/v1/admin/destinations/:id/media` (or `POST /api/v1/admin/verification/:destinationId/evidence`), passing `uploadTicketId` and metadata.
+   - **Atomic Ticket Consumption**: The API consumes `upload_ticket:{ticketId}` atomically via Redis `GETDEL`.
+   - **HeadObject Validation**: The API issues `HeadObject` to cloud storage to verify:
+     1. The object exists in the storage bucket.
+     2. `Content-Length` matches the ticket and is within the size ceiling.
+     3. Metadata matches the target destination/verification entity and authenticated uploader.
+   - **Magic Byte Inspection**: The server reads the initial 512 bytes of the object to verify the actual binary magic numbers match the declared MIME type, preventing disguised executable files.
+
+4. **Malware Quarantine & Public Promotion Pipeline**:
+   - Newly uploaded media begins in the `quarantine/` prefix with `status: 'pending_review'`.
+   - An asynchronous malware scanning worker (AWS GuardDuty or ClamAV daemon) inspects the object.
+   - Once verified clean, the worker promotes the file from `quarantine/` to `public/destinations/{id}/media/{uuid}.webp`, generates optimized responsive thumbnails, and exposes it via CDN (`https://assets.mytravelroad.com/...`).
+
 5. **Evidence Confidentiality Boundary**:
-   - Verification evidence (`verification_evidence`) contains sensitive official certificates, surveyor field notes, and legal documentation.
-   - Evidence endpoints (`/api/v1/admin/verification/*`) and URLs are strictly confidential and restricted to `curator` and `super_admin` callers. Evidence documents are **never exposed** in public tourist destination endpoints.
+   - Verification evidence (`verification_evidence`) contains sensitive official certificates and surveyor field notes.
+   - Evidence resides permanently in a **private, non-CDN bucket** (`private/verification/{id}/evidence/...`).
+   - Evidence documents are **never exposed** in public tourist endpoints. Curators and super administrators access evidence exclusively via short-lived, authenticated presigned download URLs.
+
+6. **Abandoned Upload Cleanup**:
+   - Cloud storage lifecycle policies automatically abort incomplete multipart uploads and delete unattached objects in the `quarantine/` prefix after **24 hours**.
+
+7. **Anti-SSRF & Domain Whitelisting**:
+   - The backend API **never fetches arbitrary remote URLs** supplied in client payloads.
+   - Asset registration strictly references server-validated storage tickets and keys.
 
 ---
 
