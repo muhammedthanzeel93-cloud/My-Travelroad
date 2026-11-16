@@ -338,15 +338,20 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
         - *If Missing*: Fails immediately with `401 Unauthorized` (`code: 'TOKEN_INVALID_OR_EXPIRED'`).
         - *If Compromised (`isCompromised == '1'`)*: Fails immediately with `401 Unauthorized` (`code: 'TOKEN_REPLAY_DETECTED'`).
         - *If Token Hash Mismatch (`family.activeTokenHash != presentedTokenHash`)*:
-          The application triggers the **Atomic Replay Revocation Script** passing all 4 same-slot keys explicitly:
+          The application triggers the **Atomic Replay Revocation Script** passing all 4 same-slot keys and expected state arguments explicitly:
           - `KEYS[1]`: `family:{familyId}`
           - `KEYS[2]`: `revoked_token:{familyId}:{presentedTokenHash}`
           - `KEYS[3]`: `token_lookup:{familyId}:{family.activeTokenHash}`
           - `KEYS[4]`: `session:{familyId}:{family.activeSessionId}`
-          - `ARGV[1]`: `tombstoneTtl` (86,400s)
-          - *Script Logic*: Checks if `KEYS[2]` exists. If found in revoked tombstones:
-            Marks `family:{familyId}.isCompromised = 1`, sets a 24-hour TTL on `family:{familyId}`, deletes `KEYS[3]` and `KEYS[4]`, and returns `REPLAY_CONFIRMED`.
-            (The application tier then executes an idempotent background removal of `"{familyId}:{family.activeSessionId}"` from `account_sessions:{accountId}`).
+          - `ARGV[1]`: `expectedActiveTokenHash` (`family.activeTokenHash`)
+          - `ARGV[2]`: `expectedActiveSessionId` (`family.activeSessionId`)
+          - `ARGV[3]`: `tombstoneTtl` (86,400s)
+          - *Script Execution & State Revalidation*:
+            1. Checks if `KEYS[2]` exists in revoked tombstones. If missing, returns `'NOT_A_REPLAY'`.
+            2. Checks if `KEYS[1]` (`family:{familyId}`) exists. If missing, returns `'ALREADY_REVOKED'`.
+            3. **Concurrent Rotation Defense**: Revalidates `family.activeTokenHash == ARGV[1]` and `family.activeSessionId == ARGV[2]`. If a concurrent rotation occurred between the application's pre-read and script execution, the script aborts without mutation and returns `'CONCURRENT_ROTATION_DETECTED'`. The application layer catches this, re-reads `family:{familyId}` to get the latest active token hash and session ID, and re-executes the replay revocation script until convergence, guaranteeing that newly active sessions are never left behind.
+            4. If validated: marks `family:{familyId}.isCompromised = 1`, sets a 24-hour TTL on `family:{familyId}`, deletes `KEYS[3]` and `KEYS[4]`, and returns `'REPLAY_CONFIRMED'`.
+            (The application tier then executes an idempotent background removal of `"{familyId}:{expectedActiveSessionId}"` from `account_sessions:{accountId}`).
             Returns `401 Unauthorized` (`code: 'TOKEN_REPLAY_DETECTED'`).
         - *If Token Hash Matches (`family.activeTokenHash == presentedTokenHash`)*:
           The application pre-generates replacement credentials in Node.js memory:
@@ -401,21 +406,47 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
 
 6. **Account-Wide Revocation & Lifecycle Cascade**:
    - **Single Device Logout (`POST /api/v1/auth/logout`)**:
-     - The application resolves `activeSessionId` from `family:{familyId}`.
+     - The application resolves `activeTokenHash` and `activeSessionId` from `family:{familyId}`.
      - Executes the atomic single-device logout script passing all 3 same-slot keys:
        - `KEYS[1]`: `family:{familyId}`
-       - `KEYS[2]`: `token_lookup:{familyId}:{presentedTokenHash}`
-       - `KEYS[3]`: `session:{familyId}:{activeSessionId}`
-     - Script deletes `KEYS[1]`, `KEYS[2]`, and `KEYS[3]`.
+       - `KEYS[2]`: `session:{familyId}:{activeSessionId}`
+       - `KEYS[3]`: `token_lookup:{familyId}:{activeTokenHash}`
+       - `ARGV[1]`: `expectedActiveTokenHash`
+       - `ARGV[2]`: `expectedActiveSessionId`
+     - Inside Lua: revalidates `family.activeTokenHash == ARGV[1]` and `family.activeSessionId == ARGV[2]`. Deletes `KEYS[1]`, `KEYS[2]`, and `KEYS[3]`.
      - Application tier executes decoupled removal: `SREM account_sessions:{accountId} "{familyId}:{activeSessionId}"`.
      - The browser cookie is cleared (`Max-Age=0`).
-   - **Account-Wide Revocation (Logout-All, Password Reset, Suspension, Deactivation)**:
-     - The application reads all active session pairs: `SMEMBERS account_sessions:{accountId}`.
-     - For each member string `"{familyId}:{sessionId}"`:
-       - Parses `familyId` and `sessionId`.
-       - Executes single-slot family revocation on that `{familyId}` shard (deleting `family:{familyId}`, `session:{familyId}:{sessionId}`, and active `token_lookup:{familyId}:*`).
-     - Deletes the index: `DEL account_sessions:{accountId}`.
-     - Edge gateway writes immediate tombstone `revoked_accounts:{accountId}` (15-minute TTL) to block cached JWTs at the network boundary.
+   - **Deterministic Atomic Family Revocation Script**:
+     To revoke an individual family lineage during account-wide operations without cross-slot violations or wildcard deletions:
+     1. The application pre-reads `family:{familyId}` to resolve the exact `activeTokenHash` and `activeSessionId`.
+        - If `family:{familyId}` does not exist, the family is already expired/revoked; the application proceeds immediately to `SREM account_sessions:{accountId} "{familyId}:{sessionId}"`.
+     2. The application constructs the exact same-slot keys and invokes the script:
+        - `KEYS[1]`: `family:{familyId}`
+        - `KEYS[2]`: `session:{familyId}:{activeSessionId}`
+        - `KEYS[3]`: `token_lookup:{familyId}:{activeTokenHash}`
+        - `ARGV[1]`: `expectedActiveTokenHash`
+        - `ARGV[2]`: `expectedActiveSessionId`
+     3. **Lua Script Execution Logic**:
+        - Checks if `KEYS[1]` (`family:{familyId}`) exists. If missing, returns `'ALREADY_REVOKED'`.
+        - **State Revalidation**: Checks `family.activeTokenHash == ARGV[1]` and `family.activeSessionId == ARGV[2]`.
+          - *If Mismatched*: A concurrent token rotation changed the active credentials. The script aborts without mutation and returns `'CONCURRENT_ROTATION_DETECTED'`. The application layer catches this, re-reads `family:{familyId}` to get the latest `activeTokenHash` and `activeSessionId`, and retries revocation.
+          - *If Matched*: Atomically deletes `KEYS[2]` (`session`), `KEYS[3]` (`token_lookup`), and `KEYS[1]` (`family`), returning `'REVOKED_SUCCESS'`.
+   - **Crash-Safe Account-Wide Revocation Workflow (Logout-All, Password Reset, Suspension, Deactivation)**:
+     1. **Immediate Edge Invalidation**: Edge gateway writes tombstone `revoked_accounts:{accountId}` (15-minute TTL) to block cached JWTs at the network boundary in sub-millisecond time. In-flight mutating database requests immediately assert live PostgreSQL `Account.status == 'active'` (blocking suspended or deactivated callers).
+     2. **Enumerate Active Families**: The application reads all active session pairs: `members = SMEMBERS account_sessions:{accountId}`.
+     3. **Per-Family Atomic Revocation Loop**:
+        - For each member string `"{familyId}:{sessionId}"`:
+          - Invokes the **Deterministic Atomic Family Revocation Script** against that `{familyId}` shard.
+          - If the script returns `'CONCURRENT_ROTATION_DETECTED'`, the application re-reads the updated family state and re-invokes the script until convergence.
+          - Upon receiving `'REVOKED_SUCCESS'` or `'ALREADY_REVOKED'`: the application executes `SREM account_sessions:{accountId} "{familyId}:{sessionId}"`.
+          - If a family revocation experiences a transient Redis network failure or timeout, the application executes retry attempts with exponential backoff.
+     4. **Strict Ordering on Account Index Deletion**:
+        - The index `account_sessions:{accountId}` is deleted (`DEL account_sessions:{accountId}`) **ONLY AFTER** every constituent family revocation has succeeded (or when `SCARD account_sessions:{accountId} === 0`).
+        - The index is **never deleted upfront**.
+     5. **Worker Crash Resilience & Durable Recovery**:
+        - If an application worker crashes mid-revocation, `account_sessions:{accountId}` retains all remaining un-revoked members.
+        - Because `revoked_accounts:{accountId}` is present in Redis and the account status is updated in PostgreSQL, no unauthorized requests can proceed.
+        - A background reconciliation worker or subsequent administrative action / user login reads `account_sessions:{accountId}` and completes revocation of the remaining families idempotently.
 
 7. **Zero-Trust Index Authorization & Crash Resilience**:
    - **Administrative Index vs. Authorization Credential**: `account_sessions:{accountId}` is strictly an inverted index for administrative fan-out, **never an authorization credential**. A request presenting a token or session is never authorized merely because an entry exists in `account_sessions`. A request is authorized ONLY if:
@@ -490,7 +521,7 @@ The platform handles email verification and self-service password reset using cr
    - **Password Reset Cascade**: When a password reset token is consumed:
      1. The new password hash is computed using Argon2id and updated in `account_security_credentials`.
      2. Failed login counters (`failedLoginAttempts`, `lockedUntil`) are cleared.
-     3. The application enumerates all active `"{familyId}:{sessionId}"` pairs in `account_sessions:{accountId}`, executes single-slot family revocation on each respective `{familyId}` shard, and deletes `account_sessions:{accountId}`, revoking all active sessions across all devices.
+     3. The application enumerates all active `"{familyId}:{sessionId}"` pairs in `account_sessions:{accountId}`, executes the deterministic atomic family revocation script with state revalidation on each respective `{familyId}` shard, removes each pair via `SREM`, and deletes `account_sessions:{accountId}` only after all constituent family revocations have succeeded, revoking all active sessions across all devices.
      4. An immutable audit log entry is recorded (`action: 'account.password_reset'`).
 
 4. **Relational Alternative Design (Future Migration Proposal)**:
