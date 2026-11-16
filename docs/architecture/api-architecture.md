@@ -260,12 +260,14 @@ sequenceDiagram
        "email": "tourist@example.com",
        "emailVerified": true,
        "type": "individual",
+       "gen": 1,
        "iat": 1731682800,
        "exp": 1731683700,
        "iss": "https://mytravelroad.com",
        "aud": "https://mytravelroad.com"
      }
      ```
+   - **Durable Generation Claim (`gen`)**: An integer representing the account's durable revocation generation in PostgreSQL at the moment of token issuance. Any mutating or privileged database check asserts that `jwt.gen === account.token_generation`; tokens issued under prior generations are rejected immediately.
    - **Delivery**: Returned in JSON response body. Transmitted in client requests via header: `Authorization: Bearer <accessToken>`.
 2. **Long-Lived Refresh Token**:
    - **Lifespan**: 30 days (sliding window).
@@ -320,6 +322,7 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
      - `activeSessionId`: Current valid session ID.
      - `activeTokenHash`: Current valid token SHA-256 hash.
      - `rotationSeq`: Current sequence integer.
+     - `tokenGeneration`: Integer matching the durable account generation in PostgreSQL at creation or rotation.
      - `isCompromised`: Boolean flag (true if replay detected).
    - **Resolvable Account Sessions Index**: `account_sessions:{accountId}` (Redis Set)
      - Stores resolvable members formatted as `"{familyId}:{sessionId}"` (e.g., `"550e8400-e29b-41d4-a716-446655440001:550e8400-e29b-41d4-a716-446655440002"`).
@@ -337,6 +340,9 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
      3. Pre-identifies the session and family state via single-key read on `family:{familyId}`:
         - *If Missing*: Fails immediately with `401 Unauthorized` (`code: 'TOKEN_INVALID_OR_EXPIRED'`).
         - *If Compromised (`isCompromised == '1'`)*: Fails immediately with `401 Unauthorized` (`code: 'TOKEN_REPLAY_DETECTED'`).
+        - **Durable Generation & Account Status Validation**: The application queries PostgreSQL (`SELECT token_generation, status FROM accounts WHERE id = :accountId`):
+          - *If Account Not Active*: Fails with `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'` or `'ACCOUNT_DEACTIVATED'`).
+          - *If Stale Generation (`family.tokenGeneration < account.token_generation`)*: Fails immediately with `401 Unauthorized` (`code: 'SESSION_REVOKED'`). This closes all races between concurrent refresh requests and account-wide revocation (logout-all or password reset); a refresh request racing with revocation cannot use stale account state to mint valid replacement credentials.
         - *If Token Hash Mismatch (`family.activeTokenHash != presentedTokenHash`)*:
           The application triggers the **Atomic Replay Revocation Script** passing all 4 same-slot keys and expected state arguments explicitly:
           - `KEYS[1]`: `family:{familyId}`
@@ -390,7 +396,7 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
         - Outside the family Lua transaction, the application tier executes decoupled, idempotent updates on `account_sessions:{accountId}`:
           `SREM account_sessions:{accountId} "{familyId}:{oldSessionId}"`
           `SADD account_sessions:{accountId} "{familyId}:{newSessionId}"`
-     7. **Cookie Dispatch**: The API sets the new `refreshToken` cookie containing `replacementRawToken` and returns a fresh 15-minute access token.
+     7. **Cookie Dispatch & Token Issuance**: The API sets the new `refreshToken` cookie containing `replacementRawToken` and returns a fresh 15-minute access token carrying the durable generation claim `"gen": account.token_generation`.
 
 4. **Replay Revocation Scoping & Rationale**:
    - **Family-Level Revocation Boundary**: When a replay is detected, the revocation is **strictly scoped to the compromised token family** (`family:{familyId}`).
@@ -432,31 +438,95 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
           - *If Mismatched*: A concurrent token rotation changed the active credentials. The script aborts without mutation and returns `'CONCURRENT_ROTATION_DETECTED'`. The application layer catches this, re-reads `family:{familyId}` to get the latest `activeTokenHash` and `activeSessionId`, and retries revocation.
           - *If Matched*: Atomically deletes `KEYS[2]` (`session`), `KEYS[3]` (`token_lookup`), and `KEYS[1]` (`family`), returning `'REVOKED_SUCCESS'`.
    - **Crash-Safe Account-Wide Revocation Workflow (Logout-All, Password Reset, Suspension, Deactivation)**:
-     1. **Immediate Edge Invalidation**: Edge gateway writes tombstone `revoked_accounts:{accountId}` (15-minute TTL) to block cached JWTs at the network boundary in sub-millisecond time. In-flight mutating database requests immediately assert live PostgreSQL `Account.status == 'active'` (blocking suspended or deactivated callers).
-     2. **Enumerate Active Families**: The application reads all active session pairs: `members = SMEMBERS account_sessions:{accountId}`.
-     3. **Per-Family Atomic Revocation Loop**:
+     1. **Phase 1: Transactional Durable Barrier & Outbox Insertion (PostgreSQL)**:
+        - The initiating operation executes an atomic, ACID transaction in PostgreSQL before touching Redis:
+          - Increments `accounts.token_generation = token_generation + 1`.
+          - If password reset: updates Argon2id hash in `account_security_credentials` and resets failed login counters.
+          - If suspension or deactivation: updates `accounts.status = 'suspended' | 'deactivated'`.
+          - Inserts a durable recovery outbox record:
+            `INSERT INTO account_revocation_jobs (id, account_id, target_generation, reason, status) VALUES (gen_random_uuid(), :accountId, :newGeneration, :reason, 'processing')`.
+          - Inserts an immutable audit log entry into `audit_logs`.
+          - Commits the transaction.
+        - **Durable Revocation Established**: At this exact commit point, the durable barrier is permanently established. Every existing access token carrying `jwt.gen < newGeneration` and every existing refresh family in Redis carrying `family.tokenGeneration < newGeneration` is rendered irrevocably invalid upon presentation to the database.
+     2. **Phase 2: Ephemeral Gateway Fast-Path Cache (Redis)**:
+        - The security service writes an ephemeral tombstone to Redis:
+          `revoked_accounts:{accountId}` (TTL: 900s / 15 minutes, matching the access token lifespan).
+        - **Fast-Path Cache Demarcation**: This key serves strictly as an ephemeral gateway edge cache to filter cached read traffic in sub-millisecond time. It is **never the authoritative revocation guarantee**. Redis unavailability or the expiration of the 15-minute tombstone will never restore validity to stale credentials, because PostgreSQL `token_generation` checks are permanent and authoritative.
+     3. **Phase 3: Enumerate & Revoke Active Families (Redis Shards)**:
+        - The application reads all active session pairs: `members = SMEMBERS account_sessions:{accountId}`.
         - For each member string `"{familyId}:{sessionId}"`:
-          - Invokes the **Deterministic Atomic Family Revocation Script** against that `{familyId}` shard.
+          - Invokes the **Deterministic Atomic Family Revocation Script** against that `{familyId}` shard with state revalidation.
           - If the script returns `'CONCURRENT_ROTATION_DETECTED'`, the application re-reads the updated family state and re-invokes the script until convergence.
           - Upon receiving `'REVOKED_SUCCESS'` or `'ALREADY_REVOKED'`: the application executes `SREM account_sessions:{accountId} "{familyId}:{sessionId}"`.
           - If a family revocation experiences a transient Redis network failure or timeout, the application executes retry attempts with exponential backoff.
-     4. **Strict Ordering on Account Index Deletion**:
+     4. **Phase 4: Index Cleanup & Outbox Completion**:
         - The index `account_sessions:{accountId}` is deleted (`DEL account_sessions:{accountId}`) **ONLY AFTER** every constituent family revocation has succeeded (or when `SCARD account_sessions:{accountId} === 0`).
         - The index is **never deleted upfront**.
-     5. **Worker Crash Resilience & Durable Recovery**:
-        - If an application worker crashes mid-revocation, `account_sessions:{accountId}` retains all remaining un-revoked members.
-        - Because `revoked_accounts:{accountId}` is present in Redis and the account status is updated in PostgreSQL, no unauthorized requests can proceed.
-        - A background reconciliation worker or subsequent administrative action / user login reads `account_sessions:{accountId}` and completes revocation of the remaining families idempotently.
+        - Upon index deletion, the outbox job is marked complete in PostgreSQL:
+          `UPDATE account_revocation_jobs SET status = 'completed', completed_at = NOW() WHERE id = :jobId`.
+
+   - **Exhaustive Crash Boundary Recovery Specification**:
+     To guarantee complete crash safety even if an application worker terminates unexpectedly, recovery behavior is defined across all 5 operational boundaries:
+     1. *Crash after durable state is committed but before Redis tombstone creation*:
+        - *Security State*: The durable barrier in PostgreSQL is committed. All stale access tokens are immediately rejected by live database checks (`jwt.gen < account.token_generation`), and all refresh calls fail (`family.tokenGeneration < account.token_generation`).
+        - *Recovery*: An asynchronous recovery worker discovers the job with `status = 'processing'` and expired heartbeat (or `status = 'pending'`), writes the missing Redis edge tombstone, and initiates family revocation.
+     2. *Crash after Redis tombstone creation but before family enumeration*:
+        - *Security State*: Stale requests are rejected at both the edge gateway (Redis tombstone) and the database (`token_generation`).
+        - *Recovery*: Recovery worker restarts, reads `account_sessions:{accountId}`, and proceeds with family revocation.
+     3. *Crash midway through family revocation loop*:
+        - *Security State*: Revoked families are deleted; unrevoked families remain in Redis but are unusable on presentation because their `tokenGeneration` is stale.
+        - *Recovery*: Recovery worker queries remaining members from `account_sessions:{accountId}` and resumes revoking remaining families.
+     4. *Crash after family revocation but before SREM*:
+        - *Security State*: Family keys in Redis are already deleted.
+        - *Recovery*: Recovery worker retries family revocation for that member; Lua script returns `'ALREADY_REVOKED'`; worker executes `SREM` to remove the dead index entry.
+     5. *Crash after all families are revoked but before index deletion*:
+        - *Security State*: All constituent families deleted; index contains 0 members.
+        - *Recovery*: Recovery worker detects `SCARD account_sessions:{accountId} === 0`, issues `DEL account_sessions:{accountId}`, and marks `account_revocation_jobs` as `'completed'`.
+
+   - **Durable Recovery Scheduling (Transactional Outbox Pattern)**:
+     - Unfinished revocation jobs are discovered automatically without requiring user login or manual administrative intervention.
+     - A background recovery worker periodically polls:
+       ```sql
+       SELECT id, account_id, target_generation, reason
+       FROM account_revocation_jobs
+       WHERE status IN ('pending', 'processing')
+         AND updated_at < NOW() - INTERVAL '60 seconds'
+       FOR UPDATE SKIP LOCKED;
+       ```
+     - Processing is completely idempotent; duplicate workers or retries cannot corrupt session state or double-revoke families.
+     - An operation is **never marked complete** while any family remains unresolved. Stale or missing Redis index members are pruned lazily without ever treating the index as an authorization credential.
+
+   - **Prospective Stage A+ Schema Migration Requirement**:
+     To support the durable revocation generation and transactional outbox table without modifying the approved 15-table Stage A database schema, the following schema additions are formally specified for the Stage A+ database migration cycle:
+     ```sql
+     -- Stage A+ Schema Migration: Durable Revocation Barrier & Outbox
+     ALTER TABLE accounts ADD COLUMN token_generation INTEGER NOT NULL DEFAULT 1;
+     CREATE INDEX idx_accounts_token_generation ON accounts(id, token_generation);
+
+     CREATE TABLE account_revocation_jobs (
+         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+         account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+         target_generation INTEGER NOT NULL,
+         reason VARCHAR(50) NOT NULL, -- 'logout_all', 'password_reset', 'suspension', 'deactivation'
+         status VARCHAR(20) NOT NULL DEFAULT 'pending', -- 'pending', 'processing', 'completed', 'failed'
+         retry_count INTEGER NOT NULL DEFAULT 0,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         completed_at TIMESTAMPTZ NULL
+     );
+     CREATE INDEX idx_revocation_jobs_pending ON account_revocation_jobs(status, updated_at) WHERE status IN ('pending', 'processing');
+     ```
+     *Stage A Transition Fallback Semantics*: In the initial Stage A deployment prior to running this migration, password resets durably evaluate `AccountSecurityCredential.passwordChangedAt` (`jwt.iat >= account.password_changed_at`), and account suspension/deactivation asserts live `Account.status`. The prospective `token_generation` column and outbox table formalize the unified, universal durable barrier for full Stage A+ multi-device session governance.
 
 7. **Zero-Trust Index Authorization & Crash Resilience**:
    - **Administrative Index vs. Authorization Credential**: `account_sessions:{accountId}` is strictly an inverted index for administrative fan-out, **never an authorization credential**. A request presenting a token or session is never authorized merely because an entry exists in `account_sessions`. A request is authorized ONLY if:
-     1. PostgreSQL live status check asserts `Account.status == 'active'`.
-     2. `revoked_accounts:{accountId}` tombstone is absent.
-     3. For refresh: `family:{familyId}` exists, `isCompromised == 0`, and `token_lookup:{familyId}:{tokenHash}` matches.
+     1. PostgreSQL live status check asserts `Account.status == 'active'` AND `jwt.gen == account.token_generation`.
+     2. `revoked_accounts:{accountId}` fast-path cache tombstone is absent.
+     3. For refresh: PostgreSQL check confirms `family.tokenGeneration == account.token_generation`, Redis `family:{familyId}` exists, `isCompromised == 0`, and `token_lookup:{familyId}:{tokenHash}` matches.
    - **Worker Crash Resilience & Lazy Eviction**:
      - If an application worker crashes after the Lua rotation script but before updating `account_sessions:{accountId}`, the stale index entry has **zero security impact**: presenting `oldSessionId` is immediately rejected because its underlying `session` and `token_lookup` keys were deleted atomically.
      - Whenever `account_sessions:{accountId}` is enumerated (e.g., during active session listing or logout-all), dead entries are lazily evicted: if `EXISTS session:{familyId}:{sessionId}` is false, the application executes `SREM account_sessions:{accountId} "{familyId}:{sessionId}"`.
-   - **Authoritative Database Override**: If Redis is completely degraded, offline, or experiencing network partitions, the live database status check (`SELECT status, role FROM accounts WHERE id = :id`) executed on all mutating and privileged routes acts as an authoritative, fail-closed security boundary, blocking suspended or deactivated accounts immediately.
+   - **Authoritative Database Override**: If Redis is completely degraded, offline, or experiencing network partitions, the live database status check (`SELECT status, role, token_generation FROM accounts WHERE id = :id`) executed on all mutating and privileged routes acts as an authoritative, fail-closed security boundary, blocking suspended, deactivated, or stale-generation credentials immediately.
 
 8. **Redis Deployment Topology & Cluster Hash-Slot Constraints**:
    - **Primary Stage A Deployment Topology**: High-Availability **Redis Sentinel (Standalone Primary + Replicas)**. All keys reside within a single primary Redis keyspace. Multi-key Lua scripts execute across arbitrary key names without cluster slot restrictions.
@@ -519,10 +589,10 @@ The platform handles email verification and self-service password reset using cr
      - `password_reset:{tokenHash}` -> `{ accountId, expiresAt }` (TTL: 900s)
    - **Single-Use Consumption**: Tokens are consumed atomically via a Redis `GETDEL` (or transactional Lua script) on first presentation. Any subsequent attempt to present the same token fails immediately with `400 Bad Request` (`code: 'TOKEN_INVALID'`).
    - **Password Reset Cascade**: When a password reset token is consumed:
-     1. The new password hash is computed using Argon2id and updated in `account_security_credentials`.
-     2. Failed login counters (`failedLoginAttempts`, `lockedUntil`) are cleared.
+     1. Atomically in PostgreSQL: new password hash is computed using Argon2id and updated in `account_security_credentials`, failed login counters (`failedLoginAttempts`, `lockedUntil`) are cleared, `accounts.token_generation` is incremented establishing the durable revocation barrier, a durable outbox job is created in `account_revocation_jobs` (`reason: 'password_reset'`), and an immutable audit log entry is recorded (`action: 'account.password_reset'`).
+     2. Ephemeral fast-path cache tombstone `revoked_accounts:{accountId}` is written to Redis (15-min TTL / 900s).
      3. The application enumerates all active `"{familyId}:{sessionId}"` pairs in `account_sessions:{accountId}`, executes the deterministic atomic family revocation script with state revalidation on each respective `{familyId}` shard, removes each pair via `SREM`, and deletes `account_sessions:{accountId}` only after all constituent family revocations have succeeded, revoking all active sessions across all devices.
-     4. An immutable audit log entry is recorded (`action: 'account.password_reset'`).
+     4. The outbox job in PostgreSQL is marked `'completed'`.
 
 4. **Relational Alternative Design (Future Migration Proposal)**:
    - For database-backed ephemeral tokens, a prospective `account_ephemeral_tokens` table with columns `(id, account_id, token_type, token_hash, expires_at, consumed_at)` may be proposed in a future migration cycle.
@@ -605,17 +675,19 @@ The `POST /api/v1/auth/login` endpoint produces distinct envelopes based on acco
   ```
 
 #### Stateless JWT Revocation & Live Status Assertion Mechanics
-Because JSON Web Tokens are stateless, deleting Redis refresh sessions prevents subsequent token rotation but does not automatically destroy already-minted access tokens held by clients during their 15-minute validity window. To guarantee immediate enforcement of account suspensions, role demotions, or deactivations:
+Because JSON Web Tokens are stateless, deleting Redis refresh sessions prevents subsequent token rotation but does not automatically destroy already-minted access tokens held by clients during their 15-minute validity window. To guarantee immediate enforcement of account suspensions, role demotions, deactivations, and account-wide revocations (logout-all, password reset):
 
 1. **Upper Bound Exposure Window**: Access tokens enforce a strict **15-minute maximum lifespan** ($900\text{ seconds}$).
 2. **Live Database Status Assertion on All Mutations & Privileged Routes**:
    - The backend **never trusts stale JWT claims alone** for state-modifying or privileged operations.
-   - Every administrative call under `/api/v1/admin/*`, profile update (`PATCH /profiles/me`), and bookmark operation (`POST /saved-destinations`) executes an active database lookup (`SELECT status, role FROM accounts WHERE id = :id`) within the execution transaction.
+   - Every administrative call under `/api/v1/admin/*`, profile update (`PATCH /profiles/me`), bookmark operation (`POST /saved-destinations`), and token refresh executes an active database lookup (`SELECT status, role, token_generation FROM accounts WHERE id = :id`) within the execution transaction.
    - If the account is marked `suspended` or `deactivated`, or if the caller's database role no longer matches the JWT role claim, the request is aborted immediately with `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'` or `'ACCOUNT_DEACTIVATED'`).
-3. **Gateway Fast-Revocation Blocklist for High-Volume Read Endpoints**:
-   - When an account is suspended or deactivated by an administrator, the security service sets an ephemeral blocklist key in Redis:
+   - If the access token's generation claim does not match the database (`jwt.gen !== account.token_generation`), the token is rejected immediately with `401 Unauthorized` (`code: 'TOKEN_INVALID'`), defeating stale tokens even within their 15-minute lifespan.
+3. **Gateway Fast-Revocation Blocklist (Ephemeral Cache for Read Endpoints)**:
+   - When an account is suspended, deactivated, or undergoes an account-wide revocation (`POST /auth/logout-all`, password reset), the security service sets an ephemeral blocklist key in Redis:
      `revoked_accounts:{accountId}` (TTL: 900s / 15 minutes, matching the access token lifespan).
-   - The API Gateway authentication middleware checks `EXISTS revoked_accounts:{accountId}` on every incoming request. This rejects even cached read requests within milliseconds of an administrative action, without burdening the primary PostgreSQL database with queries on high-concurrency read traffic.
+   - The API Gateway authentication middleware checks `EXISTS revoked_accounts:{accountId}` on incoming requests as an early optimization. This fast-rejects requests within milliseconds without burdening the primary PostgreSQL database with queries on high-concurrency read traffic.
+   - **Ephemeral Cache Only**: `revoked_accounts:{accountId}` is strictly an ephemeral gateway cache and **never** the authoritative revocation barrier. Authoritative security relies on durable state: the PostgreSQL `token_generation` epoch for access tokens and refresh families, and the `Account.status` lifecycle. If Redis is unavailable or the 15-minute tombstone expires, previously invalidated credentials can never regain validity.
 
 ---
 
