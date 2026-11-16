@@ -42,6 +42,14 @@ graph TD
 | **Moderator** | `moderator` | `individual` | Review flagged content, resolve safety reports, manage user status flags and content suppression. |
 | **Super Administrator** | `super_admin` | `individual` | Full governance authority: publish/archive destinations, manage categories, elevate account roles, access audit logs. |
 
+> [!IMPORTANT]
+> **Discrete Role Architecture (No Implicit Inheritance)**:
+> Roles (`traveler`, `contributor`, `curator`, `moderator`, `super_admin`) are discrete, non-overlapping classifications defined by the domain enum `UserRole`. Capabilities are evaluated strictly per endpoint. Roles do **not** automatically inherit permissions from other roles:
+> - `moderator` does not have permission to verify facts or certify evidence.
+> - `curator` does not have permission to moderate accounts or manage suspensions.
+> - `contributor` cannot access curator queues or publish destinations.
+> - `super_admin` has administrative platform authority where explicitly granted in this matrix.
+
 ---
 
 ## 3. Comprehensive Stage A API Authorization Matrix
@@ -118,8 +126,9 @@ graph TD
 | Method & Endpoint | Public | Traveler | Contributor | Curator | Moderator | Super Admin | Ownership Check | Field Restrictions / Masking | Rejection Code |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- | :--- |
 | `GET /admin/dashboard` | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | No | High-level summary metrics. | `401 / 403 FORBIDDEN_ACCESS` |
-| `GET /admin/destinations` | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | No | All statuses (`draft`, `in_review`, `published`, `archived`). | `401 / 403 FORBIDDEN_ACCESS` |
+| `GET /admin/destinations` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | All statuses (`draft`, `in_review`, `published`, `archived`). | `401 / 403 FORBIDDEN_ACCESS` |
 | `POST /admin/destinations` | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | No | Creates `draft`. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
+| `GET /admin/destinations/:id` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Privileged administrative view: unmasked coordinates, altitude, accuracy, restriction parameters. Produces `AuditLog` (`action: 'destination.privileged_location_read'`). | `401 / 403 FORBIDDEN_ACCESS` |
 | `PATCH /admin/destinations/:id` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Updates metadata. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
 | `POST /admin/destinations/:id/publish` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | No | Requires `super_admin`. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
 | `POST /admin/destinations/:id/archive` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | No | Requires `super_admin`. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
@@ -128,7 +137,7 @@ graph TD
 | `POST /admin/destinations/:id/media` | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | No | Contributors create `pending_review` media. | `401 / 403 FORBIDDEN_ACCESS` |
 | `PATCH /admin/media/:id` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Set cover, moderate, reorder. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
 | `DELETE /admin/media/:id` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Disassociates media asset. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
-| `PUT /admin/destinations/:id/opening-hours` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Updates hours and fees. Produces `AuditLog`. | `401 / 403 FORBIDDEN_ACCESS` |
+| `PUT /admin/destinations/:id/opening-hours` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Updates hours and fees. Produces atomic `AuditLog` (`action: 'destination.opening_hours_update'`). | `401 / 403 FORBIDDEN_ACCESS` |
 
 ---
 
@@ -139,7 +148,7 @@ graph TD
 | `GET /admin/verification/queue` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Verification queue triage. | `401 / 403 FORBIDDEN_ACCESS` |
 | `GET /admin/verification/:destinationId` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Full fact statuses & evidence list. | `401 / 403 FORBIDDEN_ACCESS` |
 | `POST /admin/verification/:destinationId/assign` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Assigns curator (`assignedCuratorId`). | `401 / 403 FORBIDDEN_ACCESS` |
-| `POST /admin/verification/:destinationId/evidence` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Attaches documentary proof artifact. | `401 / 403 FORBIDDEN_ACCESS` |
+| `POST /admin/verification/:destinationId/evidence` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Attaches documentary proof artifact. Confidential: restricted to curators/super admins. | `401 / 403 FORBIDDEN_ACCESS` |
 | `POST /admin/verification/:destinationId/verify-field` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Certifies single fact. Produces `VerificationRecord`. | `401 / 403 FORBIDDEN_ACCESS` |
 | `POST /admin/verification/:destinationId/dispute-field` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Flags fact as disputed or needs update. | `401 / 403 FORBIDDEN_ACCESS` |
 | `GET /admin/verification/:destinationId/history` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | No | Complete audit trail of verification records. | `401 / 403 FORBIDDEN_ACCESS` |
@@ -165,3 +174,17 @@ graph TD
 - `AuditLogTelemetry` records (`ipAddress`, `userAgent`, state snapshots) are strictly internal.
 - No public or traveler endpoint exposes historical IP addresses, user agents, or password histories.
 - Profile responses (`GET /api/v1/profiles/:handle`) never include account email addresses, phone numbers, or internal account status flags.
+
+### 4.4 Account Status Authorization Policies
+In addition to role-based evaluations, caller permissions are strictly modulated by `Account.status`:
+- **`pending_verification`**:
+  - May authenticate (`POST /auth/login`) and receive a scoped JWT with claim `"emailVerified": false`.
+  - Permitted endpoints: `GET /auth/me`, `GET /profiles/me`, `POST /auth/verify-email`, `POST /auth/resend-verification`, `POST /auth/logout`.
+  - Denied endpoints: Any mutation (`PATCH /profiles/me`, `POST /saved-destinations`, `POST /admin/*`) is rejected with `403 Forbidden` (`code: 'EMAIL_VERIFICATION_REQUIRED'`).
+- **`active`**:
+  - Fully permitted according to role and ownership checks.
+- **`suspended`**:
+  - Login (`POST /auth/login`) rejected with `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'`).
+  - Refresh (`POST /auth/refresh`) rejected with `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'`) and active refresh sessions are revoked.
+- **`deactivated`**:
+  - Login and token refresh rejected with `403 Forbidden` (`code: 'ACCOUNT_DEACTIVATED'`).

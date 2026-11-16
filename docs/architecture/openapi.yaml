@@ -93,12 +93,14 @@ paths:
   /auth/logout:
     post:
       summary: Logout Account
-      description: Invalidates caller session and clears refresh token cookies.
+      description: Invalidates caller session in Redis and clears refresh token cookies.
       tags: [Authentication]
       operationId: logoutAccount
       security:
         - BearerAuth: []
         - CookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CSRFHeader'
       responses:
         '200':
           description: Logout successful
@@ -110,11 +112,13 @@ paths:
   /auth/refresh:
     post:
       summary: Refresh Access Token
-      description: Consumes valid HttpOnly refresh cookie, performs token family rotation, and returns a new 15-minute access token.
+      description: Consumes valid HttpOnly refresh cookie, performs token family rotation in Redis, and returns a new 15-minute access token.
       tags: [Authentication]
       operationId: refreshSession
       security:
         - CookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CSRFHeader'
       responses:
         '200':
           description: Token rotated successfully
@@ -126,8 +130,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TokenRefreshResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
         '401':
           $ref: '#/components/responses/401Unauthorized'
+        '403':
+          description: Account suspended or deactivated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardErrorResponse'
 
   /auth/me:
     get:
@@ -720,6 +732,34 @@ paths:
           $ref: '#/components/responses/409Conflict'
 
   /admin/destinations/{id}:
+    get:
+      summary: Get Privileged Destination Details
+      description: Retrieves complete administrative representation of a destination including unmasked exact coordinates, altitude, accuracy, and ecological restriction parameters. Restricted to curator and super_admin. Generates an AuditLog telemetry entry.
+      tags: [Administration]
+      operationId: getPrivilegedDestinationDetail
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Privileged destination representation retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegedDestinationDetailEnvelope'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
     patch:
       summary: Update Destination
       description: Updates destination fields and records an AuditLog entry.
@@ -1235,9 +1275,17 @@ components:
       type: apiKey
       in: cookie
       name: refreshToken
-      description: HttpOnly cryptographic refresh token cookie
+      description: HttpOnly, Secure, SameSite=Strict cryptographic refresh token cookie (Path=/api/v1/auth). Enforces mandatory X-Requested-With header to eliminate cross-site request forgery.
 
   parameters:
+    CSRFHeader:
+      name: X-Requested-With
+      in: header
+      required: true
+      schema:
+        type: string
+        enum: [XMLHttpRequest]
+      description: Mandatory header to guard against cross-site request forgery on cookie-authenticated auth endpoints.
     PageParam:
       name: page
       in: query
@@ -2128,6 +2176,7 @@ components:
           example: true
         data:
           type: object
+          description: Role-scoped statistical metrics for administrative inspection. Excludes PII, private evidence, and coordinates.
           required: [destinations, verificationQueue, mediaModeration, categories]
           properties:
             destinations:
@@ -2138,6 +2187,9 @@ components:
               type: object
             categories:
               type: object
+            accounts:
+              type: object
+              description: Platform account overview (super_admin only)
 
     AdminDestinationListEnvelope:
       type: object
@@ -2174,6 +2226,128 @@ components:
                 format: date-time
         meta:
           $ref: '#/components/schemas/ResponseMeta'
+
+    PrivilegedDestinationDetailEnvelope:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+          required: [id, slug, title, shortDescription, fullDescription, publicationStatus, primaryCategory, location]
+          properties:
+            id:
+              type: string
+              format: uuid
+            slug:
+              type: string
+            title:
+              type: string
+            shortDescription:
+              type: string
+            fullDescription:
+              type: string
+            publicationStatus:
+              type: string
+              enum: [draft, in_review, published, archived]
+            featuredRank:
+              type: integer
+              nullable: true
+            primaryCategory:
+              $ref: '#/components/schemas/CategoryResponse'
+            secondaryCategories:
+              type: array
+              items:
+                $ref: '#/components/schemas/CategoryResponse'
+            location:
+              $ref: '#/components/schemas/PrivilegedDestinationLocation'
+            openingHours:
+              type: object
+              nullable: true
+            media:
+              type: array
+              items:
+                $ref: '#/components/schemas/DestinationMediaResponse'
+            verificationSummary:
+              type: object
+              properties:
+                overallStatus:
+                  type: string
+                lastAuditedAt:
+                  type: string
+                  format: date-time
+                  nullable: true
+                nextAuditDueAt:
+                  type: string
+                  format: date-time
+                  nullable: true
+            createdAt:
+              type: string
+              format: date-time
+            updatedAt:
+              type: string
+              format: date-time
+
+    PrivilegedDestinationLocation:
+      type: object
+      required: [destinationId, coordinates, formattedAddress, talukOrSubdivision, district, stateOrProvince, countryCode, isRestricted]
+      properties:
+        destinationId:
+          type: string
+          format: uuid
+        coordinates:
+          type: array
+          description: Exact WGS 84 [longitude, latitude] coordinates
+          items:
+            type: number
+          minItems: 2
+          maxItems: 2
+          example: [76.3125, 11.3412]
+        altitudeMeters:
+          type: number
+          nullable: true
+          example: 140.0
+        accuracyMeters:
+          type: number
+          nullable: true
+          example: 4.5
+        formattedAddress:
+          type: string
+        locality:
+          type: string
+          nullable: true
+        talukOrSubdivision:
+          type: string
+        district:
+          type: string
+        stateOrProvince:
+          type: string
+        countryCode:
+          type: string
+        postalCode:
+          type: string
+          nullable: true
+        isRestricted:
+          type: boolean
+        restrictionReason:
+          type: string
+          nullable: true
+        publicCentroidCoordinates:
+          type: array
+          description: Approved approximate public centroid [longitude, latitude]
+          items:
+            type: number
+          nullable: true
+          minItems: 2
+          maxItems: 2
+          example: [76.32, 11.35]
+        publicApproximateDisplayName:
+          type: string
+          nullable: true
+        maskLocality:
+          type: boolean
 
     CreateDestinationRequest:
       type: object
