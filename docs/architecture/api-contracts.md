@@ -86,7 +86,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 }
 ```
 - **Successful Response — Active Account (`200 OK`)**:
-  - **Headers**: `Set-Cookie: refreshToken=rt_01JB8...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`
+  - **Headers**: `Set-Cookie: refreshToken=rt_550e8400-e29b-41d4-a716-446655440001_a1b2c3d4e5f6...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`
 ```json
 {
   "success": true,
@@ -105,7 +105,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 }
 ```
 - **Successful Response — Pending Verification Account (`200 OK`)**:
-  - **Headers**: `Set-Cookie: refreshToken=rt_01JB8...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`
+  - **Headers**: `Set-Cookie: refreshToken=rt_550e8400-e29b-41d4-a716-446655440001_a1b2c3d4e5f6...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`
 ```json
 {
   "success": true,
@@ -157,7 +157,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 - **Request Headers**: `X-Requested-With: XMLHttpRequest` (Mandatory anti-CSRF header).
 - **Permissions**: Valid refresh token holder.
 - **Successful Response (`200 OK`)**:
-  - **Headers**: `Set-Cookie: refreshToken=rt_new...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`
+  - **Headers**: `Set-Cookie: refreshToken=rt_550e8400-e29b-41d4-a716-446655440001_f7e8d9c0b1a2...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`
 ```json
 {
   "success": true,

@@ -76,7 +76,7 @@ paths:
               description: Rotating HttpOnly refresh token cookie
               schema:
                 type: string
-                example: refreshToken=rt_01JB8...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000
+                example: refreshToken=rt_550e8400-e29b-41d4-a716-446655440001_a1b2c3d4...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000
           content:
             application/json:
               schema:
@@ -135,6 +135,12 @@ paths:
       responses:
         '200':
           description: Logout successful
+          headers:
+            Set-Cookie:
+              description: Clears HttpOnly refresh token cookie
+              schema:
+                type: string
+                example: refreshToken=; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=0
           content:
             application/json:
               schema:
@@ -155,8 +161,10 @@ paths:
           description: Token rotated successfully
           headers:
             Set-Cookie:
+              description: Rotating HttpOnly refresh token cookie
               schema:
                 type: string
+                example: refreshToken=rt_550e8400-e29b-41d4-a716-446655440001_f7e8d9c0...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000
           content:
             application/json:
               schema:
