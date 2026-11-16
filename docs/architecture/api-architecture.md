@@ -401,10 +401,10 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
 4. **Replay Revocation Scoping & Rationale**:
    - **Family-Level Revocation Boundary**: When a replay is detected, the revocation is **strictly scoped to the compromised token family** (`family:{familyId}`).
    - **Rationale (Preventing Cross-Device Collateral Invalidation)**: Ordinary transient network retries, browser background duplicate refreshes, or minor local storage desynchronizations on one device (e.g., traveler's laptop) must **never** abruptly terminate independent active sessions on other user devices (e.g., mobile phone, tablet). An attacker intercepting an old token from one device compromises only that specific token family.
-   - **Global Account-Wide Revocation**: Purging all active sessions in `account_sessions:{accountId}` is strictly reserved for deliberate, high-privilege security events:
-     - Explicit user request to log out of all devices (`POST /api/v1/auth/logout?allDevices=true`).
+   - **Global Account-Wide Revocation**: Invalidating all active sessions in `account_sessions:{accountId}` is strictly reserved for deliberate, high-privilege security events:
      - Self-service or administrative password reset (`POST /api/v1/auth/reset-password`).
      - Administrative account suspension or deactivation (`Account.status = 'suspended' | 'deactivated'`).
+     - *Future Stage A+ Endpoint*: Multi-device user logout (`POST /api/v1/auth/logout-all`) is a planned Stage A+ capability requiring the Stage A+ durable generation and outbox schema migration. In Stage A, `POST /api/v1/auth/logout` revokes strictly the caller's current session.
 
 5. **Concurrency Race Condition Prevention**:
    - Because `KEYS[2]` (`token_lookup:{familyId}:{presentedTokenHash}`) is deleted atomically on the very first instruction of the Lua script and `family.activeTokenHash` is updated, **it is impossible for concurrent requests presenting the same token to rotate twice**.
@@ -721,10 +721,11 @@ The platform handles email verification and self-service password reset using cr
      - `password_reset:{tokenHash}` -> `{ accountId, expiresAt }` (TTL: 900s)
    - **Single-Use Consumption**: Tokens are consumed atomically via a Redis `GETDEL` (or transactional Lua script) on first presentation. Any subsequent attempt to present the same token fails immediately with `400 Bad Request` (`code: 'TOKEN_INVALID'`).
    - **Password Reset Cascade**: When a password reset token is consumed:
-     1. Atomically in PostgreSQL: new password hash is computed using Argon2id and updated in `account_security_credentials`, failed login counters (`failedLoginAttempts`, `lockedUntil`) are cleared, `accounts.token_generation` is incremented establishing the durable revocation barrier, a durable outbox job is created in `account_revocation_jobs` (`reason: 'password_reset'`), and an immutable audit log entry is recorded (`action: 'account.password_reset'`).
+     1. Atomically in PostgreSQL: new password hash is computed using Argon2id and updated in `account_security_credentials`, failed login counters (`failedLoginAttempts`, `lockedUntil`) are cleared, `accounts.token_generation` is incremented establishing the durable revocation barrier, a pending outbox job is inserted into `account_revocation_jobs` (`reason: 'password_reset'`, `status: 'pending'`), and an immutable audit log entry is recorded (`action: 'account.password_reset'`).
      2. Ephemeral fast-path cache tombstone `revoked_accounts:{accountId}` is written to Redis (15-min TTL / 900s).
-     3. The application enumerates all candidate `"{familyId}:{sessionId}"` pairs in `account_sessions:{accountId}`, executes the deterministic atomic family revocation script with generation fencing and state revalidation on each respective `{familyId}` shard, and prunes each stale pair via member-specific `SREM`. Blind `DEL` of `account_sessions` is strictly eliminated; Redis natively reclaims the Set key when all constituent members are pruned, while any concurrently added sessions from new logins remain fully preserved.
-     4. The outbox job in PostgreSQL is marked `'completed'`.
+     3. Asynchronous cleanup of candidate `"{familyId}:{sessionId}"` pairs in `account_sessions:{accountId}` is handled via member-specific `SREM` and generation-fenced family revocation.
+     4. **Worker-Only Fenced Finalization**: The outbox job in PostgreSQL is **never marked completed by the initiating request**. It is finalized strictly and exclusively by the background outbox worker via the fenced finalization query (`WHERE id = :jobId AND lease_owner = :workerId AND lease_token = :claimToken AND status = 'processing' AND lease_expires_at > NOW()`) only after all candidate members are verified processed or preserved.
+     *Stage A Production Fallback*: In the initial Stage A release prior to the Stage A+ migration, password reset achieves immediate durable credential invalidation via `AccountSecurityCredential.passwordChangedAt` timestamp evaluation (`jwt.iat >= account.password_changed_at`) and live status checks, and does not claim that the Stage A+ outbox tables are deployed.
 
 4. **Relational Alternative Design (Future Migration Proposal)**:
    - For database-backed ephemeral tokens, a prospective `account_ephemeral_tokens` table with columns `(id, account_id, token_type, token_hash, expires_at, consumed_at)` may be proposed in a future migration cycle.
