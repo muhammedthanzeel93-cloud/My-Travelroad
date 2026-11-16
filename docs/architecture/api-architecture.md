@@ -468,11 +468,14 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
           SET status = 'completed',
               completed_at = NOW(),
               lease_owner = NULL,
+              lease_token = NULL,
               lease_expires_at = NULL,
               updated_at = NOW()
           WHERE id = :jobId
             AND lease_owner = :workerId
-            AND status = 'processing';
+            AND lease_token = :claimToken
+            AND status = 'processing'
+            AND lease_expires_at > NOW();
           ```
 
    - **Exhaustive Crash Boundary Recovery Specification**:
@@ -493,10 +496,10 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
         - *Security State*: All constituent families deleted; index contains 0 members.
         - *Recovery*: Recovery worker detects `SCARD account_sessions:{accountId} === 0`, issues `DEL account_sessions:{accountId}`, and marks `account_revocation_jobs` as `'completed'`.
 
-   - **Executable Outbox Worker Claim Protocol**:
-     Unfinished revocation jobs are discovered, claimed, and executed automatically by background recovery workers via a resilient 4-phase lease protocol with explicit transaction boundaries:
-     1. **Phase A: Atomic Job Claim (Transaction 1 — Instantaneous Lock & Commit)**:
-        A worker identified by unique instance ID `:workerId` (e.g. `worker-pod-7b9f8d-a12bc`) polls and atomically claims a single job using a Common Table Expression (CTE) with row-level locking:
+   - **Executable Outbox Worker Claim Protocol with Per-Claim Fencing**:
+     Unfinished revocation jobs are discovered, claimed, and executed automatically by background recovery workers via a resilient 4-phase lease protocol with cryptographic per-claim fencing tokens and explicit transaction boundaries:
+     1. **Phase A: Atomic Job Claim & Fencing Token Generation (Transaction 1 — Instantaneous Lock & Commit)**:
+        A worker identified by unique instance ID `:workerId` (e.g. `worker-pod-7b9f8d-a12bc`) polls and atomically claims a single job using a Common Table Expression (CTE) with row-level locking. Every claim or reclamation generates a fresh, unpredictable fencing token (`gen_random_uuid()`):
         ```sql
         WITH claimable AS (
             SELECT id
@@ -510,19 +513,31 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
         UPDATE account_revocation_jobs j
         SET status = 'processing',
             lease_owner = :workerId,
+            lease_token = gen_random_uuid(),
             lease_expires_at = NOW() + INTERVAL '30 seconds',
             heartbeat_at = NOW(),
             retry_count = j.retry_count + CASE WHEN j.status = 'processing' THEN 1 ELSE 0 END,
             updated_at = NOW()
         FROM claimable
         WHERE j.id = claimable.id
-        RETURNING j.id, j.account_id, j.target_generation, j.reason;
+        RETURNING j.id, j.account_id, j.target_generation, j.reason, j.lease_token;
         ```
         - *Transaction Boundary*: This transaction commits immediately upon returning the row. No PostgreSQL row locks or transactions are held open while performing network I/O against external Redis shards.
-        - *Mutual Exclusion*: `FOR UPDATE SKIP LOCKED` guarantees exactly one worker acquires the row lock; concurrent workers skip locked rows without blocking. The immediate update of `lease_owner` and `lease_expires_at` cements ownership across transaction boundaries.
-     2. **Phase B: External Redis Revocation & Heartbeat Renewal (Outside DB Transaction)**:
-        - The worker iterates through Redis shards performing deterministic atomic family revocation scripts and `SREM` operations.
-        - *Periodic Heartbeat*: For large session sets, every 10 seconds (well before the 30-second `lease_expires_at` window lapses), the worker sends a heartbeat in a discrete transaction:
+        - *Fencing Token Binding*: The returned `lease_token` is captured as `:claimToken`. It is never reused across claims or retries.
+        - *Mutual Exclusion*: `FOR UPDATE SKIP LOCKED` guarantees exactly one worker acquires the row lock; concurrent workers skip locked rows without blocking. The immediate update of `lease_owner`, `lease_token`, and `lease_expires_at` cements ownership across transaction boundaries.
+     2. **Phase B: Pre-Flight Ownership Assertion & External Redis Revocation (Outside DB Transaction)**:
+        - Before executing each unit of external work (each family revocation on a Redis shard and corresponding `SREM` index mutation), the worker verifies in PostgreSQL that its lease remains active and unexpired:
+          ```sql
+          SELECT 1
+          FROM account_revocation_jobs
+          WHERE id = :jobId
+            AND lease_owner = :workerId
+            AND lease_token = :claimToken
+            AND status = 'processing'
+            AND lease_expires_at > NOW();
+          ```
+          If this assertion returns 0 rows, the worker immediately aborts external processing (`STALE_CLAIM_ABORT`). This guarantees that a worker stalling between heartbeats cannot execute Redis operations if its lease expired or was superseded.
+        - *Periodic Fenced Heartbeat*: For large session sets, every 10 seconds (well before the 30-second `lease_expires_at` window lapses), the worker sends a heartbeat in a discrete transaction:
           ```sql
           UPDATE account_revocation_jobs
           SET lease_expires_at = NOW() + INTERVAL '30 seconds',
@@ -530,25 +545,36 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
               updated_at = NOW()
           WHERE id = :jobId
             AND lease_owner = :workerId
-            AND status = 'processing';
+            AND lease_token = :claimToken
+            AND status = 'processing'
+            AND lease_expires_at > NOW();
           ```
-        - *Fencing / Stolen Lease Detection*: If the heartbeat update returns 0 affected rows (indicating the lease expired during a catastrophic stall and was seized by another worker), the current worker immediately halts its Redis loop, preventing split-brain execution.
-     3. **Phase C: Job Finalization (Transaction 2 — Discrete Commit)**:
-        - Upon revoking all constituent families and deleting `account_sessions:{accountId}`, the worker finalizes the job:
+        - *Fencing / Stolen Lease Detection*: If the heartbeat update returns 0 affected rows (indicating the lease expired and was seized by another worker with a newer `lease_token`), the current worker immediately halts its Redis loop. It must never attempt to revive an expired or stolen claim.
+     3. **Phase C: Fenced Job Finalization (Transaction 2 — Discrete Commit)**:
+        - Upon revoking all constituent families and deleting `account_sessions:{accountId}`, the worker finalizes the job in PostgreSQL:
           ```sql
           UPDATE account_revocation_jobs
           SET status = 'completed',
               completed_at = NOW(),
               lease_owner = NULL,
+              lease_token = NULL,
               lease_expires_at = NULL,
               updated_at = NOW()
           WHERE id = :jobId
             AND lease_owner = :workerId
-            AND status = 'processing';
+            AND lease_token = :claimToken
+            AND status = 'processing'
+            AND lease_expires_at > NOW();
           ```
-     4. **Phase D: Crash Reclamation & Idempotency Guarantee**:
-        - If a worker crashes, its lease expires after 30 seconds (`lease_expires_at < NOW()`). Any peer worker will discover and claim it on the next polling cycle.
-        - The family Lua script checks and asserts state before deleting (`'ALREADY_REVOKED'` on duplicate attempts), and `SREM` is idempotent. Concurrent or retried executions can never corrupt Redis session state.
+        - If this update affects 0 rows, the worker does not report completion; the job was already reclaimed or timed out.
+     4. **Phase D: Crash Reclamation & Strict Stale Worker Fencing**:
+        - *Stalled Worker Scenario*: Suppose Worker 1 stalls or network partitions. At $t_0 + 30\text{s}$, its lease expires.
+        - *Reclamation by Worker 2*: At $t_0 + 31\text{s}$, Worker 2 polls the outbox, discovers the expired job, claims it, and writes `lease_owner = :workerId_2`, `lease_token = :claimToken_2` (`Token_B`), and a fresh `lease_expires_at`.
+        - *Stale Worker 1 Eviction*: When Worker 1 resumes:
+          - If Worker 1 attempts pre-flight validation before its next Redis call: the check `WHERE lease_token = Token_A` returns 0 rows $\rightarrow$ Worker 1 immediately terminates.
+          - If Worker 1 attempts a heartbeat renewal: `WHERE lease_token = Token_A` returns 0 rows $\rightarrow$ Worker 1 halts immediately.
+          - If Worker 1 attempts finalization: `WHERE lease_token = Token_A` returns 0 rows $\rightarrow$ Worker 1 fails closed.
+        - *Redis Idempotency Defense-in-Depth*: In addition to PostgreSQL fencing, Redis family revocation Lua scripts return `'ALREADY_REVOKED'` if already deleted, and `SREM` is idempotent. Concurrent or overlapping execution cannot corrupt Redis session state.
         - An operation is **never marked complete** while any family remains unresolved. Stale or missing Redis index members are pruned lazily without ever treating the index as an authorization credential.
 
    - **Prospective Stage A+ Schema Migration Requirement**:
@@ -565,6 +591,7 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
          reason VARCHAR(50) NOT NULL, -- 'password_reset', 'suspension', 'deactivation', 'logout_all'
          status VARCHAR(20) NOT NULL DEFAULT 'pending', -- 'pending', 'processing', 'completed', 'failed'
          lease_owner VARCHAR(255) NULL, -- Unique worker instance identifier holding active lease
+         lease_token UUID NULL, -- Unique per-claim fencing token generated anew on every claim
          lease_expires_at TIMESTAMPTZ NULL, -- Expiry timestamp of the active worker lease
          heartbeat_at TIMESTAMPTZ NULL, -- Timestamp of most recent heartbeat renewal
          retry_count INTEGER NOT NULL DEFAULT 0,
@@ -574,6 +601,8 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
      );
      CREATE INDEX idx_revocation_jobs_claimable ON account_revocation_jobs(status, lease_expires_at)
          WHERE status IN ('pending', 'processing');
+     CREATE INDEX idx_revocation_jobs_lease_fencing ON account_revocation_jobs(id, lease_owner, lease_token)
+         WHERE status = 'processing';
      CREATE INDEX idx_revocation_jobs_account ON account_revocation_jobs(account_id);
      ```
      *Stage A Operational Scope & Fallback Semantics*:
