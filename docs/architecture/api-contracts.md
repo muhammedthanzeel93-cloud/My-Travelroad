@@ -1098,8 +1098,9 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
   - `purpose: 'destination_media'`: Allowed for `contributor`, `curator`, `super_admin`. Key routed to quarantine prefix: `quarantine/destinations/{destinationId}/media/{assetUuid}.{ext}`.
   - `purpose: 'verification_evidence'`: Strictly restricted to `curator` and `super_admin`. Key routed to evidence quarantine prefix: `quarantine/destinations/{destinationId}/evidence/{evidenceUuid}.{ext}`.
 - **Security & Integrity Controls**:
-  - Generates a single-use Redis upload ticket (`upload_ticket:{uploadTicketId}`) storing `{ uploadTicketId, accountId, destinationId, purpose, mimeType, maxSizeBytes, objectKey, createdAt, expiresAt }` with 15-minute TTL.
-  - Subsequent registration endpoints assert the ticket, perform S3 `HeadObject` checks, and verify file magic bytes.
+  - Generates a single-use Redis upload ticket (`upload_ticket:{uploadTicketId}`) storing `{ uploadTicketId, accountId, destinationId, purpose, mimeType, fileSizeBytes, maxSizeBytes, objectKey, createdAt, expiresAt }` with 15-minute TTL.
+  - The ticket records both `fileSizeBytes` (exact authorized byte length declared by client) and `maxSizeBytes` (administrative ceiling for the purpose: 10MB for media, 25MB for evidence).
+  - Subsequent registration endpoints assert the ticket, perform S3 `HeadObject` checks, verify that `actualObjectSize === ticket.fileSizeBytes` and `actualObjectSize <= ticket.maxSizeBytes`, capture S3 `VersionId`, `ETag`, and `ChecksumSHA256`, and verify file magic bytes.
   - Rate limited to 20 requests / 15 minutes per account.
 - **Request Body**:
 ```json
@@ -1120,6 +1121,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
     "presignedUrl": "https://s3.ap-south-1.amazonaws.com/quarantine.mytravelroad.com/quarantine/destinations/550e8400-e29b-41d4-a716-446655440003/media/asset-uuid-002.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&...",
     "objectKey": "quarantine/destinations/550e8400-e29b-41d4-a716-446655440003/media/asset-uuid-002.jpg",
     "expiresAt": "2026-11-15T16:05:00.000Z",
+    "fileSizeBytes": 2450880,
     "maxSizeBytes": 10485760
   }
 }
@@ -1135,7 +1137,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 ### 36. Attach Destination Media Asset
 - **Endpoint**: `POST /api/v1/admin/destinations/:id/media`
 - **Purpose**: Associates a previously uploaded media asset in quarantine with a destination's gallery.
-- **Upload Workflow & Verification**: Requires an authorized `uploadTicketId`. The API executes atomic `GETDEL` on the upload ticket, asserts caller ownership (`ticket.accountId === caller.accountId`), verifies S3 `HeadObject` metadata and byte lengths, and inspects initial 512 bytes for file signature magic numbers. The asset is registered with initial status `pending_review`. Upon asynchronous antivirus scan clearance, the asset is promoted to public storage and CDN URLs are populated.
+- **Upload Workflow & Verification**: Requires an authorized `uploadTicketId`. The API executes atomic `GETDEL` on the upload ticket, asserts caller ownership (`ticket.accountId === caller.accountId`), verifies S3 `HeadObject` metadata, strictly validates that `actualObjectSize === ticket.fileSizeBytes` and `actualObjectSize <= ticket.maxSizeBytes`, captures the object's immutable `VersionId`, `ETag`, and `ChecksumSHA256`, and inspects initial 512 bytes for file signature magic numbers. The asset is registered with initial status `pending_review` bound to the immutable `{ objectKey, versionId, checksumSha256 }`. Upon asynchronous antivirus scan clearance targeting that specific `VersionId`, the asset is promoted to public storage and CDN URLs are populated. Subsequent PUTs to an unexpired presigned URL create unreferenced versions that are rejected.
 - **Security Boundary**: Clients cannot supply arbitrary CDN or external URLs. Registration strictly references server-generated, validated upload tickets.
 - **Validation Rules**:
   - Allowed MIME: `image/jpeg`, `image/png`, `image/webp`. File size ceiling: 10MB.
@@ -1341,7 +1343,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 ### 43. Submit Verification Evidence
 - **Endpoint**: `POST /api/v1/admin/verification/:destinationId/evidence`
 - **Purpose**: Attaches documentary proof (gazette circular, field survey, photo) substantiating a fact.
-- **Confidentiality & Storage Security**: Evidence documents are internal, confidential to `curator` and `super_admin`, and never exposed on public endpoints. Uploads are direct-to-S3/R2 with mandatory presigned ticket validation (`uploadTicketId`) targeting private storage without public CDN mapping. Allowed MIME: `image/*`, `application/pdf`. Max size: 25MB. Clients cannot supply arbitrary document URLs; internal storage references are derived directly from the validated upload ticket.
+- **Confidentiality & Storage Security**: Evidence documents are internal, confidential to `curator` and `super_admin`, and never exposed on public endpoints. Uploads are direct-to-S3/R2 with mandatory presigned ticket validation (`uploadTicketId`) targeting private storage without public CDN mapping. The API executes atomic `GETDEL` on the upload ticket, asserts caller ownership (`ticket.accountId === caller.accountId`), verifies S3 `HeadObject` metadata, strictly validates that `actualObjectSize === ticket.fileSizeBytes` and `actualObjectSize <= ticket.maxSizeBytes`, captures the object's immutable `VersionId`, `ETag`, and `ChecksumSHA256`, and binds the evidence record to the version-pinned asset. Allowed MIME: `image/*`, `application/pdf`. Max size: 25MB. Clients cannot supply arbitrary document URLs; internal storage references are derived directly from the validated upload ticket.
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).
 - **Request Body**:
 ```json

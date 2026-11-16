@@ -286,15 +286,15 @@ To guarantee token rotation, session persistence, and replay detection across mu
 The production deployment utilizes Redis (or Valkey) as the primary session and token state store:
 
 1. **Opaque Token Format & Information Hiding**:
-   - The client holds an opaque, unguessable bearer token in the `refreshToken` HttpOnly cookie: `rt_<64hex>` (256 bits of CSPRNG entropy generated via `crypto.randomBytes(32).toString('hex')`).
-   - The token contains **no account ID, user role, email, or sensitive identifiers**.
+   - The client holds an opaque, unguessable bearer token in the `refreshToken` HttpOnly cookie: `rt_<familyId>_<64hex>` (in Redis Cluster) or `rt_<64hex>` (in non-sharded Sentinel), providing 256 bits of CSPRNG entropy generated via `crypto.randomBytes(32).toString('hex')`.
+   - The token contains **no account ID, user role, email, or sensitive identifiers** (the opaque UUID prefix `familyId` serves purely as an unguessable Redis hash-slot routing shard key).
    - Raw tokens are transmitted exclusively over secure HTTPS cookies and are **never stored in plaintext** in Redis or application logs.
 
 2. **Key Schema & Data Structures**:
-   - **Inverted Token Lookup Index**: `token_lookup:{tokenHash}` (Redis String/Hash, TTL: 30 days / 2,592,000s)
+   - **Inverted Token Lookup Index**: `token_lookup:{familyId}:{tokenHash}` (Redis String/Hash, TTL: 30 days / 2,592,000s)
      - Maps `SHA256(rawRefreshToken)` $\rightarrow$ JSON `{ familyId, sessionId, accountId }`.
-     - Enables instant $O(1)$ identification of the session, family lineage, and account owner before or during the atomic rotation transaction.
-   - **Session Key**: `session:{sessionId}` (Redis Hash, TTL: 30 days / 2,592,000s)
+     - Enables instant $O(1)$ identification of the session, family lineage, and account owner within the `{familyId}` hash slot.
+   - **Session Key**: `session:{familyId}:{sessionId}` (Redis Hash, TTL: 30 days / 2,592,000s)
      - `accountId`: UUID of the authenticated account.
      - `tokenHash`: SHA-256 hash of the currently active refresh token.
      - `familyId`: UUID identifying the device session / token lineage.
@@ -309,40 +309,41 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
      - `rotationSeq`: Current sequence integer.
      - `isCompromised`: Boolean flag (true if replay detected).
    - **Account Sessions Index**: `account_sessions:{accountId}` (Redis Set)
-     - Contains all active `sessionId`s for the account. Facilitates instant global revocation of all sessions on password change or account suspension.
-   - **Revoked Token Tombstone**: `revoked_token:{tokenHash}` (Redis String, TTL: 86,400s / 24 hours)
+     - Contains all active `sessionId`s for the account. Facilitates instant global revocation of all sessions on password change or account suspension. Maintained outside the `{familyId}` hash slot via decoupled application-level operations.
+   - **Revoked Token Tombstone**: `revoked_token:{familyId}:{tokenHash}` (Redis String, TTL: 86,400s / 24 hours)
      - Maps previously rotated token hashes $\rightarrow$ `familyId`. Allows immediate replay detection if an old token is reused within 24 hours.
 
 3. **Application-Driven Token Generation & Deterministic Atomic Lua Rotation**:
    - **Strict Entropy Boundary**: The Node.js application layer is strictly responsible for cryptographic token generation. **Redis Lua scripts MUST NOT generate cryptographic tokens.**
    - When `POST /api/v1/auth/refresh` is received:
-     1. The application computes `presentedTokenHash = crypto.createHash('sha256').update(rawToken).digest('hex')`.
+     1. The application parses `familyId` and computes `presentedTokenHash = crypto.createHash('sha256').update(rawToken).digest('hex')`.
      2. The application pre-generates the replacement token credentials in Node.js memory:
         - `replacementRawToken = crypto.randomBytes(32).toString('hex')` (256-bit CSPRNG)
         - `replacementTokenHash = crypto.createHash('sha256').update(replacementRawToken).digest('hex')`
         - `newSessionId = crypto.randomUUID()`
      3. The application executes a deterministic atomic Lua script on Redis passing:
-        - `KEYS[1]`: `token_lookup:{presentedTokenHash}`
+        - `KEYS[1]`: `token_lookup:{familyId}:{presentedTokenHash}`
+        - `KEYS[2]`: `family:{familyId}`
         - `ARGV`: `presentedTokenHash`, `replacementTokenHash`, `newSessionId`, `ipAddress`, `userAgent`, `timestamp`, `ttl` (2,592,000s)
      4. **Lua Script Execution Logic**:
-        - **Lookup Validation**: Script checks if `token_lookup:{presentedTokenHash}` exists.
-          - *If Missing*: Script checks `revoked_token:{presentedTokenHash}`.
-            - *If Found in Revoked Tombstone*: **REPLAY ATTACK DETECTED**. The Lua script identifies the compromised family from the tombstone (`familyId`), marks `family:{familyId}.isCompromised = 1`, deletes `token_lookup:{family.activeTokenHash}` so no further tokens in this family can be refreshed, deletes `session:{family.activeSessionId}`, and removes `family.activeSessionId` from `account_sessions:{accountId}`. The family record `family:{familyId}` is retained with a **24-hour TTL as an audit tombstone**. The script returns error `TOKEN_REPLAY_DETECTED`.
+        - **Lookup Validation**: Script checks if `token_lookup:{familyId}:{presentedTokenHash}` exists.
+          - *If Missing*: Script checks `revoked_token:{familyId}:{presentedTokenHash}`.
+            - *If Found in Revoked Tombstone*: **REPLAY ATTACK DETECTED**. The Lua script operates strictly within the family keyspace: it marks `family:{familyId}.isCompromised = 1`, deletes `token_lookup:{familyId}:{family.activeTokenHash}` so no further tokens in this family can be refreshed, and deletes `session:{familyId}:{family.activeSessionId}`. The family record `family:{familyId}` is retained with a **24-hour TTL as an audit tombstone**. The script returns error `TOKEN_REPLAY_DETECTED`. (The application layer executes an idempotent background cleanup removing the revoked `sessionId` from `account_sessions:{accountId}` without cross-slot Lua constraints).
             - *If Not Found Anywhere*: Script returns error `TOKEN_INVALID_OR_EXPIRED`.
           - *If Present*:
             - Parse `{ familyId, sessionId: oldSessionId, accountId }`.
             - Check `family:{familyId}`: verify `activeTokenHash == presentedTokenHash` and `isCompromised == 0`.
             - Read current `rotationSeq` ($k$).
-            - **Atomic Swap & State Transition**:
-              1. Delete `token_lookup:{presentedTokenHash}`.
-              2. Delete `session:{oldSessionId}`.
-              3. Store tombstone `revoked_token:{presentedTokenHash} = familyId` with a 24-hour TTL (86,400s).
-              4. Create `token_lookup:{replacementTokenHash} = { familyId, sessionId: newSessionId, accountId }` (TTL: 2,592,000s).
-              5. Create `session:{newSessionId}` with `tokenHash = replacementTokenHash`, `rotationSeq = k + 1`, and client telemetry (TTL: 2,592,000s).
+            - **Atomic Swap & State Transition (Single-Slot Execution)**:
+              1. Delete `token_lookup:{familyId}:{presentedTokenHash}`.
+              2. Delete `session:{familyId}:{oldSessionId}`.
+              3. Store tombstone `revoked_token:{familyId}:{presentedTokenHash} = familyId` with a 24-hour TTL (86,400s).
+              4. Create `token_lookup:{familyId}:{replacementTokenHash} = { familyId, sessionId: newSessionId, accountId }` (TTL: 2,592,000s).
+              5. Create `session:{familyId}:{newSessionId}` with `tokenHash = replacementTokenHash`, `rotationSeq = k + 1`, and client telemetry (TTL: 2,592,000s).
               6. Update `family:{familyId}` with `activeSessionId = newSessionId`, `activeTokenHash = replacementTokenHash`, and `rotationSeq = k + 1` (TTL: 2,592,000s).
-              7. Update `account_sessions:{accountId}`: remove `oldSessionId`, add `newSessionId`.
-              8. Return success payload: `{ familyId, accountId, rotationSeq: k + 1 }`.
-     5. The API dispatches the new `refreshToken` cookie containing `replacementRawToken` and returns a fresh 15-minute access token.
+              7. Return success payload: `{ familyId, accountId, oldSessionId, newSessionId, rotationSeq: k + 1 }`.
+     5. The application tier asynchronously updates `account_sessions:{accountId}` (removing `oldSessionId` and adding `newSessionId`) as a decoupled, idempotent step outside the single-slot family Lua transaction.
+     6. The API dispatches the new `refreshToken` cookie containing `replacementRawToken` and returns a fresh 15-minute access token.
 
 4. **Replay Revocation Scoping & Rationale**:
    - **Family-Level Revocation Boundary**: When a replay is detected, the revocation is **strictly scoped to the compromised token family** (`family:{familyId}`).
@@ -353,27 +354,32 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
      - Administrative account suspension or deactivation (`Account.status = 'suspended' | 'deactivated'`).
 
 5. **Concurrency Race Condition Prevention**:
-   - Because `token_lookup:{presentedTokenHash}` is deleted atomically on the very first instruction of the Lua script, **it is impossible for concurrent requests presenting the same token to rotate twice**.
-   - Any concurrent request arriving even 1 millisecond later will find `token_lookup:{presentedTokenHash}` absent and immediately hit the `revoked_token` check, failing safely with replay detection.
+   - Because `token_lookup:{familyId}:{presentedTokenHash}` is deleted atomically on the very first instruction of the Lua script, **it is impossible for concurrent requests presenting the same token to rotate twice**.
+   - Any concurrent request arriving even 1 millisecond later will find `token_lookup:{familyId}:{presentedTokenHash}` absent and immediately hit the `revoked_token` check, failing safely with replay detection.
 
 6. **Cleanup of Expired Session Indexes & Family Records**:
    - **Native Key Expiration**: `token_lookup`, `session`, and `family` records enforce a strict 30-day sliding TTL (`EXPIRE ... 2592000`). If idle, Redis natively evicts them.
    - **Tombstone Expiration**: `revoked_token` keys natively expire after 24 hours. Compromised `family` tombstone records also expire after 24 hours.
-   - **Set Pruning**: The set `account_sessions:{accountId}` is pruned during rotation or login by removing any `sessionId` where `EXISTS session:{sessionId}` is false.
+   - **Set Pruning**: The set `account_sessions:{accountId}` is pruned during rotation or login by removing any `sessionId` where `EXISTS session:{familyId}:{sessionId}` is false (or via lazy eviction when the set is read).
 
 7. **Session Revocation & Lifecycle Cascade**:
-   - **Single Device Logout (`POST /api/v1/auth/logout`)**: Deletes `session:{sessionId}`, deletes `token_lookup:{tokenHash}`, deletes `family:{familyId}`, and removes `sessionId` from `account_sessions:{accountId}`. The browser cookie is cleared (`Max-Age=0`).
+   - **Single Device Logout (`POST /api/v1/auth/logout`)**: Deletes `session:{familyId}:{sessionId}`, deletes `token_lookup:{familyId}:{tokenHash}`, deletes `family:{familyId}`, and removes `sessionId` from `account_sessions:{accountId}`. The browser cookie is cleared (`Max-Age=0`).
    - **Password Reset / Change**: Iterates and deletes all `sessionId`s in `account_sessions:{accountId}`, terminating all existing sessions across all client devices.
    - **Account Suspension / Deactivation**: All sessions in `account_sessions:{accountId}` are immediately purged.
 
 8. **Redis Deployment Topology & Cluster Hash-Slot Constraints**:
    - **Primary Stage A Deployment Topology**: High-Availability **Redis Sentinel (Standalone Primary + Replicas)**. All keys reside within a single primary Redis keyspace. Multi-key Lua scripts execute across arbitrary key names without cluster slot restrictions.
-   - **Redis Cluster Compatibility via Hash Tagging**: In a partitioned Redis Cluster deployment, multi-key commands and Lua scripts throw `CROSSSLOT Keys in request don't hash to the same slot` unless all keys accessed atomically evaluate to the exact same hash slot. To deploy to Redis Cluster, all keys belonging to a session family must utilize a hash tag on `{familyId}`:
-     - `token_lookup:{{familyId}}:{tokenHash}`
-     - `session:{{familyId}}:{sessionId}`
-     - `family:{{familyId}}`
-     - `revoked_token:{{familyId}}:{tokenHash}`
+   - **Redis Cluster Compatibility via Hash Tagging**: In a partitioned Redis Cluster deployment, multi-key commands and Lua scripts throw `CROSSSLOT Keys in request don't hash to the same slot` unless all keys accessed atomically evaluate to the exact same hash slot. To deploy to Redis Cluster, all keys belonging to a session family must utilize a single-bracket hash tag on `{familyId}`:
+     - `token_lookup:{familyId}:{tokenHash}`
+     - `session:{familyId}:{sessionId}`
+     - `family:{familyId}`
+     - `revoked_token:{familyId}:{tokenHash}`
      In this cluster configuration, the opaque client cookie format embeds the family ID prefix (`rt_<familyId>_<64hex>`). The application layer extracts `familyId` before invoking the Lua script, guaranteeing that all keys map to the exact same Redis Cluster node and hash slot.
+   - **Cross-Slot Decoupling for Account-Level Index**:
+     - The account-level index `account_sessions:{accountId}` does **not** share the `{familyId}` hash slot.
+     - Therefore, multi-key Lua scripts in Redis Cluster **never access or mutate `account_sessions:{accountId}`**. Claiming cross-slot atomicity between `{familyId}` and `{accountId}` in Redis Cluster is impossible without global hash-tagging (which would bottleneck all accounts onto one node).
+     - Instead, the Lua script executes single-slot operations strictly on `{familyId}` keys. Updating `account_sessions:{accountId}` is performed by the application tier as a decoupled, idempotent post-script operation.
+     - **Lazy Eviction Guarantee**: If an application worker crashes before pruning `account_sessions:{accountId}`, the stale index entry has **zero security impact**: any request presenting that session is rejected immediately because `token_lookup` and `session` are deleted, and `family:{familyId}.isCompromised = 1`. Any subsequent read or enumeration of `account_sessions:{accountId}` lazily removes dead session IDs.
 
 9. **Failure Behavior & Redis Outage Resilience**:
    - **Fail-Closed on Refresh**: If Redis is unreachable, token refresh operations **fail closed** returning `503 Service Unavailable` (`code: 'SERVICE_UNAVAILABLE'`).
@@ -659,7 +665,8 @@ Every asset progresses through an explicit seven-state lifecycle:
   - Presigned headers enforce exact `Content-Type`, `Content-Length`, and metadata headers (`x-amz-meta-destination-id`, `x-amz-meta-uploader-id`).
 - **Upload Ticket Storage**:
   - Redis key: `upload_ticket:{uploadTicketId}` (TTL: 900s).
-  - Value: `{ uploadTicketId, accountId, purpose, destinationId, objectKey, mimeType, maxSizeBytes, createdAt, expiresAt }`.
+  - Value: `{ uploadTicketId, accountId, purpose, destinationId, objectKey, mimeType, fileSizeBytes, maxSizeBytes, createdAt, expiresAt }`.
+  - Preserves both `fileSizeBytes` (exact authorized size) and `maxSizeBytes` (administrative ceiling for purpose).
 
 #### 9.4.3 Asset Registration & Security Verification
 - Once binary upload to S3/R2 finishes, client invokes the registration endpoint:
@@ -669,16 +676,42 @@ Every asset progresses through an explicit seven-state lifecycle:
 - **Ownership & Entity Integrity**:
   - Backend asserts `ticket.accountId === caller.accountId`.
   - Backend asserts `ticket.destinationId === path.id`.
-- **Object Existence & Header Assertion**: The API issues S3 `HeadObject` on `ticket.objectKey` to verify:
+- **Object Existence & Exact Size Assertions**: The API issues S3 `HeadObject` on `ticket.objectKey` to verify:
   1. Object exists in the quarantine bucket.
-  2. Byte length matches `ticket.fileSizeBytes` and does not exceed the ceiling.
-  3. Stored metadata matches destination and uploader IDs.
+  2. **Exact Size & Ceiling Compliance**: Actual object byte length (`Content-Length`) is validated against both authorized size parameters:
+     - `actualObjectSize === ticket.fileSizeBytes` (matches the exact size declared in the presign request).
+     - `actualObjectSize <= ticket.maxSizeBytes` (does not exceed the maximum allowed ceiling for the purpose).
+     If the object size does not match `ticket.fileSizeBytes` or exceeds `ticket.maxSizeBytes`, registration is immediately rejected with `400 BAD_REQUEST` (`code: 'FILE_SIZE_MISMATCH'`).
+  3. `Content-Type` matches `ticket.mimeType`.
+  4. Stored metadata matches destination and uploader IDs.
 - **Magic Byte Inspection**: Server reads the initial 512 bytes of the quarantine object to verify that the file signature (magic numbers) matches the declared MIME type, rejecting disguised executable binaries.
+- **S3 Version ID & Checksum Capture**:
+  - Server captures S3 `VersionId`, `ETag`, and `ChecksumSHA256` from the `HeadObject` response.
+  - The database asset record is permanently bound to `{ objectKey, versionId, checksumSha256 }`.
 - **Malware Disclaimer & Mandatory Asynchronous Scanning**:
   > [!IMPORTANT]
   > **MIME headers and magic-byte checks alone DO NOT establish that a file is safe.** Disguised polyglots, embedded zero-day exploits, and malicious PDF scripts easily bypass byte-signature checks. Asynchronous antivirus scanning and sandboxed analysis in quarantine are mandatory before an asset is ever promoted to public storage or made accessible to users.
 
-#### 9.4.4 Storage Isolation & Elimination of Arbitrary URL Bypasses
+#### 9.4.4 Immutable Content Verification & Object Replacement Prevention
+To prevent race conditions where a client uses an unexpired presigned `PUT` URL to overwrite an object after registration or during scanning:
+1. **Quarantine Bucket Object Versioning**:
+   - The quarantine bucket (`s3://quarantine.mytravelroad.com/`) mandates **S3 Object Versioning Enabled** (or Cloudflare R2 Object Versioning).
+   - Every `PUT` request generates a cryptographically unique, immutable S3 `VersionId` and checksum.
+2. **Version-Pinned Scanning**:
+   - The asynchronous scanning worker is dispatched with the exact `{ objectKey, versionId, checksumSha256 }`.
+   - The worker reads that exact version: `s3.getObject({ Bucket: quarantineBucket, Key: objectKey, VersionId: versionId })`.
+   - If an attacker issues a subsequent `PUT` to the original presigned URL before its 15-minute expiration, S3 creates a *new*, separate `VersionId`. The scanner continues analyzing the exact registered version, completely isolated from subsequent uploads.
+3. **Version-Pinned Promotion**:
+   - Upon receiving an authenticated clean scan webhook, the promotion worker copies the exact scanned version:
+     `s3.copyObject({ CopySource: `${quarantineBucket}/${objectKey}?versionId=${versionId}`, Bucket: publicBucket, Key: finalKey })`.
+   - The promotion pipeline never references the unversioned object key.
+4. **Rejection of Repeated PUTs & Version Mismatches**:
+   - Any subsequent PUT to the presigned URL creates an unattached, unreferenced S3 version. Because the upload ticket was consumed via atomic `GETDEL`, this new version cannot be registered.
+   - Scanner webhook callbacks must submit the exact `versionId`. If a callback arrives for an obsolete, unknown, or mismatched version, the backend rejects it with `409 Conflict` (`code: 'VERSION_MISMATCH'`) and logs an audit security event.
+5. **Storage Provider Fallback (Non-Versioning Storage)**:
+   - For object stores that lack native versioning, the backend enforces an **atomic isolation step** at registration: the API server immediately executes `s3.copyObject` moving the uploaded object from `quarantine/staging/{objectKey}` to `quarantine/locked/{objectKey}` and deletes the staging key. This severs the presigned URL target; any subsequent PUT to the original presigned URL writes to a severed key that the backend will never read.
+
+#### 9.4.5 Storage Isolation & Elimination of Arbitrary URL Bypasses
 - **No Arbitrary URL Registration**: Clients are strictly forbidden from supplying arbitrary CDN or external URLs (`url`, `thumbnailUrl`, `documentUrl`) in registration payloads. All asset URLs are derived exclusively by the backend from validated server-generated storage keys upon quarantine clearance.
 - **Public vs. Private Storage Boundaries**:
   - Public Assets: Copied to `s3://assets.mytravelroad.com/` only after scan approval. Exposed via global CDN with immutable caching headers.

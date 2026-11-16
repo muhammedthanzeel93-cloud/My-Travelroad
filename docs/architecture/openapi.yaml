@@ -1009,7 +1009,7 @@ paths:
   /admin/destinations/{id}/media:
     post:
       summary: Attach Destination Media
-      description: Uploads or associates media asset with a destination.
+      description: Associates a previously uploaded media asset in quarantine with a destination's gallery using a validated upload ticket, enforcing exact size matching, S3 Object Versioning immutability, and antivirus scanning.
       tags: [Administration]
       operationId: attachDestinationMedia
       security:
@@ -1229,7 +1229,7 @@ paths:
   /admin/verification/{destinationId}/evidence:
     post:
       summary: Submit Verification Evidence
-      description: Attaches a supporting evidentiary document, gazette circular, or field survey.
+      description: Attaches a supporting evidentiary document, gazette circular, or field survey to a destination verification record using a validated upload ticket with S3 Object Versioning immutability.
       tags: [Destination Verification]
       operationId: submitVerificationEvidence
       security:
@@ -2603,7 +2603,7 @@ components:
           example: true
         data:
           type: object
-          required: [uploadTicketId, presignedUrl, objectKey, expiresAt, maxSizeBytes]
+          required: [uploadTicketId, presignedUrl, objectKey, expiresAt, fileSizeBytes, maxSizeBytes]
           properties:
             uploadTicketId:
               type: string
@@ -2620,9 +2620,14 @@ components:
               type: string
               format: date-time
               example: "2026-11-15T16:05:00.000Z"
+            fileSizeBytes:
+              type: integer
+              example: 2450880
+              description: Exact authorized payload size in bytes recorded in the upload ticket.
             maxSizeBytes:
               type: integer
               example: 10485760
+              description: Maximum allowed file size ceiling for the specified purpose.
 
     AttachMediaRequest:
       type: object
@@ -2631,7 +2636,7 @@ components:
         uploadTicketId:
           type: string
           format: uuid
-          description: Presigned upload ticket identifier for S3 quarantine assertion, magic-byte inspection, and antivirus scanning.
+          description: Presigned upload ticket identifier for S3 quarantine assertion, magic-byte inspection, exact size validation, version-pinned asset binding, and antivirus scanning.
         type:
           type: string
           enum: [image, video, panorama_360]
@@ -2819,7 +2824,7 @@ components:
         uploadTicketId:
           type: string
           format: uuid
-          description: Presigned upload ticket identifier for S3 quarantine assertion, magic-byte inspection, and antivirus scanning in private evidence storage.
+          description: Presigned upload ticket identifier for S3 quarantine assertion, magic-byte inspection, exact size validation, and version-pinned storage in private evidence repository.
         evidenceType:
           type: string
           enum:
