@@ -424,7 +424,7 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
      - The browser cookie is cleared (`Max-Age=0`).
    - **Deterministic Atomic Family Revocation Script**:
      To revoke an individual family lineage during account-wide operations without cross-slot violations or wildcard deletions:
-     1. The application pre-reads `family:{familyId}` to resolve the exact `activeTokenHash` and `activeSessionId`.
+     1. The application pre-reads `family:{familyId}` to resolve the exact `activeTokenHash`, `activeSessionId`, and `tokenGeneration`.
         - If `family:{familyId}` does not exist, the family is already expired/revoked; the application proceeds immediately to `SREM account_sessions:{accountId} "{familyId}:{sessionId}"`.
      2. The application constructs the exact same-slot keys and invokes the script:
         - `KEYS[1]`: `family:{familyId}`
@@ -432,8 +432,11 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
         - `KEYS[3]`: `token_lookup:{familyId}:{activeTokenHash}`
         - `ARGV[1]`: `expectedActiveTokenHash`
         - `ARGV[2]`: `expectedActiveSessionId`
+        - `ARGV[3]`: `targetGeneration` (the revocation epoch / `target_generation` of the outbox job)
      3. **Lua Script Execution Logic**:
         - Checks if `KEYS[1]` (`family:{familyId}`) exists. If missing, returns `'ALREADY_REVOKED'`.
+        - **Monotonic Generation Fencing**: Reads `currentGen = tonumber(redis.call('HGET', KEYS[1], 'tokenGeneration') or '0')`.
+          - *If `currentGen >= tonumber(ARGV[3])`*: The family was created or rotated under an equal or newer generation (e.g. concurrent login after revocation committed). Returns `'NEWER_GENERATION_PRESERVED'` without deleting keys.
         - **State Revalidation**: Checks `family.activeTokenHash == ARGV[1]` and `family.activeSessionId == ARGV[2]`.
           - *If Mismatched*: A concurrent token rotation changed the active credentials. The script aborts without mutation and returns `'CONCURRENT_ROTATION_DETECTED'`. The application layer catches this, re-reads `family:{familyId}` to get the latest `activeTokenHash` and `activeSessionId`, and retries revocation.
           - *If Matched*: Atomically deletes `KEYS[2]` (`session`), `KEYS[3]` (`token_lookup`), and `KEYS[1]` (`family`), returning `'REVOKED_SUCCESS'`.
@@ -452,17 +455,19 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
         - The security service writes an ephemeral tombstone to Redis:
           `revoked_accounts:{accountId}` (TTL: 900s / 15 minutes, matching the access token lifespan).
         - **Fast-Path Cache Demarcation**: This key serves strictly as an ephemeral gateway edge cache to filter cached read traffic in sub-millisecond time. It is **never the authoritative revocation guarantee**. Redis unavailability or the expiration of the 15-minute tombstone will never restore validity to stale credentials, because PostgreSQL `token_generation` checks are permanent and authoritative.
-     3. **Phase 3: Enumerate & Revoke Active Families (Redis Shards)**:
-        - The application reads all active session pairs: `members = SMEMBERS account_sessions:{accountId}`.
-        - For each member string `"{familyId}:{sessionId}"`:
-          - Invokes the **Deterministic Atomic Family Revocation Script** against that `{familyId}` shard with state revalidation.
+     3. **Phase 3: Enumerate & Revoke Candidate Families (Redis Shards)**:
+        - The application reads candidate session pairs: `candidateMembers = SMEMBERS account_sessions:{accountId}`.
+        - For each member string `"{familyId}:{sessionId}"` in the candidate snapshot:
+          - Invokes the **Deterministic Atomic Family Revocation Script** against that `{familyId}` shard with generation fencing (`ARGV[3] = targetGeneration`) and state revalidation.
           - If the script returns `'CONCURRENT_ROTATION_DETECTED'`, the application re-reads the updated family state and re-invokes the script until convergence.
-          - Upon receiving `'REVOKED_SUCCESS'` or `'ALREADY_REVOKED'`: the application executes `SREM account_sessions:{accountId} "{familyId}:{sessionId}"`.
+          - Upon receiving `'REVOKED_SUCCESS'` or `'ALREADY_REVOKED'`: the application executes member-specific `SREM account_sessions:{accountId} "{familyId}:{sessionId}"`.
+          - If the script returns `'NEWER_GENERATION_PRESERVED'`: the family belongs to a newer generation ($G \ge targetGeneration$) created by a concurrent login. The application skips `SREM`, preserving this member in `account_sessions:{accountId}`.
           - If a family revocation experiences a transient Redis network failure or timeout, the application executes retry attempts with exponential backoff.
-     4. **Phase 4: Index Cleanup & Outbox Completion**:
-        - The index `account_sessions:{accountId}` is deleted (`DEL account_sessions:{accountId}`) **ONLY AFTER** every constituent family revocation has succeeded (or when `SCARD account_sessions:{accountId} === 0`).
-        - The index is **never deleted upfront**.
-        - Upon index deletion, the outbox job is finalized in PostgreSQL:
+     4. **Phase 4: Race-Safe Member Cleanup & Outbox Completion**:
+        - **Strict Elimination of Blind Index Deletion**: The worker **NEVER** executes `DEL account_sessions:{accountId}` or relies on `SCARD` checks. Index cleanup is purely member-specific via `SREM`.
+        - In Redis, when all members of a Set are removed with `SREM`, Redis automatically and natively purges the Set key from the keyspace.
+        - If a concurrent login added a new session `"{newFamilyId}:{newSessionId}"` via `SADD`, `SREM` only deletes the target stale member, leaving the new member intact and discoverable.
+        - When all candidate members from the snapshot are either revoked and `SREM`'d or identified as newer-generation and preserved, the outbox job is finalized in PostgreSQL:
           ```sql
           UPDATE account_revocation_jobs
           SET status = 'completed',
@@ -488,13 +493,13 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
         - *Recovery*: Recovery worker atomically claims the job, reads `account_sessions:{accountId}`, and proceeds with family revocation.
      3. *Crash midway through family revocation loop*:
         - *Security State*: Revoked families are deleted; unrevoked families remain in Redis but are unusable on presentation because their `tokenGeneration !== account.token_generation`.
-        - *Recovery*: Recovery worker reclaims the expired job, queries remaining members from `account_sessions:{accountId}`, and resumes revoking remaining families.
+        - *Recovery*: Recovery worker reclaims the expired job, queries remaining members from `account_sessions:{accountId}`, and resumes revoking remaining candidate families.
      4. *Crash after family revocation but before SREM*:
         - *Security State*: Family keys in Redis are already deleted.
         - *Recovery*: Recovery worker retries family revocation for that member; Lua script returns `'ALREADY_REVOKED'`; worker executes `SREM` to remove the dead index entry.
-     5. *Crash after all families are revoked but before index deletion*:
-        - *Security State*: All constituent families deleted; index contains 0 members.
-        - *Recovery*: Recovery worker detects `SCARD account_sessions:{accountId} === 0`, issues `DEL account_sessions:{accountId}`, and marks `account_revocation_jobs` as `'completed'`.
+     5. *Crash after all candidate families are revoked but before outbox finalization*:
+        - *Security State*: Stale family keys in Redis are deleted; stale index members are removed via `SREM`. Concurrently created sessions remain intact.
+        - *Recovery*: Recovery worker reclaims the expired job, re-enumerates `account_sessions:{accountId}`, detects all remaining members are newer-generation (or nonexistent), skips `SREM`, and issues the fenced PostgreSQL finalization. Blind `DEL` is never executed.
 
    - **Executable Outbox Worker Claim Protocol with Per-Claim Fencing**:
      Unfinished revocation jobs are discovered, claimed, and executed automatically by background recovery workers via a resilient 4-phase lease protocol with cryptographic per-claim fencing tokens and explicit transaction boundaries:
@@ -525,8 +530,8 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
         - *Transaction Boundary*: This transaction commits immediately upon returning the row. No PostgreSQL row locks or transactions are held open while performing network I/O against external Redis shards.
         - *Fencing Token Binding*: The returned `lease_token` is captured as `:claimToken`. It is never reused across claims or retries.
         - *Mutual Exclusion*: `FOR UPDATE SKIP LOCKED` guarantees exactly one worker acquires the row lock; concurrent workers skip locked rows without blocking. The immediate update of `lease_owner`, `lease_token`, and `lease_expires_at` cements ownership across transaction boundaries.
-     2. **Phase B: Pre-Flight Ownership Assertion & External Redis Revocation (Outside DB Transaction)**:
-        - Before executing each unit of external work (each family revocation on a Redis shard and corresponding `SREM` index mutation), the worker verifies in PostgreSQL that its lease remains active and unexpired:
+     2. **Phase B: Pre-Flight Ownership Check & Redis Operation Boundary (Outside DB Transaction)**:
+        - *Optimistic Client-Side Pre-Flight Check*: Before executing each unit of external work, the worker executes a lightweight check in PostgreSQL:
           ```sql
           SELECT 1
           FROM account_revocation_jobs
@@ -536,7 +541,12 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
             AND status = 'processing'
             AND lease_expires_at > NOW();
           ```
-          If this assertion returns 0 rows, the worker immediately aborts external processing (`STALE_CLAIM_ABORT`). This guarantees that a worker stalling between heartbeats cannot execute Redis operations if its lease expired or was superseded.
+          If this assertion returns 0 rows, the worker immediately aborts external processing (`STALE_CLAIM_ABORT`).
+        - *TOCTOU Window & Redis Operation Boundary Guarantee*: A client-side database pre-flight query cannot provide hard atomicity across the network to Redis. If Worker 1 validates its lease in PostgreSQL, experiences a 35-second process stall (e.g. GC pause or network queue delay) before issuing its Redis command, Worker 2 may reclaim the job in PostgreSQL. Worker 1 then resumes and sends its Redis command.
+          Authoritative cross-system safety is therefore enforced directly at the Redis operation boundary through two strict invariants:
+          1. **Monotonic Generation Fencing Inside Lua**: The Deterministic Atomic Family Revocation Script checks `currentGen < targetGen`. If an older worker attempts to revoke a newer family, the Lua script returns `'NEWER_GENERATION_PRESERVED'` without mutating keys.
+          2. **Immutable Identifier Targeting & CSPRNG Entropy**: Revocation commands are strictly restricted to the exact, immutable `familyId` and `sessionId` UUIDs captured from the initial candidate snapshot. A stale worker can never guess or target a newly minted session family because new families use 256-bit CSPRNG UUIDs.
+          3. **Same-Slot Lua Idempotency**: If Worker 2 already revoked the family, Worker 1's delayed script executes against `{familyId}`, detects `EXISTS == 0`, and immediately returns `'ALREADY_REVOKED'` without corrupting any state.
         - *Periodic Fenced Heartbeat*: For large session sets, every 10 seconds (well before the 30-second `lease_expires_at` window lapses), the worker sends a heartbeat in a discrete transaction:
           ```sql
           UPDATE account_revocation_jobs
@@ -551,7 +561,7 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
           ```
         - *Fencing / Stolen Lease Detection*: If the heartbeat update returns 0 affected rows (indicating the lease expired and was seized by another worker with a newer `lease_token`), the current worker immediately halts its Redis loop. It must never attempt to revive an expired or stolen claim.
      3. **Phase C: Fenced Job Finalization (Transaction 2 — Discrete Commit)**:
-        - Upon revoking all constituent families and deleting `account_sessions:{accountId}`, the worker finalizes the job in PostgreSQL:
+        - Upon revoking all constituent candidate families and pruning stale index members via `SREM`, the worker finalizes the job in PostgreSQL:
           ```sql
           UPDATE account_revocation_jobs
           SET status = 'completed',
@@ -567,15 +577,46 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
             AND lease_expires_at > NOW();
           ```
         - If this update affects 0 rows, the worker does not report completion; the job was already reclaimed or timed out.
-     4. **Phase D: Crash Reclamation & Strict Stale Worker Fencing**:
-        - *Stalled Worker Scenario*: Suppose Worker 1 stalls or network partitions. At $t_0 + 30\text{s}$, its lease expires.
-        - *Reclamation by Worker 2*: At $t_0 + 31\text{s}$, Worker 2 polls the outbox, discovers the expired job, claims it, and writes `lease_owner = :workerId_2`, `lease_token = :claimToken_2` (`Token_B`), and a fresh `lease_expires_at`.
-        - *Stale Worker 1 Eviction*: When Worker 1 resumes:
-          - If Worker 1 attempts pre-flight validation before its next Redis call: the check `WHERE lease_token = Token_A` returns 0 rows $\rightarrow$ Worker 1 immediately terminates.
-          - If Worker 1 attempts a heartbeat renewal: `WHERE lease_token = Token_A` returns 0 rows $\rightarrow$ Worker 1 halts immediately.
-          - If Worker 1 attempts finalization: `WHERE lease_token = Token_A` returns 0 rows $\rightarrow$ Worker 1 fails closed.
-        - *Redis Idempotency Defense-in-Depth*: In addition to PostgreSQL fencing, Redis family revocation Lua scripts return `'ALREADY_REVOKED'` if already deleted, and `SREM` is idempotent. Concurrent or overlapping execution cannot corrupt Redis session state.
-        - An operation is **never marked complete** while any family remains unresolved. Stale or missing Redis index members are pruned lazily without ever treating the index as an authorization credential.
+     4. **Phase D: Concurrency Walkthroughs & Strict Fencing Guarantees**:
+
+        - **Scenario A — Stale Worker Resumes After Redis Pre-Flight**:
+          ```text
+          Timeline of Scenario A:
+          t=0s:  Worker 1 (lease_token=Token_A) executes pre-flight check for Family F1 -> Returns 1 row (Valid).
+          t=1s:  Worker 1 experiences a 35-second process stall (GC pause / network stall).
+          t=30s: Worker 1's lease expires in PostgreSQL.
+          t=31s: Worker 2 polls outbox, executes atomic claim CTE, acquires lease_token=Token_B.
+          t=32s: Worker 2 executes family revocation script on {F1} (currentGen=1 < targetGen=2) -> Deletes F1 -> Returns 'REVOKED_SUCCESS'.
+          t=33s: Worker 2 executes SREM account_sessions:{accountId} "{F1}:{S1}".
+          t=36s: Worker 1 resumes and sends its delayed Redis command for {F1}.
+          ```
+          *Why Worker 1 Cannot Mutate Newer Session State*:
+          1. **Exact Key Targeting**: Worker 1's Redis command targets `KEYS[1] = family:{F1}`. If the user concurrently logged in and minted a new session family $F_{new}$, $F_{new}$ resides under a distinct 256-bit CSPRNG UUID and distinct hash slot. Worker 1's script has zero reference to $F_{new}$.
+          2. **Idempotent Shard Lua Guard**: Shard `{F1}` executes the Lua script. Because Worker 2 already deleted `family:{F1}`, the script checks `EXISTS KEYS[1] == 0` and immediately returns `'ALREADY_REVOKED'` without executing any `DEL` commands or altering state.
+          3. **Idempotent Member SREM**: Worker 1's delayed `SREM account_sessions:{accountId} "{F1}:{S1}"` specifies literal `"{F1}:{S1}"`, which was already removed. `SREM` returns 0 and does not touch any concurrently added member `"{F_new}:{S_new}"`.
+          4. **Fenced Finalization & Heartbeat Eviction**: When Worker 1 attempts its next heartbeat or finalization, its query `WHERE lease_token = Token_A` returns 0 rows, forcing Worker 1 to immediately terminate.
+
+        - **Scenario B — New Login During Account Index Cleanup**:
+          ```text
+          Timeline of Scenario B:
+          t=0s:  Revocation worker enumerates candidate sessions: candidateMembers = ["{F1}:{S1}"].
+          t=1s:  User logs in concurrently:
+                 - PostgreSQL transaction reads accounts.token_generation = 2.
+                 - Mints new family F_new with tokenGeneration = 2.
+                 - Creates Redis keys family:{F_new}, session:{F_new}:{S_new}, token_lookup:{F_new}:{tokenHash}.
+                 - Executes SADD account_sessions:{accountId} "{F_new}:{S_new}".
+                 - account_sessions now contains ["{F1}:{S1}", "{F_new}:{S_new}"].
+          t=2s:  Worker executes family revocation script on {F1} (targetGen=2) -> Deleted.
+          t=3s:  Worker executes member-specific SREM account_sessions:{accountId} "{F1}:{S1}".
+          t=4s:  Worker finishes its candidate snapshot ["{F1}:{S1}"].
+          t=5s:  Worker executes fenced PostgreSQL finalization (status='completed').
+          ```
+          *Why New Session Entry Is Retained and Discoverable*:
+          1. **No Blind Set Deletion**: The worker **never** executes `DEL account_sessions:{accountId}` or `SCARD` checks.
+          2. **Member-Specific Pruning**: `SREM` operates strictly on the specific string `"{F1}:{S1}"`. The concurrent member `"{F_new}:{S_new}"` is never passed to `SREM` and remains undisturbed in `account_sessions:{accountId}`.
+          3. **Discoverability**: Subsequent session listings, enumerations, or administrative audits reading `account_sessions:{accountId}` immediately discover `"{F_new}:{S_new}"`.
+          4. **Generation Isolation**: If a worker ever inspects $F_{new}$, `family.tokenGeneration == 2` ($2 \ge targetGen$) causes the Lua script to return `'NEWER_GENERATION_PRESERVED'` and skip `SREM`.
+        - An operation is **never marked complete** while any candidate family remains unresolved. Stale or missing Redis index members are pruned lazily without ever treating the index as an authorization credential.
 
    - **Prospective Stage A+ Schema Migration Requirement**:
      To support the durable revocation generation and transactional outbox worker lease table without modifying the approved 15-table Stage A database schema, the following schema additions are formally specified for the Stage A+ database migration cycle:
@@ -682,7 +723,7 @@ The platform handles email verification and self-service password reset using cr
    - **Password Reset Cascade**: When a password reset token is consumed:
      1. Atomically in PostgreSQL: new password hash is computed using Argon2id and updated in `account_security_credentials`, failed login counters (`failedLoginAttempts`, `lockedUntil`) are cleared, `accounts.token_generation` is incremented establishing the durable revocation barrier, a durable outbox job is created in `account_revocation_jobs` (`reason: 'password_reset'`), and an immutable audit log entry is recorded (`action: 'account.password_reset'`).
      2. Ephemeral fast-path cache tombstone `revoked_accounts:{accountId}` is written to Redis (15-min TTL / 900s).
-     3. The application enumerates all active `"{familyId}:{sessionId}"` pairs in `account_sessions:{accountId}`, executes the deterministic atomic family revocation script with state revalidation on each respective `{familyId}` shard, removes each pair via `SREM`, and deletes `account_sessions:{accountId}` only after all constituent family revocations have succeeded, revoking all active sessions across all devices.
+     3. The application enumerates all candidate `"{familyId}:{sessionId}"` pairs in `account_sessions:{accountId}`, executes the deterministic atomic family revocation script with generation fencing and state revalidation on each respective `{familyId}` shard, and prunes each stale pair via member-specific `SREM`. Blind `DEL` of `account_sessions` is strictly eliminated; Redis natively reclaims the Set key when all constituent members are pruned, while any concurrently added sessions from new logins remain fully preserved.
      4. The outbox job in PostgreSQL is marked `'completed'`.
 
 4. **Relational Alternative Design (Future Migration Proposal)**:
