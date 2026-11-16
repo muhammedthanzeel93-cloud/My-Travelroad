@@ -1092,13 +1092,13 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ### 35. Request Presigned Upload URL
 - **Endpoint**: `POST /api/v1/admin/uploads/presign`
-- **Purpose**: Authorizes and issues a short-lived (15-minute) presigned SigV4 PUT URL allowing administrative actors to upload binary assets directly to cloud object storage (S3/R2) without server buffering.
+- **Purpose**: Authorizes and issues a short-lived (15-minute) presigned SigV4 PUT URL allowing administrative actors to upload binary assets directly to cloud object storage (S3/R2) quarantine without server buffering.
 - **Authentication**: Bearer Access Token (`contributor`, `curator`, `super_admin`).
 - **Authorization Scoping**:
-  - `purpose: 'destination_media'`: Allowed for `contributor`, `curator`, `super_admin`. Key routed to quarantine bucket: `quarantine/media/{destinationId}/{assetUuid}.{ext}`.
-  - `purpose: 'verification_evidence'`: Strictly restricted to `curator` and `super_admin`. Key routed to private evidence bucket: `evidence/{destinationId}/{assetUuid}.{ext}`.
+  - `purpose: 'destination_media'`: Allowed for `contributor`, `curator`, `super_admin`. Key routed to quarantine prefix: `quarantine/destinations/{destinationId}/media/{assetUuid}.{ext}`.
+  - `purpose: 'verification_evidence'`: Strictly restricted to `curator` and `super_admin`. Key routed to evidence quarantine prefix: `quarantine/destinations/{destinationId}/evidence/{evidenceUuid}.{ext}`.
 - **Security & Integrity Controls**:
-  - Generates a Redis upload ticket (`upload_ticket:{ticketId}`) storing `{ accountId, destinationId, purpose, mimeType, maxSizeBytes, s3Key, createdAt, expiresAt }` with 15-minute TTL.
+  - Generates a single-use Redis upload ticket (`upload_ticket:{uploadTicketId}`) storing `{ uploadTicketId, accountId, destinationId, purpose, mimeType, maxSizeBytes, objectKey, createdAt, expiresAt }` with 15-minute TTL.
   - Subsequent registration endpoints assert the ticket, perform S3 `HeadObject` checks, and verify file magic bytes.
   - Rate limited to 20 requests / 15 minutes per account.
 - **Request Body**:
@@ -1117,9 +1117,8 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
   "success": true,
   "data": {
     "uploadTicketId": "ticket-uuid-001",
-    "presignedUrl": "https://s3.ap-south-1.amazonaws.com/quarantine.mytravelroad.com/quarantine/media/550e8400-e29b-41d4-a716-446655440003/asset-uuid-002.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&...",
-    "objectKey": "quarantine/media/550e8400-e29b-41d4-a716-446655440003/asset-uuid-002.jpg",
-    "publicAssetUrl": "https://assets.mytravelroad.com/destinations/adyanpara/waterfall.jpg",
+    "presignedUrl": "https://s3.ap-south-1.amazonaws.com/quarantine.mytravelroad.com/quarantine/destinations/550e8400-e29b-41d4-a716-446655440003/media/asset-uuid-002.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&...",
+    "objectKey": "quarantine/destinations/550e8400-e29b-41d4-a716-446655440003/media/asset-uuid-002.jpg",
     "expiresAt": "2026-11-15T16:05:00.000Z",
     "maxSizeBytes": 10485760
   }
@@ -1135,10 +1134,10 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ### 36. Attach Destination Media Asset
 - **Endpoint**: `POST /api/v1/admin/destinations/:id/media`
-- **Purpose**: Associates a previously uploaded media asset with a destination's gallery.
-- **Upload Workflow**: Validates the upload using either an authorized `uploadTicketId` (verifying S3 `HeadObject` metadata and magic byte headers against the quarantine bucket) or a direct approved CDN URL (`^https://assets\.mytravelroad\.com/.*$`). Prevents server SSRF and ensures no unvetted binaries enter the system.
+- **Purpose**: Associates a previously uploaded media asset in quarantine with a destination's gallery.
+- **Upload Workflow & Verification**: Requires an authorized `uploadTicketId`. The API executes atomic `GETDEL` on the upload ticket, asserts caller ownership (`ticket.accountId === caller.accountId`), verifies S3 `HeadObject` metadata and byte lengths, and inspects initial 512 bytes for file signature magic numbers. The asset is registered with initial status `pending_review`. Upon asynchronous antivirus scan clearance, the asset is promoted to public storage and CDN URLs are populated.
+- **Security Boundary**: Clients cannot supply arbitrary CDN or external URLs. Registration strictly references server-generated, validated upload tickets.
 - **Validation Rules**:
-  - `url` & `thumbnailUrl`: Must match approved CDN domain (`^https://assets\.mytravelroad\.com/.*$`).
   - Allowed MIME: `image/jpeg`, `image/png`, `image/webp`. File size ceiling: 10MB.
 - **Authentication**: Bearer Access Token (`contributor`, `curator`, `super_admin`).
 - **Request Body**:
@@ -1146,8 +1145,6 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 {
   "uploadTicketId": "ticket-uuid-001",
   "type": "image",
-  "url": "https://assets.mytravelroad.com/destinations/adyanpara/waterfall.jpg",
-  "thumbnailUrl": "https://assets.mytravelroad.com/destinations/adyanpara/waterfall_thumb.jpg",
   "altText": "Adyanpara waterfalls cascading down rocky hillside",
   "caption": "Cascading waterfall during peak post-monsoon volume.",
   "attribution": "DTPC Malappuram",
@@ -1163,8 +1160,9 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
   "data": {
     "id": "media-uuid-002",
     "destinationId": "550e8400-e29b-41d4-a716-446655440003",
-    "status": "approved",
+    "status": "pending_review",
     "isCover": true,
+    "displayOrder": 1,
     "createdAt": "2026-11-15T15:50:00.000Z"
   }
 }
@@ -1343,7 +1341,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 ### 43. Submit Verification Evidence
 - **Endpoint**: `POST /api/v1/admin/verification/:destinationId/evidence`
 - **Purpose**: Attaches documentary proof (gazette circular, field survey, photo) substantiating a fact.
-- **Confidentiality & Storage Security**: Evidence documents are internal, confidential to `curator` and `super_admin`, and never exposed on public endpoints. Uploads are direct-to-S3/R2 with presigned ticket validation (`uploadTicketId`) targeting private storage without public CDN mapping. Allowed MIME: `image/*`, `application/pdf`. Max size: 25MB.
+- **Confidentiality & Storage Security**: Evidence documents are internal, confidential to `curator` and `super_admin`, and never exposed on public endpoints. Uploads are direct-to-S3/R2 with mandatory presigned ticket validation (`uploadTicketId`) targeting private storage without public CDN mapping. Allowed MIME: `image/*`, `application/pdf`. Max size: 25MB. Clients cannot supply arbitrary document URLs; internal storage references are derived directly from the validated upload ticket.
 - **Authentication**: Bearer Access Token (`curator`, `super_admin`).
 - **Request Body**:
 ```json
@@ -1352,7 +1350,6 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
   "evidenceType": "government_gazette",
   "sourceOrganization": "Kerala Forest & Wildlife Department",
   "officialReferenceCode": "GO(Rt)No.412/2026/F&WLD",
-  "documentUrl": "https://assets.mytravelroad.com/evidence/go_412_2026.pdf",
   "notes": "Official gazette notification confirming ecotourism visiting hours and monsoon advisory."
 }
 ```

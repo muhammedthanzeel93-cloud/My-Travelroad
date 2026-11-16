@@ -2612,14 +2612,10 @@ components:
             presignedUrl:
               type: string
               format: uri
-              example: https://s3.ap-south-1.amazonaws.com/quarantine.mytravelroad.com/quarantine/media/550e8400-e29b-41d4-a716-446655440003/asset-uuid-002.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&...
+              example: https://s3.ap-south-1.amazonaws.com/quarantine.mytravelroad.com/quarantine/destinations/550e8400-e29b-41d4-a716-446655440003/media/asset-uuid-002.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&...
             objectKey:
               type: string
-              example: quarantine/media/550e8400-e29b-41d4-a716-446655440003/asset-uuid-002.jpg
-            publicAssetUrl:
-              type: string
-              format: uri
-              example: https://assets.mytravelroad.com/destinations/adyanpara/waterfall.jpg
+              example: quarantine/destinations/550e8400-e29b-41d4-a716-446655440003/media/asset-uuid-002.jpg
             expiresAt:
               type: string
               format: date-time
@@ -2630,21 +2626,15 @@ components:
 
     AttachMediaRequest:
       type: object
-      required: [type, url, altText, license]
+      required: [uploadTicketId, type, altText, license]
       properties:
         uploadTicketId:
           type: string
           format: uuid
-          nullable: true
-          description: Presigned upload ticket identifier for S3 object assertion and magic-byte validation.
+          description: Presigned upload ticket identifier for S3 quarantine assertion, magic-byte inspection, and antivirus scanning.
         type:
           type: string
           enum: [image, video, panorama_360]
-        url:
-          type: string
-        thumbnailUrl:
-          type: string
-          nullable: true
         altText:
           type: string
         caption:
@@ -2824,13 +2814,12 @@ components:
 
     SubmitEvidenceRequest:
       type: object
-      required: [evidenceType, sourceOrganization]
+      required: [uploadTicketId, evidenceType, sourceOrganization]
       properties:
         uploadTicketId:
           type: string
           format: uuid
-          nullable: true
-          description: Presigned upload ticket identifier for S3 object assertion and magic-byte validation in private evidence bucket.
+          description: Presigned upload ticket identifier for S3 quarantine assertion, magic-byte inspection, and antivirus scanning in private evidence storage.
         evidenceType:
           type: string
           enum:
@@ -2847,8 +2836,6 @@ components:
         officialReferenceCode:
           type: string
           maxLength: 100
-        documentUrl:
-          type: string
         notes:
           type: string
 

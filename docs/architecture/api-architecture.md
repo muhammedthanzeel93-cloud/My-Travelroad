@@ -114,6 +114,7 @@ The `error` object inside a failed envelope guarantees four standard properties:
 | `VALIDATION_FAILED` | `422` | Zod schema validation failed on one or more payload fields. |
 | `COORDINATE_PRIVACY_RESTRICTED` | `403` | Caller attempted to query raw coordinates of an ecologically restricted destination. |
 | `RATE_LIMIT_EXCEEDED` | `429` | Request volume exceeded the allocated rate limit tier. |
+| `AUDIT_LOG_FAILURE` | `500` | Privileged action aborted because the mandatory immutable audit log could not be committed. Exact coordinates and privileged data are suppressed. |
 | `INTERNAL_SERVER_ERROR` | `500` | Unhandled server exception. Details are redacted from client response. |
 
 ### 3.3 Security Redaction & Information Sanitization
@@ -326,7 +327,7 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
      4. **Lua Script Execution Logic**:
         - **Lookup Validation**: Script checks if `token_lookup:{presentedTokenHash}` exists.
           - *If Missing*: Script checks `revoked_token:{presentedTokenHash}`.
-            - *If Found in Revoked Tombstone*: **REPLAY ATTACK DETECTED**. The Lua script immediately marks `family:{familyId}.isCompromised = 1`, deletes `family:{familyId}`, and deletes all session keys listed in `account_sessions:{accountId}`. The script returns error `TOKEN_REPLAY_DETECTED`.
+            - *If Found in Revoked Tombstone*: **REPLAY ATTACK DETECTED**. The Lua script identifies the compromised family from the tombstone (`familyId`), marks `family:{familyId}.isCompromised = 1`, deletes `token_lookup:{family.activeTokenHash}` so no further tokens in this family can be refreshed, deletes `session:{family.activeSessionId}`, and removes `family.activeSessionId` from `account_sessions:{accountId}`. The family record `family:{familyId}` is retained with a **24-hour TTL as an audit tombstone**. The script returns error `TOKEN_REPLAY_DETECTED`.
             - *If Not Found Anywhere*: Script returns error `TOKEN_INVALID_OR_EXPIRED`.
           - *If Present*:
             - Parse `{ familyId, sessionId: oldSessionId, accountId }`.
@@ -343,21 +344,38 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
               8. Return success payload: `{ familyId, accountId, rotationSeq: k + 1 }`.
      5. The API dispatches the new `refreshToken` cookie containing `replacementRawToken` and returns a fresh 15-minute access token.
 
-4. **Concurrency Race Condition Prevention**:
-   - Because `token_lookup:{presentedTokenHash}` is deleted atomically on the very first instruction of the Lua script, **it is impossible for concurrent requests presenting the same token to rotate twice**.
-   - Any concurrent request arriving even 1 millisecond later will find `token_lookup:{presentedTokenHash}` absent and immediately hit the `revoked_token` check, failing with replay detection.
+4. **Replay Revocation Scoping & Rationale**:
+   - **Family-Level Revocation Boundary**: When a replay is detected, the revocation is **strictly scoped to the compromised token family** (`family:{familyId}`).
+   - **Rationale (Preventing Cross-Device Collateral Invalidation)**: Ordinary transient network retries, browser background duplicate refreshes, or minor local storage desynchronizations on one device (e.g., traveler's laptop) must **never** abruptly terminate independent active sessions on other user devices (e.g., mobile phone, tablet). An attacker intercepting an old token from one device compromises only that specific token family.
+   - **Global Account-Wide Revocation**: Purging all active sessions in `account_sessions:{accountId}` is strictly reserved for deliberate, high-privilege security events:
+     - Explicit user request to log out of all devices (`POST /api/v1/auth/logout?allDevices=true`).
+     - Self-service or administrative password reset (`POST /api/v1/auth/reset-password`).
+     - Administrative account suspension or deactivation (`Account.status = 'suspended' | 'deactivated'`).
 
-5. **Cleanup of Expired Session Indexes & Family Records**:
+5. **Concurrency Race Condition Prevention**:
+   - Because `token_lookup:{presentedTokenHash}` is deleted atomically on the very first instruction of the Lua script, **it is impossible for concurrent requests presenting the same token to rotate twice**.
+   - Any concurrent request arriving even 1 millisecond later will find `token_lookup:{presentedTokenHash}` absent and immediately hit the `revoked_token` check, failing safely with replay detection.
+
+6. **Cleanup of Expired Session Indexes & Family Records**:
    - **Native Key Expiration**: `token_lookup`, `session`, and `family` records enforce a strict 30-day sliding TTL (`EXPIRE ... 2592000`). If idle, Redis natively evicts them.
-   - **Tombstone Expiration**: `revoked_token` keys natively expire after 24 hours.
+   - **Tombstone Expiration**: `revoked_token` keys natively expire after 24 hours. Compromised `family` tombstone records also expire after 24 hours.
    - **Set Pruning**: The set `account_sessions:{accountId}` is pruned during rotation or login by removing any `sessionId` where `EXISTS session:{sessionId}` is false.
 
-6. **Session Revocation & Lifecycle Cascade**:
-   - **Logout (`POST /api/v1/auth/logout`)**: Deletes `session:{sessionId}`, deletes `token_lookup:{tokenHash}`, and removes `sessionId` from `account_sessions:{accountId}`. The browser cookie is cleared (`Max-Age=0`).
+7. **Session Revocation & Lifecycle Cascade**:
+   - **Single Device Logout (`POST /api/v1/auth/logout`)**: Deletes `session:{sessionId}`, deletes `token_lookup:{tokenHash}`, deletes `family:{familyId}`, and removes `sessionId` from `account_sessions:{accountId}`. The browser cookie is cleared (`Max-Age=0`).
    - **Password Reset / Change**: Iterates and deletes all `sessionId`s in `account_sessions:{accountId}`, terminating all existing sessions across all client devices.
    - **Account Suspension / Deactivation**: All sessions in `account_sessions:{accountId}` are immediately purged.
 
-7. **Failure Behavior & Redis Outage Resilience**:
+8. **Redis Deployment Topology & Cluster Hash-Slot Constraints**:
+   - **Primary Stage A Deployment Topology**: High-Availability **Redis Sentinel (Standalone Primary + Replicas)**. All keys reside within a single primary Redis keyspace. Multi-key Lua scripts execute across arbitrary key names without cluster slot restrictions.
+   - **Redis Cluster Compatibility via Hash Tagging**: In a partitioned Redis Cluster deployment, multi-key commands and Lua scripts throw `CROSSSLOT Keys in request don't hash to the same slot` unless all keys accessed atomically evaluate to the exact same hash slot. To deploy to Redis Cluster, all keys belonging to a session family must utilize a hash tag on `{familyId}`:
+     - `token_lookup:{{familyId}}:{tokenHash}`
+     - `session:{{familyId}}:{sessionId}`
+     - `family:{{familyId}}`
+     - `revoked_token:{{familyId}}:{tokenHash}`
+     In this cluster configuration, the opaque client cookie format embeds the family ID prefix (`rt_<familyId>_<64hex>`). The application layer extracts `familyId` before invoking the Lua script, guaranteeing that all keys map to the exact same Redis Cluster node and hash slot.
+
+9. **Failure Behavior & Redis Outage Resilience**:
    - **Fail-Closed on Refresh**: If Redis is unreachable, token refresh operations **fail closed** returning `503 Service Unavailable` (`code: 'SERVICE_UNAVAILABLE'`).
    - **Database Status Override**: If Redis is degraded or down and an administrator suspends or deactivates an account, PostgreSQL `accounts.status` governs access. Because all privileged and mutating operations execute an active live database status query, compromised accounts are blocked immediately regardless of Redis status.
 
@@ -581,7 +599,7 @@ flowchart TD
   - To support editorial fact verification and ecological perimeter monitoring, authorized callers with role `curator` or `super_admin` can access unmasked exact coordinates and sensitivity metadata through the administrative endpoint `GET /api/v1/admin/destinations/:id`.
   - **Audit Ledger Insertion**: Every read of this privileged endpoint writes an immutable business event to `audit_logs` (`actorAccountId: callerUuid`, `actorRole: curator|super_admin`, `action: 'destination.privileged_location_read'`, `entityType: 'destination'`, `entityId: destinationUuid`, `state_before: null`, `state_after: null`).
   - **Telemetry Separation & Sanitization**: Operational telemetry (`ipAddress`, `userAgent`, `contextNotes: "Privileged coordinate inspection"`, `retentionExpiresAt: 90 days`) is written to `audit_log_telemetry`. **Raw GPS coordinates, PostGIS geometry, altitude, accuracy, and sensitive evidence files are STRICTLY PROHIBITED from telemetry snapshots.**
-  - **Fail-Closed Transactional Behavior**: The audit record creation and privileged coordinate read execute within the same atomic database transaction. If the audit log insertion cannot be committed, the transaction rolls back, and the API **fails closed** with `500 Internal Server Error` (`code: 'INTERNAL_SERVER_ERROR'`), returning NO coordinates. Public-facing endpoints continue strictly enforcing the `v_public_destination_locations` view.
+  - **Fail-Closed Transactional Behavior**: The audit record creation and privileged coordinate read execute within the same atomic database transaction. If the audit log insertion cannot be committed, the transaction rolls back, and the API **fails closed** with `500 Internal Server Error` (`code: 'AUDIT_LOG_FAILURE'`), returning NO coordinates. Public-facing endpoints continue strictly enforcing the `v_public_destination_locations` view.
 
 ### 9.2 Audit Logging Invariants
 Every state-modifying administrative action (`POST`, `PUT`, `PATCH`, `DELETE` under `/api/v1/admin/*`) and privileged coordinate read generates an immutable server-side `AuditLog` entry matching the domain `AdminAction` taxonomy (`destination.create`, `destination.publish`, `destination.opening_hours_update`, `destination.privileged_location_read`, `verification.field_verify`, etc.).
@@ -602,59 +620,70 @@ Every state-modifying administrative action (`POST`, `PUT`, `PATCH`, `DELETE` un
   - `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`
 
 ### 9.4 Complete Media & Evidence Upload Authorization Workflow
-To prevent server memory exhaustion, resource denial-of-service, and Server-Side Request Forgery (SSRF) vulnerabilities, the platform enforces an end-to-end authorized direct-upload architecture:
+To prevent server memory exhaustion, resource denial-of-service, and Server-Side Request Forgery (SSRF) vulnerabilities, the platform enforces an end-to-end authorized direct-upload architecture governed by strict state transitions and automated security controls.
 
-1. **Upload Authorization API (`POST /api/v1/admin/uploads/presign`)**:
-   - Clients never upload binaries directly through the Next.js API server.
-   - Before uploading, the client requests an authorized upload ticket and presigned S3/R2 URL.
-   - **Role & Target Validation**:
-     - `contributor`: Allowed only for `targetType: 'destination_media'` on draft destinations. Forbidden from uploading verification evidence.
-     - `curator` & `super_admin`: Authorized for both `destination_media` and `verification_evidence`.
-     - Validates that `targetId` exists in the database.
-   - **MIME & Size Ceilings**:
-     - Destination media: Restricted to `image/jpeg`, `image/png`, `image/webp`. File size ceiling: **10 MB** ($10,485,760\text{ bytes}$).
-     - Verification evidence: Restricted to `image/jpeg`, `image/png`, `image/webp`, and `application/pdf`. File size ceiling: **25 MB** ($26,214,400\text{ bytes}$).
-   - **Server-Generated Bound Keys**:
-     - Client filenames are discarded to prevent directory traversal (`../`).
-     - Storage keys are bound to the target entity:
-       - Media: `quarantine/destinations/{destinationId}/media/{uuid}.{ext}`
-       - Evidence: `private/verification/{verificationId}/evidence/{uuid}.pdf`
-   - **Presigned URL Policy**:
-     - Generates a signed AWS SigV4 `PUT` URL with a strict **15-minute expiration** ($900\text{ seconds}$).
-     - Presigned policy enforces exact `Content-Type`, `Content-Length`, and metadata headers (`x-amz-meta-target-id`, `x-amz-meta-uploader-id`).
-   - **Upload Ticket Tracking**:
-     - The server stores an upload ticket in Redis:
-       `upload_ticket:{ticketId} = { targetType, targetId, storageKey, uploaderId, mimeType, fileSizeBytes }` (TTL: 900s).
+#### 9.4.1 Canonical Upload Lifecycle States
+Every asset progresses through an explicit seven-state lifecycle:
+1. **`authorized`**: Client requests upload authorization via `POST /api/v1/admin/uploads/presign`. Server verifies caller RBAC permissions, generates a bound storage key, issues a signed AWS SigV4 `PUT` URL (15-minute expiry), and creates a single-use Redis upload ticket (`upload_ticket:{uploadTicketId}`).
+2. **`uploaded`**: Client uploads the binary payload directly to cloud storage (S3/R2) via HTTP `PUT`. The object lands in an isolated, private quarantine prefix.
+3. **`quarantined`**: Client calls the registration endpoint (`POST /admin/destinations/:id/media` or `POST /admin/verification/:destinationId/evidence`) presenting `uploadTicketId`. The API server consumes the ticket atomically (`GETDEL`), asserts caller ownership and entity binding, verifies S3 `HeadObject` metadata, and inspects the initial 512 bytes for file signature magic numbers. The asset is persisted in PostgreSQL with initial status `quarantined` (mapped to `pending_review` in database). The object remains strictly inaccessible: stored in a non-public quarantine bucket with zero CDN mapping.
+4. **`scanning`**: S3 `ObjectCreated` event triggers an asynchronous background malware analysis pipeline (ClamAV daemon or AWS GuardDuty malware protection container). The scanner updates the asset internal state to `scanning`.
+5. **`approved`**: If the malware scan passes cleanly, the scanning worker posts a cryptographically authenticated callback (HMAC-SHA256 signature using `SCANNER_WEBHOOK_SECRET`) to the internal API:
+   - **Destination Media (`purpose: 'destination_media'`)**: Asset is promoted (copied) from quarantine to the public CDN storage bucket (`s3://assets.mytravelroad.com/destinations/{destinationId}/media/{assetUuid}.webp`), optimized responsive thumbnails are generated, and the public asset URL is activated. Database record is updated to `status: 'approved'`.
+   - **Verification Evidence (`purpose: 'verification_evidence'`)**: Asset is moved to the private, non-CDN evidence bucket (`s3://evidence.mytravelroad.com/destinations/{destinationId}/evidence/{evidenceUuid}.{ext}`). Database record is updated to `status: 'approved'`. **Evidence is NEVER exposed to public CDN endpoints**; authorized curators and super administrators access evidence exclusively via short-lived (15-minute) presigned `GET` URLs generated on demand.
+6. **`rejected`**: If malware is detected, analysis times out (> 120 seconds), or file signature verification fails:
+   - The quarantine object is immediately deleted from cloud storage (or moved to an isolated security forensic vault).
+   - Database record is marked `status: 'rejected'`.
+   - A security incident event is recorded in `audit_logs` (`action: 'media.upload_rejected_malware'`).
+7. **`expired`**: Cloud storage lifecycle rules automatically delete any unattached objects in the `quarantine/` prefix older than **24 hours**. Redis upload tickets expire automatically after 15 minutes.
 
-2. **Direct Binary Upload**:
-   - The client performs an HTTP `PUT` directly to the cloud object storage bucket (`uploadUrl`) with the exact `Content-Type` and binary payload.
+#### 9.4.2 Upload Authorization API (`POST /api/v1/admin/uploads/presign`)
+- Clients never upload binaries through the Next.js API server.
+- **Canonical Request Fields**:
+  - `purpose`: String enum (`"destination_media"` or `"verification_evidence"`).
+  - `destinationId`: UUID of the destination entity to which this asset belongs. For verification evidence, the backend verifies the destination exists and resolves its linked 1:1 `DestinationVerification` container (`verification_id`).
+  - `filename`: Original client filename (used exclusively to extract file extension; path and basename are discarded to eliminate directory traversal vulnerabilities).
+  - `mimeType`: Declared MIME type, validated against strict allowlists.
+  - `fileSizeBytes`: Declared byte length, checked against size ceilings.
+- **Role Scoping**:
+  - `contributor`: Authorized only for `purpose: 'destination_media'`. Barred from requesting evidence upload presigns (`403 FORBIDDEN_ACCESS`).
+  - `curator` & `super_admin`: Authorized for both `destination_media` and `verification_evidence`.
+- **MIME & Size Ceilings**:
+  - `destination_media`: Allowed MIME: `image/jpeg`, `image/png`, `image/webp`. File size ceiling: **10 MB** ($10,485,760\text{ bytes}$).
+  - `verification_evidence`: Allowed MIME: `image/jpeg`, `image/png`, `image/webp`, `application/pdf`. File size ceiling: **25 MB** ($26,214,400\text{ bytes}$).
+- **Server-Generated Bound Keys**:
+  - Destination Media: `quarantine/destinations/{destinationId}/media/{assetUuid}.{ext}`
+  - Verification Evidence: `quarantine/destinations/{destinationId}/evidence/{evidenceUuid}.{ext}`
+- **Presigned URL Policy**:
+  - Signed AWS SigV4 `PUT` URL with a strict **15-minute expiration** ($900\text{ seconds}$).
+  - Presigned headers enforce exact `Content-Type`, `Content-Length`, and metadata headers (`x-amz-meta-destination-id`, `x-amz-meta-uploader-id`).
+- **Upload Ticket Storage**:
+  - Redis key: `upload_ticket:{uploadTicketId}` (TTL: 900s).
+  - Value: `{ uploadTicketId, accountId, purpose, destinationId, objectKey, mimeType, maxSizeBytes, createdAt, expiresAt }`.
 
-3. **Asset Registration & Server-Side Verification**:
-   - Once the binary upload finishes, the client invokes the registration endpoint:
-     - `POST /api/v1/admin/destinations/:id/media` (or `POST /api/v1/admin/verification/:destinationId/evidence`), passing `uploadTicketId` and metadata.
-   - **Atomic Ticket Consumption**: The API consumes `upload_ticket:{ticketId}` atomically via Redis `GETDEL`.
-   - **HeadObject Validation**: The API issues `HeadObject` to cloud storage to verify:
-     1. The object exists in the storage bucket.
-     2. `Content-Length` matches the ticket and is within the size ceiling.
-     3. Metadata matches the target destination/verification entity and authenticated uploader.
-   - **Magic Byte Inspection**: The server reads the initial 512 bytes of the object to verify the actual binary magic numbers match the declared MIME type, preventing disguised executable files.
+#### 9.4.3 Asset Registration & Security Verification
+- Once binary upload to S3/R2 finishes, client invokes the registration endpoint:
+  - `POST /api/v1/admin/destinations/:id/media` (for destination media)
+  - `POST /api/v1/admin/verification/:destinationId/evidence` (for verification evidence)
+- **Single-Use Ticket Consumption**: The API executes atomic Redis `GETDEL upload_ticket:{uploadTicketId}`. If the ticket is missing or has expired, registration is rejected with `400 BAD_REQUEST` (`code: 'INVALID_OR_EXPIRED_UPLOAD_TICKET'`). A ticket can never be reused.
+- **Ownership & Entity Integrity**:
+  - Backend asserts `ticket.accountId === caller.accountId`.
+  - Backend asserts `ticket.destinationId === path.id`.
+- **Object Existence & Header Assertion**: The API issues S3 `HeadObject` on `ticket.objectKey` to verify:
+  1. Object exists in the quarantine bucket.
+  2. Byte length matches `ticket.fileSizeBytes` and does not exceed the ceiling.
+  3. Stored metadata matches destination and uploader IDs.
+- **Magic Byte Inspection**: Server reads the initial 512 bytes of the quarantine object to verify that the file signature (magic numbers) matches the declared MIME type, rejecting disguised executable binaries.
+- **Malware Disclaimer & Mandatory Asynchronous Scanning**:
+  > [!IMPORTANT]
+  > **MIME headers and magic-byte checks alone DO NOT establish that a file is safe.** Disguised polyglots, embedded zero-day exploits, and malicious PDF scripts easily bypass byte-signature checks. Asynchronous antivirus scanning and sandboxed analysis in quarantine are mandatory before an asset is ever promoted to public storage or made accessible to users.
 
-4. **Malware Quarantine & Public Promotion Pipeline**:
-   - Newly uploaded media begins in the `quarantine/` prefix with `status: 'pending_review'`.
-   - An asynchronous malware scanning worker (AWS GuardDuty or ClamAV daemon) inspects the object.
-   - Once verified clean, the worker promotes the file from `quarantine/` to `public/destinations/{id}/media/{uuid}.webp`, generates optimized responsive thumbnails, and exposes it via CDN (`https://assets.mytravelroad.com/...`).
-
-5. **Evidence Confidentiality Boundary**:
-   - Verification evidence (`verification_evidence`) contains sensitive official certificates and surveyor field notes.
-   - Evidence resides permanently in a **private, non-CDN bucket** (`private/verification/{id}/evidence/...`).
-   - Evidence documents are **never exposed** in public tourist endpoints. Curators and super administrators access evidence exclusively via short-lived, authenticated presigned download URLs.
-
-6. **Abandoned Upload Cleanup**:
-   - Cloud storage lifecycle policies automatically abort incomplete multipart uploads and delete unattached objects in the `quarantine/` prefix after **24 hours**.
-
-7. **Anti-SSRF & Domain Whitelisting**:
-   - The backend API **never fetches arbitrary remote URLs** supplied in client payloads.
-   - Asset registration strictly references server-validated storage tickets and keys.
+#### 9.4.4 Storage Isolation & Elimination of Arbitrary URL Bypasses
+- **No Arbitrary URL Registration**: Clients are strictly forbidden from supplying arbitrary CDN or external URLs (`url`, `thumbnailUrl`, `documentUrl`) in registration payloads. All asset URLs are derived exclusively by the backend from validated server-generated storage keys upon quarantine clearance.
+- **Public vs. Private Storage Boundaries**:
+  - Public Assets: Copied to `s3://assets.mytravelroad.com/` only after scan approval. Exposed via global CDN with immutable caching headers.
+  - Private Evidence: Resides permanently in `s3://evidence.mytravelroad.com/` with zero public CDN routing. Access requires short-lived presigned GET URLs generated only for authorized administrative sessions.
+- **Abandoned Upload Auto-Cleanup**: Cloud storage lifecycle rules purge unattached quarantine objects after **24 hours**. Expired Redis tickets auto-delete after 15 minutes.
 
 ---
 

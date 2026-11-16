@@ -14,23 +14,34 @@ This document defines the authoritative access control matrix for all **Stage A*
 
 ---
 
-## 2. Actor Tiers & Role Hierarchy
+## 2. Actor Tiers & Discrete Capability Domains
 
 ```mermaid
-graph TD
-    Public[Public Visitor / Unauthenticated]
-    Traveler[Authenticated Tourist: traveler]
-    Contributor[Community Contributor: contributor]
-    Curator[Fact Curator: curator]
-    Moderator[Safety Moderator: moderator]
-    SuperAdmin[Super Administrator: super_admin]
+graph LR
+    subgraph Discrete_Roles["Stage A Discrete User Roles (No Inheritance)"]
+        R_Public["Public Visitor<br/>(Unauthenticated)"]
+        R_Traveler["traveler<br/>(Tourist Profile, Bookmarks)"]
+        R_Contributor["contributor<br/>(Draft Destinations, Upload Media)"]
+        R_Curator["curator<br/>(Fact Verification, Evidence, Review Queue)"]
+        R_Moderator["moderator<br/>(Safety Flags, User Suppression)"]
+        R_Admin["super_admin<br/>(Publish/Archive, Taxonomy, RBAC, Ledger)"]
+    end
 
-    Public --> Traveler
-    Traveler --> Contributor
-    Contributor --> Curator
-    Curator --> SuperAdmin
-    Traveler --> Moderator
-    Moderator --> SuperAdmin
+    subgraph Capabilities["Discrete Capability Boundaries"]
+        C_Browse["Public Browsing & Proximity Search"]
+        C_Traveler["Personal Profile & Bookmarks"]
+        C_Draft["Draft Creation & Media Staging"]
+        C_Curate["Fact Auditing, Evidence & Queue Triage"]
+        C_Moderate["Safety & Moderation Telemetry"]
+        C_Govern["Lifecycle Publication & Platform Governance"]
+    end
+
+    R_Public --> C_Browse
+    R_Traveler --> C_Traveler
+    R_Contributor --> C_Draft
+    R_Curator --> C_Curate
+    R_Moderator --> C_Moderate
+    R_Admin --> C_Govern
 ```
 
 | Actor Tier | Role Code | Account Classification | Core Responsibilities & Capabilities |
