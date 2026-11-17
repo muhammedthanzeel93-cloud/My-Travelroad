@@ -66,3 +66,9 @@ export {
   getRefreshTokenCookieOptions,
   getClearRefreshTokenCookieOptions,
 } from "./cookie";
+
+// Authenticated Principal & Request Types (Task 10.3)
+export {
+  type AuthenticatedPrincipal,
+  type AuthenticatedRequest,
+} from "./auth.types";

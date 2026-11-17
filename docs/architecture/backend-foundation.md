@@ -338,8 +338,70 @@ The authentication module (`src/server/auth/`) establishes reusable cryptographi
   - Redis connection lifecycle, cluster client initialization, and session state persistence (`session:{familyId}:{sessionId}`, `family:{familyId}`).
   - Redis Lua scripts for atomic refresh rotation and replay revocation.
   - HTTP authentication endpoints (`/api/v1/auth/register`, `/api/v1/auth/login`, `/api/v1/auth/refresh`, `/api/v1/auth/logout`).
-  - Authorization middleware (`authenticateBearer`, `requireRole`, `requireEmailVerified`).
 - **Stage A Revocation & Token Generation Semantics**:
   - The Stage A database uses `accounts` and `account_security_credentials`. It does **not** contain a `token_generation` column.
   - In Stage A, durable invalidation (such as on password change or admin intervention) is evaluated against `AccountSecurityCredential.passwordChangedAt` and live `Account.status` checks (`active` vs `suspended`/`deactivated`).
   - The `gen` integer claim is included in the access token contract per `api-architecture.md` Section 6.2 and is strictly verified at runtime as an integer ($\ge 1$). However, **it is purely a validated compatibility claim and does NOT function as an active revocation mechanism in Stage A**. Connecting `gen` to a durable database increment counter is deferred to a future architecture stage when database schema changes are formally scheduled.
+
+---
+
+## 12. Authentication & Role Authorization Middleware Foundation
+
+The middleware layer (`src/server/middleware/`) provides reusable, modular Express middleware enforcing server-side identity verification, discrete role authorization, email verification gating, and lifecycle status checks:
+
+### 12.1 Authentication Middleware (`authenticate`, `createAuthenticateMiddleware`)
+- **Protocol**: Reads HTTP `Authorization: Bearer <token>` header. Rejects missing, non-Bearer, or empty tokens with `401 UnauthorizedError(ErrorCode.AUTHENTICATION_REQUIRED)`.
+- **Token Verification**: Calls the verified `verifyAccessToken()` primitive. Rejects expired (`TOKEN_EXPIRED`) or corrupted/tampered (`TOKEN_INVALID`) JWTs. Never implements a secondary verification path.
+- **Authoritative Database Synchronization**:
+  - Queries PostgreSQL via Prisma `account.findUnique` selecting only minimal operational fields: `id`, `email`, `emailVerified`, `status`, `type`, `role`, and `securityCredentials.passwordChangedAt`.
+  - Never retrieves password hashes, salts, MFA secrets, or sensitive credentials.
+  - Nonexistent accounts are rejected with `401 UnauthorizedError(ErrorCode.AUTHENTICATION_REQUIRED)`.
+- **System Account Defense**: Accounts with `type = 'system'` (including Root System Account `00000000-0000-4000-8000-000000000001`) are programmatic and barred from authenticating via interactive APIs, rejecting with `403 ForbiddenError(ErrorCode.FORBIDDEN_ACCESS)`.
+- **Status Gating at Authentication Barrier**:
+  - Suspended accounts (`status = 'suspended'`) are rejected immediately with `403 ForbiddenError(ErrorCode.ACCOUNT_SUSPENDED)`.
+  - Deactivated accounts (`status = 'deactivated'`) are rejected immediately with `403 ForbiddenError(ErrorCode.ACCOUNT_DEACTIVATED)`.
+  - Unverified accounts (`status = 'pending_verification'`) successfully authenticate to allow access to initial self-service endpoints (`/auth/me`, `/auth/verify-email`, `/auth/resend-verification`), while downstream mutation guards enforce email verification.
+- **Stage A Password Change Invalidation**:
+  - If `AccountSecurityCredential.passwordChangedAt` is populated, the middleware verifies that the token's issued-at timestamp is not earlier than the password change timestamp (`claims.iat >= Math.floor(passwordChangedAt.getTime() / 1000)`).
+  - Tokens issued prior to a password change are rejected with `401 UnauthorizedError(ErrorCode.TOKEN_INVALID)`.
+- **Fail-Closed Reliability**:
+  - Database failures or connection drops fail closed, logging the error and returning `503 ServiceUnavailableError(ErrorCode.SERVICE_UNAVAILABLE)` without leaking database connection strings or internals.
+- **Dependency Injection**:
+  - Provides `createAuthenticateMiddleware(dbClient)` allowing unit tests to inject mock Prisma clients with complete test isolation.
+
+### 12.2 Authenticated Principal (`AuthenticatedPrincipal`)
+- Upon successful authentication and database resolution, the middleware attaches a typed `AuthenticatedPrincipal` to `req.auth` (and alias `req.user`):
+  ```ts
+  export interface AuthenticatedPrincipal {
+    accountId: AccountId;       // Nominal UUIDv4
+    email: string;              // Authoritative PostgreSQL email
+    role: UserRole;             // Authoritative PostgreSQL role
+    accountType: AccountType;   // Authoritative PostgreSQL classification
+    accountStatus: AccountStatus; // Authoritative PostgreSQL lifecycle status
+    emailVerified: boolean;     // Authoritative PostgreSQL email verification flag
+  }
+  ```
+- **Authoritative Overrides**: Authoritative role, type, status, and verification state are always derived from PostgreSQL, preventing stale or forged JWT claims from exercising unauthorized privileges.
+
+### 12.3 Discrete Role Enforcement (`requireRole`)
+- **Discrete RBAC (Zero Implicit Inheritance)**:
+  - Permissions are discrete. Roles (`traveler`, `contributor`, `curator`, `moderator`, `super_admin`) do **not** inherit capabilities from other roles.
+  - `super_admin` is not automatically authorized unless `super_admin` is explicitly passed in `allowedRoles`.
+- **Factory-Time Validation**: Validates that `allowedRoles` contains at least one approved `UserRole` using `isValidUserRole()`. Invalid or empty configurations fail fast at initialization.
+- **Runtime Assertion**:
+  - If unauthenticated (`!req.auth`): returns `401 UnauthorizedError(ErrorCode.AUTHENTICATION_REQUIRED)`.
+  - If caller's role is not in `allowedRoles`: returns `403 ForbiddenError(ErrorCode.FORBIDDEN_ACCESS)`.
+
+### 12.4 Email Verification Enforcement (`requireEmailVerified`)
+- Restricts protected mutation operations (such as destination drafting, media upload, or bookmarking) to accounts with `req.auth.emailVerified === true`.
+- Unverified accounts are rejected with `403 ForbiddenError(ErrorCode.EMAIL_VERIFICATION_REQUIRED)`.
+
+### 12.5 Account Status Enforcement (`requireAccountStatus`, `requireActiveAccount`)
+- Provides reusable middleware asserting acceptable lifecycle statuses:
+  - `requireAccountStatus(...allowedStatuses)`: Restricts routes to specified statuses.
+  - `requireActiveAccount`: Convenience shorthand asserting `req.auth.accountStatus === 'active'`.
+- Pending verification accounts attempting active-only operations receive `403 ForbiddenError(ErrorCode.EMAIL_VERIFICATION_REQUIRED)`.
+
+### 12.6 Explicit Separation of Authentication and Authorization
+- **Authentication (`authenticate`)**: Verifies cryptographic token validity, confirms account existence in PostgreSQL, asserts baseline non-suspension and password freshness, and attaches the `AuthenticatedPrincipal`.
+- **Authorization (`requireRole`, `requireEmailVerified`, `requireAccountStatus`)**: Asserts capability permissions, email verification, and status eligibility. Downstream route handlers remain clean and focused on business logic.
