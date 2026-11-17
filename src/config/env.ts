@@ -125,6 +125,11 @@ export const envSchema = z.object({
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
     .default("info"),
+  JWT_SECRET: z
+    .string()
+    .min(32, "JWT_SECRET must be at least 32 characters long for 256-bit entropy"),
+  JWT_ISSUER: z.string().default("https://mytravelroad.com"),
+  JWT_AUDIENCE: z.string().default("https://mytravelroad.com"),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -159,6 +164,10 @@ function getActiveEnv(): Env {
   if (isTest && !sourceEnv.DATABASE_URL) {
     sourceEnv.DATABASE_URL =
       "postgresql://postgres:postgres@localhost:5432/mytravelroad_test?schema=public";
+  }
+  if (isTest && !sourceEnv.JWT_SECRET) {
+    sourceEnv.JWT_SECRET =
+      "default_test_jwt_secret_at_least_32_characters_long!";
   }
   return validateEnv(sourceEnv);
 }

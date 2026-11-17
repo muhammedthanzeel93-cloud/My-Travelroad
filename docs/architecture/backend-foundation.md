@@ -32,7 +32,11 @@ src/
 │   ├── auth/
 │   │   ├── index.ts            # Auth module barrel exports
 │   │   ├── password.ts         # Argon2id password hashing, verification & re-hash checking
-│   │   └── password.schema.ts  # Zod password validation schemas (creation & login)
+│   │   ├── password.schema.ts  # Zod password validation schemas (creation & login)
+│   │   ├── token.types.ts      # Auth token, claims, session metadata & cookie types
+│   │   ├── jwt.ts              # HS256 JWT access token signing & verification (jose)
+│   │   ├── refresh-token.ts    # CSPRNG refresh token generation (rt_<familyId>_<entropy>), SHA-256 hashing & validation
+│   │   └── cookie.ts           # Centralized auth cookie options (HttpOnly, Secure, SameSite=Strict, Path=/api/v1/auth)
 │   ├── errors/
 │   │   ├── app-error.ts        # AppError base class & specialized error subclasses
 │   │   └── error-codes.ts      # Machine-readable error code constants
@@ -65,6 +69,9 @@ Environment variables are validated on application startup via `src/config/env.t
 | `DIRECT_URL` | `string` | *(Optional)* | Direct PostgreSQL connection string bypassing poolers. |
 | `CORS_ALLOWED_ORIGINS` | `string` (comma-separated) | `http://localhost:3000` | Allowed origins for cross-origin requests. Every entry must strictly conform to RFC 6454 HTTP(S) serialized origins (`http://host[:port]` or `https://host[:port]`). Wildcards (`*`), credentials, paths, query strings, fragments, and empty entries are rejected at startup with generic, non-reflecting error messages to prevent credential leakage. |
 | `LOG_LEVEL` | `enum('fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent')` | `info` | Active Pino log level threshold. |
+| `JWT_SECRET` | `string (min 32 chars)` | *(Required)* | Secret key used to sign and verify HMAC-SHA256 (`HS256`) access tokens. Must contain at least 32 characters (256 bits) of entropy. |
+| `JWT_ISSUER` | `string` | `https://mytravelroad.com` | Expected JWT issuer claim (`iss`). |
+| `JWT_AUDIENCE` | `string` | `https://mytravelroad.com` | Expected JWT audience claim (`aud`). |
 
 ---
 
@@ -252,6 +259,8 @@ The test suite is built on **Vitest** and **Supertest** located under `tests/ser
 - `request-id.test.ts`: Validates generation of UUIDv4, validation/preservation of valid incoming headers, sanitization of malicious headers, and header echo.
 - `logging.test.ts`: Validates Pino redaction rules against authorization headers, cookies, passwords, and tokens; tests actual `requestLoggerMiddleware` query-stripping behavior; asserts on `PRISMA_LOG_CONFIG` to guarantee query logging suppression.
 - `auth/password.test.ts`: Validates Argon2id MCF generation, constant-time verification, rejection of incorrect passwords, unique CSPRNG salts, safe malformed hash handling, `needsRehash` parameter detection, and Zod password complexity rules.
+- `auth/jwt.test.ts`: Validates HMAC-SHA256 access token signing, claim preservation, algorithm-confusion attack rejection (`alg: none`, `alg: HS512`), expiration enforcement, and issuer/audience verification.
+- `auth/refresh-token.test.ts`: Validates CSPRNG opaque refresh token generation (`rt_<uuid>_<64hex>`), timing-safe SHA-256 hash verification, family ID extraction, format regex checking, and centralized cookie options generation.
 
 ---
 
@@ -273,7 +282,63 @@ The authentication module (`src/server/auth/`) provides reusable cryptographic u
 2. **Safe Error Handling**: `verifyPassword` catches malformed hashes, corrupted salts, and internal library exceptions, returning `false` safely without exposing internal details or crashing.
 3. **Lazy Re-Hashing**: `needsRehash` checks whether stored MCF strings match current target cost parameters, enabling zero-downtime parameter upgrades during authenticated logins.
 4. **Password Input Policy (Zod & Unicode Code-Point Semantics)**:
-   - Password lengths are strictly evaluated in **Unicode code points** (`countCodePoints(str)` via `[...str].length`), correctly accommodating supplementary characters (e.g. emoji, astral symbols) spanning surrogate pairs.
+   - Password lengths are strictly evaluated in **Unicode code points** (`countCodePoints(str)` via `Array.from(str).length`), correctly accommodating supplementary characters (e.g. emoji, astral symbols) spanning surrogate pairs.
    - The 72-character maximum threshold is an **application-level API policy** established for payload bounding and DoS mitigation, distinct from Argon2id's maximum supported input length (which natively supports inputs up to $2^{32}-1$ bytes).
    - `passwordCreationSchema`: 8–72 Unicode code points, $\ge 1$ uppercase ASCII letter, $\ge 1$ lowercase ASCII letter, $\ge 1$ numeric digit. Whitespace is strictly preserved without silent trimming.
    - `loginPasswordSchema`: 1–72 Unicode code points, non-empty string. Both schemas and the hashing boundary enforce identical 72-code-point boundaries.
+
+---
+
+## 11. Authentication Token & Session Security Foundation
+
+The token and session security module (`src/server/auth/`) establishes reusable primitives for stateless access verification, stateful refresh rotation, and centralized cookie management:
+
+### 11.1 Access Token Architecture (JWT)
+- **Signing Algorithm**: HMAC-SHA256 (`HS256`) via `jose` library.
+- **Key Derivation**: Sourced from `env.JWT_SECRET` (minimum 32 characters / 256 bits of entropy).
+- **Lifetime**: 15 minutes (`900` seconds).
+- **Algorithm Pinning & Confusion Defense**: Both signing and verification pin strictly to `HS256` (`algorithms: ["HS256"]`). Tokens signed with `none`, `RS256`, `HS384`, or `HS512` are rejected.
+- **Payload & Claims**:
+  - `sub`: User UUIDv4 (Subject)
+  - `role`: Canonical role (`traveler`, `agency_admin`, `agency_agent`, `super_admin`)
+  - `email`: User primary email
+  - `emailVerified`: Boolean verification status
+  - `type`: Account classification (`individual`, `business`)
+  - `status`: Account status (`active`, `suspended`, `pending_verification`, `archived`)
+  - `gen`: Token generation sequence counter (`number`)
+  - `iat`: Issued-at Unix timestamp (seconds)
+  - `exp`: Expiration Unix timestamp (seconds, `iat + 900`)
+  - `iss`: Issuer URI (`env.JWT_ISSUER`, default `https://mytravelroad.com`)
+  - `aud`: Audience URI (`env.JWT_AUDIENCE`, default `https://mytravelroad.com`)
+- **Error Handling**: Missing, expired, malformed, or invalid tokens throw `UnauthorizedError` with canonical error codes (`TOKEN_EXPIRED`, `TOKEN_INVALID`), preventing secret exposure.
+
+### 11.2 Refresh Token Architecture
+- **Format**: Structured opaque string: `rt_<familyId>_<entropy>`
+  - `familyId`: UUIDv4 routing shard key. Contains zero user, role, or authorization data.
+  - `entropy`: 32 bytes of cryptographically secure random bytes generated via `crypto.randomBytes(32)` formatted as a 64-character lowercase hex string (256 bits entropy).
+  - Validated via regex: `^rt_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}_[0-9a-f]{64}$`.
+- **Storage & Hashing**:
+  - Refresh tokens are **never stored in plaintext** in any storage tier.
+  - The server computes a SHA-256 hex digest (`hashRefreshToken(token)`).
+  - Storage verification uses constant-time comparison via `crypto.timingSafeEqual` (`verifyRefreshTokenHash(token, hash)`).
+- **Lifetime**: 30 days (`2592000` seconds).
+- **Rotation & Replay Detection**:
+  - Every token refresh issues a new refresh token within the same `familyId` and invalidates the previous hash.
+  - If an expired, already-rotated, or invalid refresh token is presented, replay detection triggers: the entire token family is immediately revoked, defeating token hijacking.
+
+### 11.3 Centralized Cookie Configuration
+- **Cookie Name**: `refreshToken`
+- **Path**: Restricted strictly to `/api/v1/auth` (preventing transmission on general API requests or static assets).
+- **HttpOnly**: `true` (prohibiting JavaScript access and mitigating XSS token theft).
+- **Secure**: `true` in production (`env.NODE_ENV === "production"`); `false` in development/test.
+- **SameSite**: `Strict` (defending against Cross-Site Request Forgery).
+- **MaxAge**: 30 days (`30 * 24 * 60 * 60 * 1000` ms) on token issuance; `0` on logout or session clearing.
+
+### 11.4 Ephemeral & Durable Storage Partitioning
+- **Redis (Ephemeral Session State)**:
+  - Stores active family sessions (`session:{familyId}`) and refresh token hashes with a 30-day TTL.
+  - Stores account-wide revocation generation markers (`user:revocations:{userId}`).
+  - **Failure Mode**: Fail-closed posture (`REDIS_FAIL_MODE=fail_closed`). If Redis is unavailable or partitioned, authentication verification operations reject requests to prevent split-brain authorization.
+- **PostgreSQL (Durable Source of Truth)**:
+  - Stores persistent account status, role, verified email state, and `token_generation` counter on the `users` table.
+  - Survives complete Redis cluster flushing or restarts.
