@@ -1,5 +1,11 @@
 ﻿import { PrismaClient, Prisma } from "@prisma/client";
 
+/**
+ * Explicit Prisma Client log levels.
+ * Restricts logging strictly to errors and warnings to prevent sensitive query parameters from leaking.
+ */
+export const PRISMA_LOG_CONFIG: Prisma.LogLevel[] = ["error", "warn"];
+
 declare global {
   // eslint-disable-next-line no-var
   var prisma: PrismaClient | undefined;
@@ -8,7 +14,7 @@ declare global {
 export const prisma =
   globalThis.prisma ??
   new PrismaClient({
-    log: ["error", "warn"],
+    log: PRISMA_LOG_CONFIG,
   });
 
 if (process.env.NODE_ENV !== "production") {

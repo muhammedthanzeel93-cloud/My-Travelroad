@@ -4,51 +4,62 @@
  */
 
 import { Request, Response, NextFunction } from "express";
-import { logger } from "../../config/logger";
+import { Logger } from "pino";
+import { logger as defaultLogger } from "../../config/logger";
 
-export function requestLoggerMiddleware(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): void {
-  const startTime = Date.now();
-  req.log = logger.child({ requestId: req.id });
+/**
+ * Factory function creating request logging middleware with an injectable Logger.
+ * Facilitates isolated testing while defaulting to the application's root logger.
+ */
+export function createRequestLoggerMiddleware(customLogger?: Logger) {
+  const activeLogger = customLogger ?? defaultLogger;
 
-  // Extract pathname only — strictly strip query strings to prevent sensitive query parameters from leaking into logs
-  const rawUrl = req.originalUrl || req.url || "/";
-  const pathname = rawUrl.split("?")[0] || "/";
+  return function requestLoggerMiddleware(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): void {
+    const startTime = Date.now();
+    req.log = activeLogger.child({ requestId: req.id });
 
-  // Log incoming request at debug level
-  req.log.debug(
-    {
-      method: req.method,
-      path: pathname,
-      ip: req.ip,
-      userAgent: req.headers["user-agent"],
-    },
-    "Incoming request"
-  );
+    // Extract pathname only — strictly strip query strings to prevent sensitive query parameters from leaking into logs
+    const rawUrl = req.originalUrl || req.url || "/";
+    const pathname = rawUrl.split("?")[0] || "/";
 
-  // Hook response completion
-  res.on("finish", () => {
-    const duration = Date.now() - startTime;
-    const statusCode = res.statusCode;
+    // Log incoming request at debug level
+    req.log.debug(
+      {
+        method: req.method,
+        path: pathname,
+        ip: req.ip,
+        userAgent: req.headers["user-agent"],
+      },
+      "Incoming request"
+    );
 
-    const logData = {
-      method: req.method,
-      path: pathname,
-      statusCode,
-      durationMs: duration,
-    };
+    // Hook response completion
+    res.on("finish", () => {
+      const duration = Date.now() - startTime;
+      const statusCode = res.statusCode;
 
-    if (statusCode >= 500) {
-      req.log.error(logData, "Request completed with server error");
-    } else if (statusCode >= 400) {
-      req.log.warn(logData, "Request completed with client error");
-    } else {
-      req.log.info(logData, "Request completed");
-    }
-  });
+      const logData = {
+        method: req.method,
+        path: pathname,
+        statusCode,
+        durationMs: duration,
+      };
 
-  next();
+      if (statusCode >= 500) {
+        req.log.error(logData, "Request completed with server error");
+      } else if (statusCode >= 400) {
+        req.log.warn(logData, "Request completed with client error");
+      } else {
+        req.log.info(logData, "Request completed");
+      }
+    });
+
+    next();
+  };
 }
+
+export const requestLoggerMiddleware = createRequestLoggerMiddleware();

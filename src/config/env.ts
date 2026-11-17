@@ -82,27 +82,36 @@ export const envSchema = z.object({
     .string()
     .default("http://localhost:3000")
     .transform((val, ctx) => {
-      const origins = val
-        .split(",")
-        .map((origin) => origin.trim())
-        .filter(Boolean);
+      const rawEntries = val.split(",").map((origin) => origin.trim());
 
-      if (origins.length === 0) {
+      if (
+        rawEntries.length === 0 ||
+        (rawEntries.length === 1 && rawEntries[0] === "")
+      ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message:
-            "CORS_ALLOWED_ORIGINS must contain at least one valid HTTP(S) origin",
+            "CORS_ALLOWED_ORIGINS must contain at least one valid HTTP(S) origin.",
+        });
+        return [];
+      }
+
+      if (rawEntries.some((entry) => entry.length === 0)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "CORS_ALLOWED_ORIGINS contains an empty origin entry.",
         });
         return [];
       }
 
       const validatedOrigins: string[] = [];
 
-      for (const origin of origins) {
+      for (const origin of rawEntries) {
         if (!isValidHttpOrigin(origin)) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
-            message: `Invalid CORS origin '${origin}'. Every entry must be a valid HTTP(S) origin without wildcards, paths, query parameters, fragments, or credentials.`,
+            message:
+              "CORS_ALLOWED_ORIGINS contains an invalid HTTP(S) origin entry.",
           });
           return [];
         }

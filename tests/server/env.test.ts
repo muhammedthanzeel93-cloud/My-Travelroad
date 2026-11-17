@@ -79,23 +79,114 @@ describe("Environment Configuration & Validation", () => {
     const base = { DATABASE_URL: "postgresql://localhost:5432/db" };
 
     // Wildcard
-    expect(() => validateEnv({ ...base, CORS_ALLOWED_ORIGINS: "*" })).toThrowError(/Invalid CORS origin/);
-    expect(() => validateEnv({ ...base, CORS_ALLOWED_ORIGINS: "http://localhost:3000, *" })).toThrowError(/Invalid CORS origin/);
+    expect(() =>
+      validateEnv({ ...base, CORS_ALLOWED_ORIGINS: "*" })
+    ).toThrowError(/CORS_ALLOWED_ORIGINS contains an invalid HTTP\(S\) origin entry/);
+    expect(() =>
+      validateEnv({ ...base, CORS_ALLOWED_ORIGINS: "http://localhost:3000, *" })
+    ).toThrowError(/CORS_ALLOWED_ORIGINS contains an invalid HTTP\(S\) origin entry/);
 
     // Path
-    expect(() => validateEnv({ ...base, CORS_ALLOWED_ORIGINS: "https://example.com/api" })).toThrowError(/Invalid CORS origin/);
+    expect(() =>
+      validateEnv({ ...base, CORS_ALLOWED_ORIGINS: "https://example.com/api" })
+    ).toThrowError(/CORS_ALLOWED_ORIGINS contains an invalid HTTP\(S\) origin entry/);
 
     // Credentials
-    expect(() => validateEnv({ ...base, CORS_ALLOWED_ORIGINS: "https://admin:secret@domain.com" })).toThrowError(/Invalid CORS origin/);
+    expect(() =>
+      validateEnv({
+        ...base,
+        CORS_ALLOWED_ORIGINS: "https://admin:secret@domain.com",
+      })
+    ).toThrowError(/CORS_ALLOWED_ORIGINS contains an invalid HTTP\(S\) origin entry/);
 
     // Query string
-    expect(() => validateEnv({ ...base, CORS_ALLOWED_ORIGINS: "http://localhost:3000?token=123" })).toThrowError(/Invalid CORS origin/);
+    expect(() =>
+      validateEnv({
+        ...base,
+        CORS_ALLOWED_ORIGINS: "http://localhost:3000?token=123",
+      })
+    ).toThrowError(/CORS_ALLOWED_ORIGINS contains an invalid HTTP\(S\) origin entry/);
 
     // Fragment
-    expect(() => validateEnv({ ...base, CORS_ALLOWED_ORIGINS: "http://localhost:3000#admin" })).toThrowError(/Invalid CORS origin/);
+    expect(() =>
+      validateEnv({
+        ...base,
+        CORS_ALLOWED_ORIGINS: "http://localhost:3000#admin",
+      })
+    ).toThrowError(/CORS_ALLOWED_ORIGINS contains an invalid HTTP\(S\) origin entry/);
 
     // Malformed
-    expect(() => validateEnv({ ...base, CORS_ALLOWED_ORIGINS: "example.com" })).toThrowError(/Invalid CORS origin/);
+    expect(() =>
+      validateEnv({ ...base, CORS_ALLOWED_ORIGINS: "example.com" })
+    ).toThrowError(/CORS_ALLOWED_ORIGINS contains an invalid HTTP\(S\) origin entry/);
+  });
+
+  it("prevents secret leakage in CORS configuration validation errors", () => {
+    const base = { DATABASE_URL: "postgresql://localhost:5432/db" };
+    const secretValue = "SUPER_SECRET_ADMIN_TOKEN_999888";
+
+    let thrownError: Error | null = null;
+    try {
+      validateEnv({
+        ...base,
+        CORS_ALLOWED_ORIGINS: `https://admin:${secretValue}@example.com`,
+      });
+    } catch (err) {
+      thrownError = err as Error;
+    }
+
+    expect(thrownError).not.toBeNull();
+    expect(thrownError?.message).toContain(
+      "CORS_ALLOWED_ORIGINS contains an invalid HTTP(S) origin entry."
+    );
+    // Explicitly assert that the credential/secret value is NEVER leaked in the error message
+    expect(thrownError?.message).not.toContain(secretValue);
+    expect(thrownError?.message).not.toContain("admin:");
+    expect(thrownError?.message).not.toContain("example.com");
+  });
+
+  it("rejects empty entries in comma-separated CORS configuration", () => {
+    const base = { DATABASE_URL: "postgresql://localhost:5432/db" };
+
+    // Trailing comma
+    expect(() =>
+      validateEnv({
+        ...base,
+        CORS_ALLOWED_ORIGINS: "http://localhost:3000,",
+      })
+    ).toThrowError(/CORS_ALLOWED_ORIGINS contains an empty origin entry/);
+
+    // Consecutive commas
+    expect(() =>
+      validateEnv({
+        ...base,
+        CORS_ALLOWED_ORIGINS: "http://localhost:3000,,https://example.com",
+      })
+    ).toThrowError(/CORS_ALLOWED_ORIGINS contains an empty origin entry/);
+
+    // Leading comma
+    expect(() =>
+      validateEnv({
+        ...base,
+        CORS_ALLOWED_ORIGINS: ",http://localhost:3000",
+      })
+    ).toThrowError(/CORS_ALLOWED_ORIGINS contains an empty origin entry/);
+
+    // Whitespace comma
+    expect(() =>
+      validateEnv({
+        ...base,
+        CORS_ALLOWED_ORIGINS: "http://localhost:3000,   ,https://example.com",
+      })
+    ).toThrowError(/CORS_ALLOWED_ORIGINS contains an empty origin entry/);
+
+    // Empty string
+    expect(() =>
+      validateEnv({
+        ...base,
+        CORS_ALLOWED_ORIGINS: "",
+      })
+    ).toThrowError(/CORS_ALLOWED_ORIGINS must contain at least one valid HTTP\(S\) origin/);
   });
 
   it("rejects invalid NODE_ENV values", () => {

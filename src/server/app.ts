@@ -7,10 +7,14 @@ import express, { Express } from "express";
 import helmet from "helmet";
 import cookieParser from "cookie-parser";
 import { PrismaClient } from "@prisma/client";
+import { Logger } from "pino";
 import { env } from "../config/env";
 import { requestIdMiddleware } from "./middleware/request-id";
 import { createCorsMiddleware } from "./middleware/cors";
-import { requestLoggerMiddleware } from "./middleware/request-logger";
+import {
+  requestLoggerMiddleware,
+  createRequestLoggerMiddleware,
+} from "./middleware/request-logger";
 import { notFoundHandler, errorHandler } from "./middleware/error-handler";
 import { createHealthRouter } from "./routes/health.routes";
 import { createApiRouter } from "./routes";
@@ -18,6 +22,7 @@ import { createApiRouter } from "./routes";
 export interface AppOptions {
   prismaClient?: PrismaClient;
   corsOrigins?: string[];
+  logger?: Logger;
 }
 
 export function createApp(options: AppOptions = {}): Express {
@@ -40,7 +45,11 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(cookieParser());
 
   // 6. Correlated Request Logger
-  app.use(requestLoggerMiddleware);
+  app.use(
+    options.logger
+      ? createRequestLoggerMiddleware(options.logger)
+      : requestLoggerMiddleware
+  );
 
   // 7. Route Mounting
   // Top-level liveness & readiness probes for load balancers / container orchestrators

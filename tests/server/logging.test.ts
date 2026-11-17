@@ -4,6 +4,12 @@
 
 import { describe, it, expect } from "vitest";
 import pino from "pino";
+import express from "express";
+import request from "supertest";
+import { Prisma } from "@prisma/client";
+import { requestIdMiddleware } from "../../src/server/middleware/request-id";
+import { createRequestLoggerMiddleware } from "../../src/server/middleware/request-logger";
+import { prisma, PRISMA_LOG_CONFIG } from "../../src/lib/db";
 
 describe("Pino Sensitive Data Redaction", () => {
   it("redacts authorization headers, cookies, passwords, and tokens", () => {
@@ -93,46 +99,10 @@ describe("Pino Sensitive Data Redaction", () => {
       }
     );
 
-    const express = (await import("express")).default;
-    const request = (await import("supertest")).default;
-    const { requestIdMiddleware } = await import(
-      "../../src/server/middleware/request-id"
-    );
-
     const app = express();
     app.use(requestIdMiddleware);
-
-    // Custom request logger using testLogger
-    app.use((req, res, next) => {
-      const startTime = Date.now();
-      req.log = testLogger.child({ requestId: req.id });
-
-      const rawUrl = req.originalUrl || req.url || "/";
-      const pathname = rawUrl.split("?")[0] || "/";
-
-      req.log.debug(
-        {
-          method: req.method,
-          path: pathname,
-        },
-        "Incoming request"
-      );
-
-      res.on("finish", () => {
-        const duration = Date.now() - startTime;
-        req.log.info(
-          {
-            method: req.method,
-            path: pathname,
-            statusCode: res.statusCode,
-            durationMs: duration,
-          },
-          "Request completed"
-        );
-      });
-
-      next();
-    });
+    // Mount the actual production requestLoggerMiddleware configured with testLogger
+    app.use(createRequestLoggerMiddleware(testLogger));
 
     app.get("/api/v1/destinations", (_req, res) => {
       res.json({ success: true });
@@ -170,11 +140,14 @@ describe("Pino Sensitive Data Redaction", () => {
   });
 
   it("verifies Prisma logging configuration suppresses raw query and bound parameter logging", async () => {
-    const { prisma } = await import("../../src/lib/db");
+    // Explicitly assert on the exported PRISMA_LOG_CONFIG constant to guarantee test failure if query logging is enabled
+    expect(PRISMA_LOG_CONFIG).toEqual(["error", "warn"]);
+    expect(PRISMA_LOG_CONFIG).not.toContain("query");
+    expect(PRISMA_LOG_CONFIG).not.toContain("info");
 
-    // Inspect the Prisma Client instance internal log options
-    // Prisma internally stores options on _engineConfig or _clientVersion
-    const clientOptions = (prisma as any)._engineConfig || (prisma as any)._options;
+    // Inspect the Prisma Client instance internal log options if available
+    const clientOptions =
+      (prisma as any)._engineConfig || (prisma as any)._options;
     if (clientOptions && clientOptions.log) {
       // Must not include "query" or "info" log levels
       const logLevels = Array.isArray(clientOptions.log)
@@ -198,7 +171,6 @@ describe("Pino Sensitive Data Redaction", () => {
 
     try {
       const sensitiveToken = "CONFIDENTIAL_BOUND_PARAMETER_SECRET_XYZ_12345";
-      const { Prisma } = await import("@prisma/client");
       try {
         await prisma.$queryRaw(
           Prisma.sql`SELECT 1 AS check_col, ${sensitiveToken} AS token_col`
@@ -208,7 +180,9 @@ describe("Pino Sensitive Data Redaction", () => {
       }
 
       // Ensure the sensitive bound parameter was NOT written to stdout by Prisma query logging
-      expect(stdoutBuffer).not.toContain("CONFIDENTIAL_BOUND_PARAMETER_SECRET_XYZ_12345");
+      expect(stdoutBuffer).not.toContain(
+        "CONFIDENTIAL_BOUND_PARAMETER_SECRET_XYZ_12345"
+      );
       expect(stdoutBuffer).not.toContain("SELECT 1 AS check_col");
     } finally {
       process.stdout.write = originalStdoutWrite;
