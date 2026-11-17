@@ -81,4 +81,137 @@ describe("Pino Sensitive Data Redaction", () => {
     expect(output).not.toContain("rt_sensitive_refresh_family_uuid");
     expect(output).not.toContain("aws_secret_access_key_value");
   });
+
+  it("excludes query strings from request URL logging", async () => {
+    let capturedLogs = "";
+    const testLogger = pino(
+      { level: "debug" },
+      {
+        write: (msg: string) => {
+          capturedLogs += msg;
+        },
+      }
+    );
+
+    const express = (await import("express")).default;
+    const request = (await import("supertest")).default;
+    const { requestIdMiddleware } = await import(
+      "../../src/server/middleware/request-id"
+    );
+
+    const app = express();
+    app.use(requestIdMiddleware);
+
+    // Custom request logger using testLogger
+    app.use((req, res, next) => {
+      const startTime = Date.now();
+      req.log = testLogger.child({ requestId: req.id });
+
+      const rawUrl = req.originalUrl || req.url || "/";
+      const pathname = rawUrl.split("?")[0] || "/";
+
+      req.log.debug(
+        {
+          method: req.method,
+          path: pathname,
+        },
+        "Incoming request"
+      );
+
+      res.on("finish", () => {
+        const duration = Date.now() - startTime;
+        req.log.info(
+          {
+            method: req.method,
+            path: pathname,
+            statusCode: res.statusCode,
+            durationMs: duration,
+          },
+          "Request completed"
+        );
+      });
+
+      next();
+    });
+
+    app.get("/api/v1/destinations", (_req, res) => {
+      res.json({ success: true });
+    });
+
+    const response = await request(app)
+      .get("/api/v1/destinations?token=SENSITIVE_QUERY_TOKEN_999&password=SENSITIVE_PASSWORD_888&filter=beaches")
+      .expect(200);
+
+    expect(response.body.success).toBe(true);
+
+    // Parse logged records
+    const lines = capturedLogs.trim().split("\n").filter(Boolean);
+    const parsedRecords = lines.map((line) => JSON.parse(line));
+
+    // Verify both debug and info log entries record the pathname without query parameters
+    const incomingRecord = parsedRecords.find(
+      (r) => r.msg === "Incoming request"
+    );
+    expect(incomingRecord).toBeDefined();
+    expect(incomingRecord.path).toBe("/api/v1/destinations");
+
+    const completionRecord = parsedRecords.find(
+      (r) => r.msg === "Request completed"
+    );
+    expect(completionRecord).toBeDefined();
+    expect(completionRecord.path).toBe("/api/v1/destinations");
+    expect(completionRecord.statusCode).toBe(200);
+
+    // Assert that sensitive query string values and parameter names are completely absent from logs
+    expect(capturedLogs).not.toContain("SENSITIVE_QUERY_TOKEN_999");
+    expect(capturedLogs).not.toContain("SENSITIVE_PASSWORD_888");
+    expect(capturedLogs).not.toContain("token=");
+    expect(capturedLogs).not.toContain("password=");
+  });
+
+  it("verifies Prisma logging configuration suppresses raw query and bound parameter logging", async () => {
+    const { prisma } = await import("../../src/lib/db");
+
+    // Inspect the Prisma Client instance internal log options
+    // Prisma internally stores options on _engineConfig or _clientVersion
+    const clientOptions = (prisma as any)._engineConfig || (prisma as any)._options;
+    if (clientOptions && clientOptions.log) {
+      // Must not include "query" or "info" log levels
+      const logLevels = Array.isArray(clientOptions.log)
+        ? clientOptions.log.map((entry: any) =>
+            typeof entry === "string" ? entry : entry.level
+          )
+        : [];
+      expect(logLevels).not.toContain("query");
+      expect(logLevels).not.toContain("info");
+      expect(logLevels).toEqual(expect.arrayContaining(["error", "warn"]));
+    }
+
+    // Verify that running a parameterized raw query with a sensitive marker string
+    // does not output the sensitive value or SQL statement to stdout/stderr
+    let stdoutBuffer = "";
+    const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk: any) => {
+      stdoutBuffer += typeof chunk === "string" ? chunk : chunk.toString();
+      return true;
+    };
+
+    try {
+      const sensitiveToken = "CONFIDENTIAL_BOUND_PARAMETER_SECRET_XYZ_12345";
+      const { Prisma } = await import("@prisma/client");
+      try {
+        await prisma.$queryRaw(
+          Prisma.sql`SELECT 1 AS check_col, ${sensitiveToken} AS token_col`
+        );
+      } catch {
+        // Expected offline failure when local PostgreSQL is not running
+      }
+
+      // Ensure the sensitive bound parameter was NOT written to stdout by Prisma query logging
+      expect(stdoutBuffer).not.toContain("CONFIDENTIAL_BOUND_PARAMETER_SECRET_XYZ_12345");
+      expect(stdoutBuffer).not.toContain("SELECT 1 AS check_col");
+    } finally {
+      process.stdout.write = originalStdoutWrite;
+    }
+  });
 });

@@ -59,7 +59,7 @@ Environment variables are validated on application startup via `src/config/env.t
 | `PORT` | `number (1-65535)` | `4000` | HTTP listener port. Avoids port 3000 used by Next.js. |
 | `DATABASE_URL` | `string` | *(Required)* | PostgreSQL + PostGIS connection string for Prisma. |
 | `DIRECT_URL` | `string` | *(Optional)* | Direct PostgreSQL connection string bypassing poolers. |
-| `CORS_ALLOWED_ORIGINS` | `string` (comma-separated) | `http://localhost:3000` | Allowed origins for cross-origin requests. |
+| `CORS_ALLOWED_ORIGINS` | `string` (comma-separated) | `http://localhost:3000` | Allowed origins for cross-origin requests. Every entry must strictly conform to RFC 6454 HTTP(S) serialized origins (`http://host[:port]` or `https://host[:port]`). Wildcards (`*`), credentials, paths, query strings, and fragments are rejected at startup. |
 | `LOG_LEVEL` | `enum('fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent')` | `info` | Active Pino log level threshold. |
 
 ---
@@ -84,10 +84,16 @@ flowchart TD
     MWError --> Res["Sanitized JSON Error Response Envelope"]
 ```
 
-### Request ID Handling
+### Request ID & Path-Only URL Logging
 - If the incoming request contains an `X-Request-Id` header matching `^[a-zA-Z0-9_-]{1,64}$`, that value is preserved.
 - If missing, empty, or containing invalid characters, a new UUIDv4 is generated via Node.js `crypto.randomUUID()`.
 - The ID is bound to `req.id` and echoed back via the `X-Request-Id` response header.
+- **Pathname-Only Logging**: To prevent sensitive query parameters (`?token=...`, `?password=...`) from leaking into persistent log storage, the request logger strips all query strings and logs strictly the sanitized pathname (`path: req.originalUrl.split('?')[0]`).
+
+### CORS Origin Validation & Sanitized Error Responses
+- CORS origins are strictly matched against the validated allowlist.
+- When an unauthorized origin attempts cross-origin access, the request is rejected with a generic HTTP `403 FORBIDDEN_ACCESS` error envelope (`"message": "Cross-origin request forbidden by CORS policy"`).
+- Attacker-controlled origin strings are **never reflected** in error response payloads, eliminating XSS and reflection vectors.
 
 ### Sensitive Data Redaction in Logging
 Pino is configured to redact credentials, tokens, and sensitive headers across all log records:
@@ -210,6 +216,7 @@ Redacted values are replaced with `[REDACTED]`.
 ## 7. Database Infrastructure & Lifecycle Management
 
 - **Prisma Client Singleton**: `src/lib/db.ts` uses the global singleton pattern to prevent duplicate connection pools during hot-reloading in development.
+- **Query Logging Hardening**: Prisma Client is configured strictly with `log: ["error", "warn"]` across all environments. Raw SQL query logging (`"query"`) is prohibited to prevent the emission of bound parameter values that may contain sensitive credentials, password hashes, or personally identifiable information.
 - **Explicit Connection Lifecycle**:
   - `connectDatabase()`: Explicitly initiates connection pool creation (`prisma.$connect()`).
   - `disconnectDatabase()`: Cleanly drains connection pools on server shutdown (`prisma.$disconnect()`).

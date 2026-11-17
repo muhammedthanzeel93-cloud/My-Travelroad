@@ -72,10 +72,14 @@ export function errorHandler(
     statusCode = 413;
     code = ErrorCode.BAD_REQUEST;
     message = "Request entity too large (maximum allowed size: 100kb)";
-  } else if (err instanceof Error && err.message.includes("not allowed by CORS")) {
+  } else if (
+    err instanceof Error &&
+    (err.message === "CORS_ORIGIN_DENIED" ||
+      err.message.includes("not allowed by CORS"))
+  ) {
     statusCode = 403;
     code = ErrorCode.FORBIDDEN_ACCESS;
-    message = err.message;
+    message = "Cross-origin request forbidden by CORS policy";
   } else {
     // Unexpected internal server error — log stack trace securely without leaking to client
     log.error({ err, requestId }, "Unhandled internal exception encountered");

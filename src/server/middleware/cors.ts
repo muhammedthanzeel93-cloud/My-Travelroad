@@ -17,7 +17,8 @@ export function createCorsMiddleware(allowedOrigins: string[] = ["http://localho
         return callback(null, true);
       }
 
-      return callback(new Error(`Origin '${origin}' not allowed by CORS`));
+      // Sanitized: Never interpolate attacker-controlled origin in error message
+      return callback(new Error("CORS_ORIGIN_DENIED"));
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],

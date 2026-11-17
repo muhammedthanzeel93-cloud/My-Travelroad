@@ -14,11 +14,15 @@ export function requestLoggerMiddleware(
   const startTime = Date.now();
   req.log = logger.child({ requestId: req.id });
 
+  // Extract pathname only — strictly strip query strings to prevent sensitive query parameters from leaking into logs
+  const rawUrl = req.originalUrl || req.url || "/";
+  const pathname = rawUrl.split("?")[0] || "/";
+
   // Log incoming request at debug level
   req.log.debug(
     {
       method: req.method,
-      url: req.originalUrl || req.url,
+      path: pathname,
       ip: req.ip,
       userAgent: req.headers["user-agent"],
     },
@@ -32,7 +36,7 @@ export function requestLoggerMiddleware(
 
     const logData = {
       method: req.method,
-      url: req.originalUrl || req.url,
+      path: pathname,
       statusCode,
       durationMs: duration,
     };

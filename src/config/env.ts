@@ -5,6 +5,72 @@
 
 import { z } from "zod";
 
+/**
+ * Validates that an origin string complies strictly with RFC 6454 serialized origin rules:
+ * - Scheme must strictly be http: or https:
+ * - Must contain a valid hostname (IP or domain name)
+ * - Optional port
+ * - NO wildcards (*)
+ * - NO user credentials (user:pass@)
+ * - NO URL paths (e.g. /path)
+ * - NO query strings (?query)
+ * - NO fragments (#hash)
+ */
+export function isValidHttpOrigin(origin: string): boolean {
+  if (!origin || typeof origin !== "string") {
+    return false;
+  }
+
+  // Reject wildcards anywhere in origin
+  if (origin.includes("*")) {
+    return false;
+  }
+
+  // Reject credentials / userinfo
+  if (origin.includes("@")) {
+    return false;
+  }
+
+  // Reject query strings or fragments
+  if (origin.includes("?") || origin.includes("#")) {
+    return false;
+  }
+
+  try {
+    const url = new URL(origin);
+
+    // Protocol must strictly be http: or https:
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return false;
+    }
+
+    // Must have a valid non-empty hostname
+    if (!url.hostname) {
+      return false;
+    }
+
+    // Must not contain credentials
+    if (url.username || url.password) {
+      return false;
+    }
+
+    // Must not contain any path beyond empty or "/"
+    if (url.pathname && url.pathname !== "/") {
+      return false;
+    }
+
+    // Ensure raw origin strictly matches serialized origin (without trailing slash)
+    const normalizedRaw = origin.endsWith("/") ? origin.slice(0, -1) : origin;
+    if (normalizedRaw !== url.origin) {
+      return false;
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export const envSchema = z.object({
   NODE_ENV: z
     .enum(["development", "test", "production"])
@@ -15,12 +81,38 @@ export const envSchema = z.object({
   CORS_ALLOWED_ORIGINS: z
     .string()
     .default("http://localhost:3000")
-    .transform((val) =>
-      val
+    .transform((val, ctx) => {
+      const origins = val
         .split(",")
         .map((origin) => origin.trim())
-        .filter(Boolean)
-    ),
+        .filter(Boolean);
+
+      if (origins.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            "CORS_ALLOWED_ORIGINS must contain at least one valid HTTP(S) origin",
+        });
+        return [];
+      }
+
+      const validatedOrigins: string[] = [];
+
+      for (const origin of origins) {
+        if (!isValidHttpOrigin(origin)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Invalid CORS origin '${origin}'. Every entry must be a valid HTTP(S) origin without wildcards, paths, query parameters, fragments, or credentials.`,
+          });
+          return [];
+        }
+        validatedOrigins.push(
+          origin.endsWith("/") ? origin.slice(0, -1) : origin
+        );
+      }
+
+      return validatedOrigins;
+    }),
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
     .default("info"),

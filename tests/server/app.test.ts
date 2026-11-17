@@ -34,25 +34,32 @@ describe("Express Application Factory", () => {
     expect(response.headers["access-control-allow-credentials"]).toBe("true");
   });
 
-  it("blocks unauthorized CORS origins with 403 FORBIDDEN_ACCESS", async () => {
+  it("blocks unauthorized CORS origins with generic 403 FORBIDDEN_ACCESS without reflecting attacker input", async () => {
     const app = createApp({
       corsOrigins: ["http://localhost:3000"],
     });
 
+    const maliciousOrigin = "http://unauthorized-attacker.example.com/<script>alert(1)</script>";
     const response = await request(app)
       .get("/health")
-      .set("Origin", "http://unauthorized-attacker.example.com");
+      .set("Origin", maliciousOrigin);
 
     expect(response.status).toBe(403);
     expect(response.body).toEqual({
       success: false,
       error: {
         code: "FORBIDDEN_ACCESS",
-        message: "Origin 'http://unauthorized-attacker.example.com' not allowed by CORS",
+        message: "Cross-origin request forbidden by CORS policy",
         requestId: expect.any(String),
         timestamp: expect.any(String),
       },
     });
+
+    // Explicitly verify zero reflection of attacker-controlled Origin input
+    const serialized = JSON.stringify(response.body);
+    expect(serialized).not.toContain("unauthorized-attacker");
+    expect(serialized).not.toContain("<script>");
+    expect(serialized).not.toContain("alert(1)");
   });
 
   it("enforces 100kb payload size limit on JSON bodies", async () => {
