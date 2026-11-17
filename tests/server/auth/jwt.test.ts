@@ -412,28 +412,56 @@ describe("JWT Access Token Security Module", () => {
   });
 
   it("verifies runtime type guards correctly identify valid and invalid values", () => {
-    // UserRole
+    // UserRole: all 5 approved roles must be true
     expect(isValidUserRole("traveler")).toBe(true);
+    expect(isValidUserRole("contributor")).toBe(true);
+    expect(isValidUserRole("curator")).toBe(true);
+    expect(isValidUserRole("moderator")).toBe(true);
     expect(isValidUserRole("super_admin")).toBe(true);
+
+    // UserRole: invalid strings and non-string values must be false
     expect(isValidUserRole("agency_admin")).toBe(false);
+    expect(isValidUserRole("agency_agent")).toBe(false);
+    expect(isValidUserRole("superadmin")).toBe(false);
     expect(isValidUserRole("")).toBe(false);
     expect(isValidUserRole(null)).toBe(false);
+    expect(isValidUserRole(undefined)).toBe(false);
     expect(isValidUserRole(123)).toBe(false);
+    expect(isValidUserRole(true)).toBe(false);
+    expect(isValidUserRole({})).toBe(false);
+    expect(isValidUserRole([])).toBe(false);
 
-    // AccountType
+    // AccountType: all 3 approved account types must be true
     expect(isValidAccountType("individual")).toBe(true);
     expect(isValidAccountType("business")).toBe(true);
     expect(isValidAccountType("system")).toBe(true);
-    expect(isValidAccountType("enterprise")).toBe(false);
-    expect(isValidAccountType(undefined)).toBe(false);
 
-    // AccountStatus
+    // AccountType: invalid strings and non-string values must be false
+    expect(isValidAccountType("enterprise")).toBe(false);
+    expect(isValidAccountType("agency")).toBe(false);
+    expect(isValidAccountType("")).toBe(false);
+    expect(isValidAccountType(null)).toBe(false);
+    expect(isValidAccountType(undefined)).toBe(false);
+    expect(isValidAccountType(999)).toBe(false);
+    expect(isValidAccountType(false)).toBe(false);
+    expect(isValidAccountType({})).toBe(false);
+
+    // AccountStatus: all 4 approved statuses must be true
     expect(isValidAccountStatus("active")).toBe(true);
     expect(isValidAccountStatus("suspended")).toBe(true);
     expect(isValidAccountStatus("pending_verification")).toBe(true);
     expect(isValidAccountStatus("deactivated")).toBe(true);
+
+    // AccountStatus: invalid strings and non-string values must be false
     expect(isValidAccountStatus("archived")).toBe(false);
-    expect(isValidAccountStatus(false)).toBe(false);
+    expect(isValidAccountStatus("deleted")).toBe(false);
+    expect(isValidAccountStatus("banned")).toBe(false);
+    expect(isValidAccountStatus("")).toBe(false);
+    expect(isValidAccountStatus(null)).toBe(false);
+    expect(isValidAccountStatus(undefined)).toBe(false);
+    expect(isValidAccountStatus(0)).toBe(false);
+    expect(isValidAccountStatus(true)).toBe(false);
+    expect(isValidAccountStatus({})).toBe(false);
   });
 
   it("rejects an access token with a tampered signature", async () => {

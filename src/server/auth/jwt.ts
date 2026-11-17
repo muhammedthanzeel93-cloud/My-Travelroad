@@ -22,7 +22,7 @@ export const JWT_ALGORITHM = "HS256";
 export const CLOCK_TOLERANCE_SECONDS = 60;
 
 /** Authoritative domain roles allowed in access tokens. */
-export const VALID_USER_ROLES = new Set<UserRole>([
+export const VALID_USER_ROLES = new Set<string>([
   "traveler",
   "contributor",
   "curator",
@@ -31,14 +31,14 @@ export const VALID_USER_ROLES = new Set<UserRole>([
 ]);
 
 /** Authoritative domain account types allowed in access tokens. */
-export const VALID_ACCOUNT_TYPES = new Set<AccountType>([
+export const VALID_ACCOUNT_TYPES = new Set<string>([
   "individual",
   "business",
   "system",
 ]);
 
 /** Authoritative domain account lifecycle statuses allowed in access tokens. */
-export const VALID_ACCOUNT_STATUSES = new Set<AccountStatus>([
+export const VALID_ACCOUNT_STATUSES = new Set<string>([
   "active",
   "suspended",
   "pending_verification",
@@ -62,21 +62,21 @@ export const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
  * Runtime type guard for UserRole.
  */
 export function isValidUserRole(value: unknown): value is UserRole {
-  return typeof value === "string" && VALID_USER_ROLES.has(value as UserRole);
+  return typeof value === "string" && VALID_USER_ROLES.has(value);
 }
 
 /**
  * Runtime type guard for AccountType.
  */
 export function isValidAccountType(value: unknown): value is AccountType {
-  return typeof value === "string" && VALID_ACCOUNT_TYPES.has(value as AccountType);
+  return typeof value === "string" && VALID_ACCOUNT_TYPES.has(value);
 }
 
 /**
  * Runtime type guard for AccountStatus.
  */
 export function isValidAccountStatus(value: unknown): value is AccountStatus {
-  return typeof value === "string" && VALID_ACCOUNT_STATUSES.has(value as AccountStatus);
+  return typeof value === "string" && VALID_ACCOUNT_STATUSES.has(value);
 }
 
 export interface SignTokenOptions {
