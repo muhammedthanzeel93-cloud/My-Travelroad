@@ -29,6 +29,10 @@ src/
 ├── server/
 │   ├── app.ts                  # Express application factory (createApp)
 │   ├── index.ts                # Server bootstrap entrypoint & graceful shutdown handlers
+│   ├── auth/
+│   │   ├── index.ts            # Auth module barrel exports
+│   │   ├── password.ts         # Argon2id password hashing, verification & re-hash checking
+│   │   └── password.schema.ts  # Zod password validation schemas (creation & login)
 │   ├── errors/
 │   │   ├── app-error.ts        # AppError base class & specialized error subclasses
 │   │   └── error-codes.ts      # Machine-readable error code constants
@@ -247,3 +251,27 @@ The test suite is built on **Vitest** and **Supertest** located under `tests/ser
 - `error-handler.test.ts`: Validates 404 handler, custom `AppError` subclasses, Zod validation formatting, body parser syntax errors, and 500 stack sanitization.
 - `request-id.test.ts`: Validates generation of UUIDv4, validation/preservation of valid incoming headers, sanitization of malicious headers, and header echo.
 - `logging.test.ts`: Validates Pino redaction rules against authorization headers, cookies, passwords, and tokens; tests actual `requestLoggerMiddleware` query-stripping behavior; asserts on `PRISMA_LOG_CONFIG` to guarantee query logging suppression.
+- `auth/password.test.ts`: Validates Argon2id MCF generation, constant-time verification, rejection of incorrect passwords, unique CSPRNG salts, safe malformed hash handling, `needsRehash` parameter detection, and Zod password complexity rules.
+
+---
+
+## 10. Password Security & Cryptography Foundation
+
+The authentication module (`src/server/auth/`) provides reusable cryptographic utilities strictly adhering to **RFC 9106** and **OWASP Password Storage Guidelines**:
+
+### 10.1 Argon2id Configuration Parameters
+- **Algorithm**: `argon2id` (v=19 / 0x13)
+- **Memory Cost ($m$)**: $65536\text{ KiB}$ ($64\text{ MiB}$)
+- **Time Cost ($t$)**: $3\text{ iterations}$
+- **Parallelism ($p$)**: $4\text{ threads / lanes}$
+- **Salt Length**: $16\text{ bytes}$ ($128\text{ bits}$ CSPRNG generated automatically by `argon2`)
+- **Key / Digest Length**: $32\text{ bytes}$ ($256\text{ bits}$)
+- **Format**: Standard Modular Crypt Format (MCF): `$argon2id$v=19$m=65536,t=3,p=4$<salt>$<digest>`
+
+### 10.2 Cryptographic Invariants
+1. **No Plaintext Persistence**: Passwords are never stored, logged, or reflected in responses or traces.
+2. **Safe Error Handling**: `verifyPassword` catches malformed hashes, corrupted salts, and internal library exceptions, returning `false` safely without exposing internal details or crashing.
+3. **Lazy Re-Hashing**: `needsRehash` checks whether stored MCF strings match current target cost parameters, enabling zero-downtime parameter upgrades during authenticated logins.
+4. **Password Input Policy (Zod)**:
+   - `passwordCreationSchema`: 8–72 characters, $\ge 1$ uppercase letter, $\ge 1$ lowercase letter, $\ge 1$ digit. Whitespace is strictly preserved without silent trimming.
+   - `loginPasswordSchema`: 1–72 characters, non-empty string.
