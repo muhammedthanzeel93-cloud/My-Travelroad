@@ -21,6 +21,37 @@ if (process.env.NODE_ENV !== "production") {
 export const db = prisma;
 
 /**
+ * Database Lifecycle Management Helpers
+ */
+
+/**
+ * Explicitly connects the Prisma Client to the database.
+ */
+export async function connectDatabase(): Promise<void> {
+  await prisma.$connect();
+}
+
+/**
+ * Gracefully disconnects the Prisma Client and closes all connection pools.
+ */
+export async function disconnectDatabase(): Promise<void> {
+  await prisma.$disconnect();
+}
+
+/**
+ * Executes a lightweight readiness probe (SELECT 1) against PostgreSQL.
+ * Returns true if connected, false otherwise.
+ */
+export async function checkDatabaseHealth(): Promise<boolean> {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Spatial Types & Coordinate Interfaces
  */
 
