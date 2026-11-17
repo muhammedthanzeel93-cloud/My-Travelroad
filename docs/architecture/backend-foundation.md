@@ -300,18 +300,18 @@ The authentication module (`src/server/auth/`) establishes reusable cryptographi
 - **Defensive Signing Options**: `signAccessToken()` accepts an optional `expiresInSeconds` bounded strictly between $1$ and $86,400$ seconds (1 second to 24 hours), rejecting zero, negative, non-integer, or unreasonable values.
 - **Algorithm Pinning & Confusion Defense**: Both signing and verification pin strictly to `HS256` (`algorithms: ["HS256"]`). Tokens signed with `none`, `RS256`, `HS384`, or `HS512` are rejected.
 - **Payload & Claims Schema**:
-  - `sub`: Valid account UUID string matching standard UUIDv4 format (`/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i`).
+  - `sub`: Valid account UUID string strictly matching UUIDv4 (`/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i`), rejecting UUID versions other than 4.
   - `role`: One of the approved `UserRole` enums: `traveler`, `contributor`, `curator`, `moderator`, `super_admin`.
   - `email`: Valid non-empty email string matching standard email syntax.
   - `emailVerified`: Strict boolean value.
   - `type`: One of the approved `AccountType` enums: `individual`, `business`, `system`.
   - `status`: One of the approved `AccountStatus` enums: `active`, `suspended`, `pending_verification`, `deactivated`.
-  - `gen`: Positive integer sequence counter ($\ge 1$).
-  - `iat`: Valid positive integer Unix timestamp (seconds).
-  - `exp`: Valid positive integer Unix timestamp (seconds, strictly $> 0$).
+  - `gen`: Positive integer sequence counter ($\ge 1$). Purely a validated compatibility claim in Stage A.
+  - `iat`: Valid positive integer Unix timestamp; bounded by an explicit clock tolerance of 60 seconds (`CLOCK_TOLERANCE_SECONDS = 60`) to reject timestamps unreasonably in the future.
+  - `exp`: Valid positive integer Unix timestamp strictly later than `iat` (`exp > iat`).
   - `iss`: Issuer URI (`env.JWT_ISSUER`, default `https://mytravelroad.com`).
-  - `aud`: Audience URI (`env.JWT_AUDIENCE`, default `https://mytravelroad.com`).
-- **Strict Runtime Validation**: `verifyAccessToken()` asserts each claim at runtime without TypeScript type casts or manufactured defaults. Missing or invalid claims trigger immediate rejection with a sanitized `UnauthorizedError(ErrorCode.TOKEN_INVALID)`.
+  - `aud`: Audience URI (`env.JWT_AUDIENCE`, default `https://mytravelroad.com`). Verification confirms presence in `aud` string or array and guarantees returned `claims.aud` reflects the verified configured expected audience.
+- **Strict Runtime Type Guards**: `verifyAccessToken()` asserts each claim at runtime using dedicated type guard functions (`isValidUserRole`, `isValidAccountType`, `isValidAccountStatus`) without unsafe TypeScript type casts or manufactured defaults. Missing, malformed, or invalid claims trigger immediate rejection with a sanitized `UnauthorizedError(ErrorCode.TOKEN_INVALID)`.
 
 ### 11.2 Refresh Token Primitives
 - **Format**: Structured opaque string: `rt_<familyId>_<entropy>`
@@ -342,4 +342,4 @@ The authentication module (`src/server/auth/`) establishes reusable cryptographi
 - **Stage A Revocation & Token Generation Semantics**:
   - The Stage A database uses `accounts` and `account_security_credentials`. It does **not** contain a `token_generation` column.
   - In Stage A, durable invalidation (such as on password change or admin intervention) is evaluated against `AccountSecurityCredential.passwordChangedAt` and live `Account.status` checks (`active` vs `suspended`/`deactivated`).
-  - The `gen` integer claim is included in the access token contract per `api-architecture.md` Section 6.2 and is strictly verified at runtime as an integer ($\ge 1$), but is intentionally decoupled from Stage A database persistence. Account-wide generation revocation via database increments will be connected in future architecture stages when schema extensions are formally scheduled.
+  - The `gen` integer claim is included in the access token contract per `api-architecture.md` Section 6.2 and is strictly verified at runtime as an integer ($\ge 1$). However, **it is purely a validated compatibility claim and does NOT function as an active revocation mechanism in Stage A**. Connecting `gen` to a durable database increment counter is deferred to a future architecture stage when database schema changes are formally scheduled.

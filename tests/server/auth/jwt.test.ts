@@ -9,6 +9,10 @@ import {
   verifyAccessToken,
   ACCESS_TOKEN_EXPIRATION_SECONDS,
   JWT_ALGORITHM,
+  UUID_V4_REGEX,
+  isValidUserRole,
+  isValidAccountType,
+  isValidAccountStatus,
   AccessTokenPayload,
 } from "../../../src/server/auth";
 import { UnauthorizedError } from "../../../src/server/errors/app-error";
@@ -236,10 +240,20 @@ describe("JWT Access Token Security Module", () => {
     }
   });
 
-  it("rejects access tokens containing malformed or non-UUID subject (sub)", async () => {
+  it("rejects access tokens containing malformed, non-UUID, or non-v4 UUID subject (sub)", async () => {
     const key = new TextEncoder().encode(TEST_SECRET);
 
-    const badSubs = ["not-a-uuid", "12345", "550e8400-e29b-41d4-a716", "user_123456789", ""];
+    // Includes malformed strings, non-UUIDs, and valid UUIDs of versions other than 4 (v1, v3, v5)
+    const badSubs = [
+      "not-a-uuid",
+      "12345",
+      "550e8400-e29b-41d4-a716",
+      "user_123456789",
+      "",
+      "6ba7b810-9dad-11d1-80b4-00c04fd430c8", // UUIDv1
+      "6ba7b811-9dad-31d1-80b4-00c04fd430c8", // UUIDv3
+      "6ba7b814-9dad-51d1-80b4-00c04fd430c8", // UUIDv5
+    ];
 
     for (const badSub of badSubs) {
       const token = await new SignJWT({ ...validPayload, sub: badSub })
@@ -251,9 +265,32 @@ describe("JWT Access Token Security Module", () => {
         .sign(key);
 
       await expect(verifyAccessToken(token, { secret: TEST_SECRET })).rejects.toThrow(
-        new UnauthorizedError("Token missing valid account UUID subject (sub) claim", ErrorCode.TOKEN_INVALID)
+        new UnauthorizedError("Token missing valid account UUIDv4 subject (sub) claim", ErrorCode.TOKEN_INVALID)
       );
     }
+  });
+
+  it("extracts and verifies the expected audience from multiple audiences in aud array", async () => {
+    const key = new TextEncoder().encode(TEST_SECRET);
+
+    // aud is an array where the expected audience is at index 1 (not index 0)
+    const token = await new SignJWT({ ...validPayload })
+      .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+      .setSubject(validPayload.sub)
+      .setIssuedAt()
+      .setExpirationTime("15m")
+      .setIssuer(TEST_ISSUER)
+      .setAudience(["https://other-service.example.com", TEST_AUDIENCE])
+      .sign(key);
+
+    const claims = await verifyAccessToken(token, {
+      secret: TEST_SECRET,
+      issuer: TEST_ISSUER,
+      audience: TEST_AUDIENCE,
+    });
+
+    // Returned claim MUST be the verified expected audience, NOT the first element
+    expect(claims.aud).toBe(TEST_AUDIENCE);
   });
 
   it("rejects access tokens containing invalid email or non-boolean emailVerified", async () => {
@@ -288,10 +325,11 @@ describe("JWT Access Token Security Module", () => {
     );
   });
 
-  it("rejects access tokens missing valid numeric timestamps (iat, exp)", async () => {
+  it("rejects access tokens with missing exp, exp <= iat, or future iat", async () => {
     const key = new TextEncoder().encode(TEST_SECRET);
+    const now = Math.floor(Date.now() / 1000);
 
-    // Token without iat
+    // 1. Missing iat
     const tokenNoIat = await new SignJWT({ ...validPayload })
       .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
       .setSubject(validPayload.sub)
@@ -303,6 +341,99 @@ describe("JWT Access Token Security Module", () => {
     await expect(verifyAccessToken(tokenNoIat, { secret: TEST_SECRET })).rejects.toThrow(
       new UnauthorizedError("Token missing valid issued-at (iat) timestamp claim", ErrorCode.TOKEN_INVALID)
     );
+
+    // 2. Missing exp claim
+    const tokenNoExp = await new SignJWT({ ...validPayload })
+      .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+      .setSubject(validPayload.sub)
+      .setIssuedAt(now)
+      .setIssuer(TEST_ISSUER)
+      .setAudience(TEST_AUDIENCE)
+      .sign(key);
+
+    await expect(verifyAccessToken(tokenNoExp, { secret: TEST_SECRET })).rejects.toThrow(
+      new UnauthorizedError("Token missing valid expiration (exp) timestamp claim", ErrorCode.TOKEN_INVALID)
+    );
+
+    // 3. exp === iat
+    const tokenExpEqualIat = await new SignJWT({ ...validPayload })
+      .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+      .setSubject(validPayload.sub)
+      .setIssuedAt(now)
+      .setExpirationTime(now)
+      .setIssuer(TEST_ISSUER)
+      .setAudience(TEST_AUDIENCE)
+      .sign(key);
+
+    await expect(verifyAccessToken(tokenExpEqualIat, { secret: TEST_SECRET })).rejects.toThrow(
+      UnauthorizedError
+    );
+
+    // 4. exp < iat
+    const tokenExpLessThanIat = await new SignJWT({ ...validPayload })
+      .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+      .setSubject(validPayload.sub)
+      .setIssuedAt(now)
+      .setExpirationTime(now - 100)
+      .setIssuer(TEST_ISSUER)
+      .setAudience(TEST_AUDIENCE)
+      .sign(key);
+
+    await expect(verifyAccessToken(tokenExpLessThanIat, { secret: TEST_SECRET })).rejects.toThrow(
+      UnauthorizedError
+    );
+
+    // 5. iat 2 hours in the future (unreasonable future beyond CLOCK_TOLERANCE_SECONDS)
+    const tokenFutureIat = await new SignJWT({ ...validPayload })
+      .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+      .setSubject(validPayload.sub)
+      .setIssuedAt(now + 7200)
+      .setExpirationTime(now + 8100)
+      .setIssuer(TEST_ISSUER)
+      .setAudience(TEST_AUDIENCE)
+      .sign(key);
+
+    await expect(verifyAccessToken(tokenFutureIat, { secret: TEST_SECRET })).rejects.toThrow(
+      new UnauthorizedError("Token issued-at (iat) timestamp is unreasonably in the future", ErrorCode.TOKEN_INVALID)
+    );
+
+    // 6. iat within 30 seconds into the future (within CLOCK_TOLERANCE_SECONDS = 60s)
+    const tokenPermittedDrift = await new SignJWT({ ...validPayload })
+      .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+      .setSubject(validPayload.sub)
+      .setIssuedAt(now + 30)
+      .setExpirationTime(now + 930)
+      .setIssuer(TEST_ISSUER)
+      .setAudience(TEST_AUDIENCE)
+      .sign(key);
+
+    const verifiedDrift = await verifyAccessToken(tokenPermittedDrift, { secret: TEST_SECRET });
+    expect(verifiedDrift.iat).toBe(now + 30);
+  });
+
+  it("verifies runtime type guards correctly identify valid and invalid values", () => {
+    // UserRole
+    expect(isValidUserRole("traveler")).toBe(true);
+    expect(isValidUserRole("super_admin")).toBe(true);
+    expect(isValidUserRole("agency_admin")).toBe(false);
+    expect(isValidUserRole("")).toBe(false);
+    expect(isValidUserRole(null)).toBe(false);
+    expect(isValidUserRole(123)).toBe(false);
+
+    // AccountType
+    expect(isValidAccountType("individual")).toBe(true);
+    expect(isValidAccountType("business")).toBe(true);
+    expect(isValidAccountType("system")).toBe(true);
+    expect(isValidAccountType("enterprise")).toBe(false);
+    expect(isValidAccountType(undefined)).toBe(false);
+
+    // AccountStatus
+    expect(isValidAccountStatus("active")).toBe(true);
+    expect(isValidAccountStatus("suspended")).toBe(true);
+    expect(isValidAccountStatus("pending_verification")).toBe(true);
+    expect(isValidAccountStatus("deactivated")).toBe(true);
+    expect(isValidAccountStatus("archived")).toBe(false);
+    expect(isValidAccountStatus(false)).toBe(false);
   });
 
   it("rejects an access token with a tampered signature", async () => {
@@ -422,10 +553,10 @@ describe("JWT Access Token Security Module", () => {
     // sub: empty or non-UUID
     await expect(
       signAccessToken({ ...validPayload, sub: "" }, { secret: TEST_SECRET })
-    ).rejects.toThrow("sub must be a valid account UUID string");
+    ).rejects.toThrow("sub must be a valid account UUIDv4 string");
     await expect(
       signAccessToken({ ...validPayload, sub: "not-a-uuid" }, { secret: TEST_SECRET })
-    ).rejects.toThrow("sub must be a valid account UUID string");
+    ).rejects.toThrow("sub must be a valid account UUIDv4 string");
 
     // role: empty or invalid
     await expect(

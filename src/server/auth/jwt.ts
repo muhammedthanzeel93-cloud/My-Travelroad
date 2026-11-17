@@ -18,6 +18,9 @@ export const ACCESS_TOKEN_EXPIRATION_SECONDS = 900;
 /** Approved cryptographic signing algorithm for access tokens. */
 export const JWT_ALGORITHM = "HS256";
 
+/** Maximum permitted clock skew / drift in seconds for issued-at (iat) timestamps. */
+export const CLOCK_TOLERANCE_SECONDS = 60;
+
 /** Authoritative domain roles allowed in access tokens. */
 export const VALID_USER_ROLES = new Set<UserRole>([
   "traveler",
@@ -42,12 +45,39 @@ export const VALID_ACCOUNT_STATUSES = new Set<AccountStatus>([
   "deactivated",
 ]);
 
-/** UUIDv4 format regular expression. */
-export const UUID_REGEX =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+/**
+ * Strict UUIDv4 format regular expression.
+ * Enforces version digit strictly equal to 4 and variant strictly equal to 8, 9, a, or b.
+ */
+export const UUID_V4_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** Backward-compatible alias for UUIDv4 regex. */
+export const UUID_REGEX = UUID_V4_REGEX;
 
 /** RFC 5322-compliant simple email regex pattern. */
 export const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * Runtime type guard for UserRole.
+ */
+export function isValidUserRole(value: unknown): value is UserRole {
+  return typeof value === "string" && VALID_USER_ROLES.has(value as UserRole);
+}
+
+/**
+ * Runtime type guard for AccountType.
+ */
+export function isValidAccountType(value: unknown): value is AccountType {
+  return typeof value === "string" && VALID_ACCOUNT_TYPES.has(value as AccountType);
+}
+
+/**
+ * Runtime type guard for AccountStatus.
+ */
+export function isValidAccountStatus(value: unknown): value is AccountStatus {
+  return typeof value === "string" && VALID_ACCOUNT_STATUSES.has(value as AccountStatus);
+}
 
 export interface SignTokenOptions {
   secret?: string;
@@ -92,11 +122,11 @@ export async function signAccessToken(
     throw new Error("Invalid payload: AccessTokenPayload must be an object");
   }
 
-  if (!payload.sub || typeof payload.sub !== "string" || !UUID_REGEX.test(payload.sub)) {
-    throw new Error("Invalid payload: sub must be a valid account UUID string");
+  if (!payload.sub || typeof payload.sub !== "string" || !UUID_V4_REGEX.test(payload.sub)) {
+    throw new Error("Invalid payload: sub must be a valid account UUIDv4 string");
   }
 
-  if (!payload.role || !VALID_USER_ROLES.has(payload.role)) {
+  if (!isValidUserRole(payload.role)) {
     throw new Error(
       `Invalid payload: role must be one of ${Array.from(VALID_USER_ROLES).join(", ")}`
     );
@@ -110,13 +140,13 @@ export async function signAccessToken(
     throw new Error("Invalid payload: emailVerified must be a boolean");
   }
 
-  if (!payload.type || !VALID_ACCOUNT_TYPES.has(payload.type)) {
+  if (!isValidAccountType(payload.type)) {
     throw new Error(
       `Invalid payload: type must be one of ${Array.from(VALID_ACCOUNT_TYPES).join(", ")}`
     );
   }
 
-  if (!payload.status || !VALID_ACCOUNT_STATUSES.has(payload.status)) {
+  if (!isValidAccountStatus(payload.status)) {
     throw new Error(
       `Invalid payload: status must be one of ${Array.from(VALID_ACCOUNT_STATUSES).join(", ")}`
     );
@@ -210,25 +240,23 @@ export async function verifyAccessToken(
       audience,
     });
 
-    // 1. sub claim: must be a valid account UUID
-    if (!payload.sub || typeof payload.sub !== "string" || !UUID_REGEX.test(payload.sub)) {
+    // 1. sub claim: must strictly be a valid account UUIDv4
+    if (!payload.sub || typeof payload.sub !== "string" || !UUID_V4_REGEX.test(payload.sub)) {
       throw new UnauthorizedError(
-        "Token missing valid account UUID subject (sub) claim",
+        "Token missing valid account UUIDv4 subject (sub) claim",
         ErrorCode.TOKEN_INVALID
       );
     }
+    const sub: string = payload.sub;
 
-    // 2. role claim: must strictly be one of the approved UserRole enums
-    if (
-      !payload.role ||
-      typeof payload.role !== "string" ||
-      !VALID_USER_ROLES.has(payload.role as UserRole)
-    ) {
+    // 2. role claim: must strictly be one of the approved UserRole enums established via type guard
+    if (!isValidUserRole(payload.role)) {
       throw new UnauthorizedError(
         "Token contains invalid or unsupported role claim",
         ErrorCode.TOKEN_INVALID
       );
     }
+    const role: UserRole = payload.role;
 
     // 3. email claim: must be a valid non-empty email string
     if (!payload.email || typeof payload.email !== "string" || !EMAIL_REGEX.test(payload.email)) {
@@ -237,6 +265,7 @@ export async function verifyAccessToken(
         ErrorCode.TOKEN_INVALID
       );
     }
+    const email: string = payload.email;
 
     // 4. emailVerified claim: must be a strict boolean
     if (typeof payload.emailVerified !== "boolean") {
@@ -245,30 +274,25 @@ export async function verifyAccessToken(
         ErrorCode.TOKEN_INVALID
       );
     }
+    const emailVerified: boolean = payload.emailVerified;
 
-    // 5. type claim: must strictly be one of the approved AccountType enums
-    if (
-      !payload.type ||
-      typeof payload.type !== "string" ||
-      !VALID_ACCOUNT_TYPES.has(payload.type as AccountType)
-    ) {
+    // 5. type claim: must strictly be one of the approved AccountType enums established via type guard
+    if (!isValidAccountType(payload.type)) {
       throw new UnauthorizedError(
         "Token contains invalid or unsupported type claim",
         ErrorCode.TOKEN_INVALID
       );
     }
+    const type: AccountType = payload.type;
 
-    // 6. status claim: must strictly be one of the approved AccountStatus enums
-    if (
-      !payload.status ||
-      typeof payload.status !== "string" ||
-      !VALID_ACCOUNT_STATUSES.has(payload.status as AccountStatus)
-    ) {
+    // 6. status claim: must strictly be one of the approved AccountStatus enums established via type guard
+    if (!isValidAccountStatus(payload.status)) {
       throw new UnauthorizedError(
         "Token contains invalid or unsupported status claim",
         ErrorCode.TOKEN_INVALID
       );
     }
+    const status: AccountStatus = payload.status;
 
     // 7. gen claim: must strictly be a positive integer; NEVER defaulted
     if (
@@ -281,8 +305,9 @@ export async function verifyAccessToken(
         ErrorCode.TOKEN_INVALID
       );
     }
+    const gen: number = payload.gen;
 
-    // 8. iat claim: must strictly be a positive integer Unix timestamp
+    // 8. iat claim: must strictly be a positive integer Unix timestamp and not unreasonably in the future
     if (
       typeof payload.iat !== "number" ||
       !Number.isInteger(payload.iat) ||
@@ -293,8 +318,16 @@ export async function verifyAccessToken(
         ErrorCode.TOKEN_INVALID
       );
     }
+    const currentUnixTime = Math.floor(Date.now() / 1000);
+    if (payload.iat > currentUnixTime + CLOCK_TOLERANCE_SECONDS) {
+      throw new UnauthorizedError(
+        "Token issued-at (iat) timestamp is unreasonably in the future",
+        ErrorCode.TOKEN_INVALID
+      );
+    }
+    const iat: number = payload.iat;
 
-    // 9. exp claim: must strictly be a positive integer Unix timestamp
+    // 9. exp claim: must strictly be a positive integer Unix timestamp strictly greater than iat
     if (
       typeof payload.exp !== "number" ||
       !Number.isInteger(payload.exp) ||
@@ -305,6 +338,13 @@ export async function verifyAccessToken(
         ErrorCode.TOKEN_INVALID
       );
     }
+    if (payload.exp <= payload.iat) {
+      throw new UnauthorizedError(
+        "Token expiration (exp) timestamp must be strictly later than issued-at (iat) timestamp",
+        ErrorCode.TOKEN_INVALID
+      );
+    }
+    const exp: number = payload.exp;
 
     // 10. iss claim: must match configured issuer
     if (typeof payload.iss !== "string" || payload.iss !== issuer) {
@@ -313,36 +353,46 @@ export async function verifyAccessToken(
         ErrorCode.TOKEN_INVALID
       );
     }
+    const iss: string = payload.iss;
 
-    // 11. aud claim: must match configured audience string or array containing audience
-    let audClaim = "";
+    // 11. aud claim: must match configured expected audience string or contain it within an audience array
     if (typeof payload.aud === "string") {
-      audClaim = payload.aud;
-    } else if (
-      Array.isArray(payload.aud) &&
-      payload.aud.length > 0 &&
-      typeof payload.aud[0] === "string"
-    ) {
-      audClaim = payload.aud[0];
+      if (payload.aud !== audience) {
+        throw new UnauthorizedError(
+          "Token audience claim does not match expected audience",
+          ErrorCode.TOKEN_INVALID
+        );
+      }
+    } else if (Array.isArray(payload.aud)) {
+      const hasAudience = payload.aud.some(
+        (entry) => typeof entry === "string" && entry === audience
+      );
+      if (!hasAudience) {
+        throw new UnauthorizedError(
+          "Token audience array does not contain expected audience",
+          ErrorCode.TOKEN_INVALID
+        );
+      }
     } else {
       throw new UnauthorizedError(
         "Token missing valid audience (aud) claim",
         ErrorCode.TOKEN_INVALID
       );
     }
+    const aud: string = audience;
 
     const claims: AccessTokenClaims = {
-      sub: payload.sub,
-      role: payload.role as UserRole,
-      email: payload.email,
-      emailVerified: payload.emailVerified,
-      type: payload.type as AccountType,
-      status: payload.status as AccountStatus,
-      gen: payload.gen,
-      iat: payload.iat,
-      exp: payload.exp,
-      iss: payload.iss,
-      aud: audClaim,
+      sub,
+      role,
+      email,
+      emailVerified,
+      type,
+      status,
+      gen,
+      iat,
+      exp,
+      iss,
+      aud,
     };
 
     return claims;
