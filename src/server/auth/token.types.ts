@@ -7,6 +7,10 @@ import { UserRole, AccountType, AccountStatus } from "../../types/domain/account
 
 /**
  * Access Token Payload inputs required to sign a new short-lived JWT.
+ * Authoritative Domain Enums:
+ * - UserRole: 'traveler' | 'contributor' | 'curator' | 'moderator' | 'super_admin'
+ * - AccountType: 'individual' | 'business' | 'system'
+ * - AccountStatus: 'active' | 'suspended' | 'pending_verification' | 'deactivated'
  */
 export interface AccessTokenPayload {
   /** Account UUID identifier. */
@@ -21,15 +25,19 @@ export interface AccessTokenPayload {
   type: AccountType;
   /** Operational account lifecycle status. */
   status: AccountStatus;
-  /** Durable revocation generation integer (defaults to 1). */
-  gen?: number;
+  /**
+   * Token generation sequence integer specified by api-architecture.md Section 6.2.
+   * Note: Decoupled from Stage A database schema (accounts / account_security_credentials),
+   * where durable invalidation relies on passwordChangedAt and live account status.
+   */
+  gen: number;
 }
 
 /**
  * Decoded and verified Access Token claims conforming to api-architecture.md Section 6.2.
  */
 export interface AccessTokenClaims extends AccessTokenPayload {
-  /** Durable revocation generation integer. */
+  /** Token generation sequence integer. */
   gen: number;
   /** Issued at timestamp (seconds since Unix epoch). */
   iat: number;

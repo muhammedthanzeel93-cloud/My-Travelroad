@@ -291,40 +291,38 @@ The authentication module (`src/server/auth/`) provides reusable cryptographic u
 
 ## 11. Authentication Token & Session Security Foundation
 
-The token and session security module (`src/server/auth/`) establishes reusable primitives for stateless access verification, stateful refresh rotation, and centralized cookie management:
+The authentication module (`src/server/auth/`) establishes reusable cryptographic primitives for stateless access token verification, opaque refresh token lifecycle management, and centralized cookie configuration:
 
 ### 11.1 Access Token Architecture (JWT)
 - **Signing Algorithm**: HMAC-SHA256 (`HS256`) via `jose` library.
 - **Key Derivation**: Sourced from `env.JWT_SECRET` (minimum 32 characters / 256 bits of entropy).
 - **Lifetime**: 15 minutes (`900` seconds).
+- **Defensive Signing Options**: `signAccessToken()` accepts an optional `expiresInSeconds` bounded strictly between $1$ and $86,400$ seconds (1 second to 24 hours), rejecting zero, negative, non-integer, or unreasonable values.
 - **Algorithm Pinning & Confusion Defense**: Both signing and verification pin strictly to `HS256` (`algorithms: ["HS256"]`). Tokens signed with `none`, `RS256`, `HS384`, or `HS512` are rejected.
-- **Payload & Claims**:
-  - `sub`: User UUIDv4 (Subject)
-  - `role`: Canonical role (`traveler`, `agency_admin`, `agency_agent`, `super_admin`)
-  - `email`: User primary email
-  - `emailVerified`: Boolean verification status
-  - `type`: Account classification (`individual`, `business`)
-  - `status`: Account status (`active`, `suspended`, `pending_verification`, `archived`)
-  - `gen`: Token generation sequence counter (`number`)
-  - `iat`: Issued-at Unix timestamp (seconds)
-  - `exp`: Expiration Unix timestamp (seconds, `iat + 900`)
-  - `iss`: Issuer URI (`env.JWT_ISSUER`, default `https://mytravelroad.com`)
-  - `aud`: Audience URI (`env.JWT_AUDIENCE`, default `https://mytravelroad.com`)
-- **Error Handling**: Missing, expired, malformed, or invalid tokens throw `UnauthorizedError` with canonical error codes (`TOKEN_EXPIRED`, `TOKEN_INVALID`), preventing secret exposure.
+- **Payload & Claims Schema**:
+  - `sub`: Valid account UUID string matching standard UUIDv4 format (`/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i`).
+  - `role`: One of the approved `UserRole` enums: `traveler`, `contributor`, `curator`, `moderator`, `super_admin`.
+  - `email`: Valid non-empty email string matching standard email syntax.
+  - `emailVerified`: Strict boolean value.
+  - `type`: One of the approved `AccountType` enums: `individual`, `business`, `system`.
+  - `status`: One of the approved `AccountStatus` enums: `active`, `suspended`, `pending_verification`, `deactivated`.
+  - `gen`: Positive integer sequence counter ($\ge 1$).
+  - `iat`: Valid positive integer Unix timestamp (seconds).
+  - `exp`: Valid positive integer Unix timestamp (seconds, strictly $> 0$).
+  - `iss`: Issuer URI (`env.JWT_ISSUER`, default `https://mytravelroad.com`).
+  - `aud`: Audience URI (`env.JWT_AUDIENCE`, default `https://mytravelroad.com`).
+- **Strict Runtime Validation**: `verifyAccessToken()` asserts each claim at runtime without TypeScript type casts or manufactured defaults. Missing or invalid claims trigger immediate rejection with a sanitized `UnauthorizedError(ErrorCode.TOKEN_INVALID)`.
 
-### 11.2 Refresh Token Architecture
+### 11.2 Refresh Token Primitives
 - **Format**: Structured opaque string: `rt_<familyId>_<entropy>`
-  - `familyId`: UUIDv4 routing shard key. Contains zero user, role, or authorization data.
+  - `familyId`: UUIDv4 routing shard key representing the token family lineage. Contains zero user, role, or authorization data.
   - `entropy`: 32 bytes of cryptographically secure random bytes generated via `crypto.randomBytes(32)` formatted as a 64-character lowercase hex string (256 bits entropy).
   - Validated via regex: `^rt_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}_[0-9a-f]{64}$`.
 - **Storage & Hashing**:
   - Refresh tokens are **never stored in plaintext** in any storage tier.
   - The server computes a SHA-256 hex digest (`hashRefreshToken(token)`).
-  - Storage verification uses constant-time comparison via `crypto.timingSafeEqual` (`verifyRefreshTokenHash(token, hash)`).
-- **Lifetime**: 30 days (`2592000` seconds).
-- **Rotation & Replay Detection**:
-  - Every token refresh issues a new refresh token within the same `familyId` and invalidates the previous hash.
-  - If an expired, already-rotated, or invalid refresh token is presented, replay detection triggers: the entire token family is immediately revoked, defeating token hijacking.
+  - Verification against stored digests is performed using constant-time comparison via `crypto.timingSafeEqual` (`verifyRefreshTokenHash(token, hash)`).
+- **Lifetime**: 30 days (`2,592,000` seconds).
 
 ### 11.3 Centralized Cookie Configuration
 - **Cookie Name**: `refreshToken`
@@ -332,13 +330,16 @@ The token and session security module (`src/server/auth/`) establishes reusable 
 - **HttpOnly**: `true` (prohibiting JavaScript access and mitigating XSS token theft).
 - **Secure**: `true` in production (`env.NODE_ENV === "production"`); `false` in development/test.
 - **SameSite**: `Strict` (defending against Cross-Site Request Forgery).
-- **MaxAge**: 30 days (`30 * 24 * 60 * 60 * 1000` ms) on token issuance; `0` on logout or session clearing.
+- **MaxAge**: 30 days (`30 * 24 * 60 * 60 * 1000` ms) on active session issuance; `0` on logout or session clearing (`getClearRefreshTokenCookieOptions()`).
 
-### 11.4 Ephemeral & Durable Storage Partitioning
-- **Redis (Ephemeral Session State)**:
-  - Stores active family sessions (`session:{familyId}`) and refresh token hashes with a 30-day TTL.
-  - Stores account-wide revocation generation markers (`user:revocations:{userId}`).
-  - **Failure Mode**: Fail-closed posture (`REDIS_FAIL_MODE=fail_closed`). If Redis is unavailable or partitioned, authentication verification operations reject requests to prevent split-brain authorization.
-- **PostgreSQL (Durable Source of Truth)**:
-  - Stores persistent account status, role, verified email state, and `token_generation` counter on the `users` table.
-  - Survives complete Redis cluster flushing or restarts.
+### 11.4 Architectural Boundaries & Stage A Scope
+- **Task 10.2 Scope**: Limited exclusively to reusable cryptographic token and cookie primitives (`signAccessToken`, `verifyAccessToken`, `generateRefreshToken`, `parseRefreshToken`, `hashRefreshToken`, `verifyRefreshTokenHash`, `getRefreshTokenCookieOptions`, `getClearRefreshTokenCookieOptions`).
+- **Deferred to Subsequent Tasks**:
+  - Redis connection lifecycle, cluster client initialization, and session state persistence (`session:{familyId}:{sessionId}`, `family:{familyId}`).
+  - Redis Lua scripts for atomic refresh rotation and replay revocation.
+  - HTTP authentication endpoints (`/api/v1/auth/register`, `/api/v1/auth/login`, `/api/v1/auth/refresh`, `/api/v1/auth/logout`).
+  - Authorization middleware (`authenticateBearer`, `requireRole`, `requireEmailVerified`).
+- **Stage A Revocation & Token Generation Semantics**:
+  - The Stage A database uses `accounts` and `account_security_credentials`. It does **not** contain a `token_generation` column.
+  - In Stage A, durable invalidation (such as on password change or admin intervention) is evaluated against `AccountSecurityCredential.passwordChangedAt` and live `Account.status` checks (`active` vs `suspended`/`deactivated`).
+  - The `gen` integer claim is included in the access token contract per `api-architecture.md` Section 6.2 and is strictly verified at runtime as an integer ($\ge 1$), but is intentionally decoupled from Stage A database persistence. Account-wide generation revocation via database increments will be connected in future architecture stages when schema extensions are formally scheduled.

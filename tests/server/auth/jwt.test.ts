@@ -53,21 +53,83 @@ describe("JWT Access Token Security Module", () => {
     expect(claims.exp - claims.iat).toBe(ACCESS_TOKEN_EXPIRATION_SECONDS);
   });
 
-  it("enforces default generation claim (gen: 1) when omitted", async () => {
-    const { gen, ...payloadWithoutGen } = validPayload;
-    const token = await signAccessToken(payloadWithoutGen as AccessTokenPayload, {
-      secret: TEST_SECRET,
-    });
-    const claims = await verifyAccessToken(token, { secret: TEST_SECRET });
-    expect(claims.gen).toBe(1);
+  it("rejects an access token with missing, zero, negative, or non-integer generation (gen) claim", async () => {
+    const key = new TextEncoder().encode(TEST_SECRET);
+
+    // 1. Missing gen claim
+    const tokenNoGen = await new SignJWT({
+      role: validPayload.role,
+      email: validPayload.email,
+      emailVerified: validPayload.emailVerified,
+      type: validPayload.type,
+      status: validPayload.status,
+    })
+      .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+      .setSubject(validPayload.sub)
+      .setIssuedAt()
+      .setExpirationTime("15m")
+      .setIssuer(TEST_ISSUER)
+      .setAudience(TEST_AUDIENCE)
+      .sign(key);
+
+    await expect(verifyAccessToken(tokenNoGen, { secret: TEST_SECRET })).rejects.toThrow(
+      new UnauthorizedError("Token missing valid generation (gen) claim", ErrorCode.TOKEN_INVALID)
+    );
+
+    // 2. gen: 0
+    const tokenGenZero = await new SignJWT({ ...validPayload, gen: 0 })
+      .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+      .setSubject(validPayload.sub)
+      .setIssuedAt()
+      .setExpirationTime("15m")
+      .setIssuer(TEST_ISSUER)
+      .setAudience(TEST_AUDIENCE)
+      .sign(key);
+
+    await expect(verifyAccessToken(tokenGenZero, { secret: TEST_SECRET })).rejects.toThrow(
+      new UnauthorizedError("Token missing valid generation (gen) claim", ErrorCode.TOKEN_INVALID)
+    );
+
+    // 3. gen: -1
+    const tokenGenNegative = await new SignJWT({ ...validPayload, gen: -1 })
+      .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+      .setSubject(validPayload.sub)
+      .setIssuedAt()
+      .setExpirationTime("15m")
+      .setIssuer(TEST_ISSUER)
+      .setAudience(TEST_AUDIENCE)
+      .sign(key);
+
+    await expect(verifyAccessToken(tokenGenNegative, { secret: TEST_SECRET })).rejects.toThrow(
+      new UnauthorizedError("Token missing valid generation (gen) claim", ErrorCode.TOKEN_INVALID)
+    );
+
+    // 4. gen: float (1.5)
+    const tokenGenFloat = await new SignJWT({ ...validPayload, gen: 1.5 })
+      .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+      .setSubject(validPayload.sub)
+      .setIssuedAt()
+      .setExpirationTime("15m")
+      .setIssuer(TEST_ISSUER)
+      .setAudience(TEST_AUDIENCE)
+      .sign(key);
+
+    await expect(verifyAccessToken(tokenGenFloat, { secret: TEST_SECRET })).rejects.toThrow(
+      new UnauthorizedError("Token missing valid generation (gen) claim", ErrorCode.TOKEN_INVALID)
+    );
   });
 
   it("rejects an expired access token with TOKEN_EXPIRED error code", async () => {
-    // Sign token with -10 second expiration (already expired)
-    const expiredToken = await signAccessToken(validPayload, {
-      secret: TEST_SECRET,
-      expiresInSeconds: -10,
-    });
+    const key = new TextEncoder().encode(TEST_SECRET);
+    // Create an expired token directly using jose SignJWT with negative expiration
+    const expiredToken = await new SignJWT({ ...validPayload })
+      .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+      .setSubject(validPayload.sub)
+      .setIssuedAt(Math.floor(Date.now() / 1000) - 1000)
+      .setExpirationTime(Math.floor(Date.now() / 1000) - 100)
+      .setIssuer(TEST_ISSUER)
+      .setAudience(TEST_AUDIENCE)
+      .sign(key);
 
     let error: any = null;
     try {
@@ -79,6 +141,168 @@ describe("JWT Access Token Security Module", () => {
     expect(error).toBeInstanceOf(UnauthorizedError);
     expect(error.code).toBe(ErrorCode.TOKEN_EXPIRED);
     expect(error.statusCode).toBe(401);
+  });
+
+  it("defensively validates expiresInSeconds during signing", async () => {
+    // Rejects zero
+    await expect(
+      signAccessToken(validPayload, { secret: TEST_SECRET, expiresInSeconds: 0 })
+    ).rejects.toThrow("must be a positive integer between 1 and 86400 seconds");
+
+    // Rejects negative
+    await expect(
+      signAccessToken(validPayload, { secret: TEST_SECRET, expiresInSeconds: -10 })
+    ).rejects.toThrow("must be a positive integer between 1 and 86400 seconds");
+
+    // Rejects non-integer float
+    await expect(
+      signAccessToken(validPayload, { secret: TEST_SECRET, expiresInSeconds: 12.5 })
+    ).rejects.toThrow("must be a positive integer between 1 and 86400 seconds");
+
+    // Rejects unreasonable values (> 86400 seconds / 24 hours)
+    await expect(
+      signAccessToken(validPayload, { secret: TEST_SECRET, expiresInSeconds: 100000 })
+    ).rejects.toThrow("must be a positive integer between 1 and 86400 seconds");
+
+    // Accepts valid override
+    const token = await signAccessToken(validPayload, {
+      secret: TEST_SECRET,
+      expiresInSeconds: 300,
+    });
+    const claims = await verifyAccessToken(token, { secret: TEST_SECRET });
+    expect(claims.exp - claims.iat).toBe(300);
+  });
+
+  it("rejects access tokens containing unapproved or forged user roles", async () => {
+    const key = new TextEncoder().encode(TEST_SECRET);
+
+    const forgedRoles = ["agency_admin", "agency_agent", "admin", "guest", "root", ""];
+
+    for (const badRole of forgedRoles) {
+      const token = await new SignJWT({ ...validPayload, role: badRole })
+        .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+        .setSubject(validPayload.sub)
+        .setIssuedAt()
+        .setExpirationTime("15m")
+        .setIssuer(TEST_ISSUER)
+        .setAudience(TEST_AUDIENCE)
+        .sign(key);
+
+      await expect(verifyAccessToken(token, { secret: TEST_SECRET })).rejects.toThrow(
+        new UnauthorizedError("Token contains invalid or unsupported role claim", ErrorCode.TOKEN_INVALID)
+      );
+    }
+  });
+
+  it("rejects access tokens containing unapproved account types", async () => {
+    const key = new TextEncoder().encode(TEST_SECRET);
+
+    const forgedTypes = ["enterprise", "operator", "custom", ""];
+
+    for (const badType of forgedTypes) {
+      const token = await new SignJWT({ ...validPayload, type: badType })
+        .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+        .setSubject(validPayload.sub)
+        .setIssuedAt()
+        .setExpirationTime("15m")
+        .setIssuer(TEST_ISSUER)
+        .setAudience(TEST_AUDIENCE)
+        .sign(key);
+
+      await expect(verifyAccessToken(token, { secret: TEST_SECRET })).rejects.toThrow(
+        new UnauthorizedError("Token contains invalid or unsupported type claim", ErrorCode.TOKEN_INVALID)
+      );
+    }
+  });
+
+  it("rejects access tokens containing unapproved account statuses", async () => {
+    const key = new TextEncoder().encode(TEST_SECRET);
+
+    const forgedStatuses = ["archived", "banned", "deleted", "locked", ""];
+
+    for (const badStatus of forgedStatuses) {
+      const token = await new SignJWT({ ...validPayload, status: badStatus })
+        .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+        .setSubject(validPayload.sub)
+        .setIssuedAt()
+        .setExpirationTime("15m")
+        .setIssuer(TEST_ISSUER)
+        .setAudience(TEST_AUDIENCE)
+        .sign(key);
+
+      await expect(verifyAccessToken(token, { secret: TEST_SECRET })).rejects.toThrow(
+        new UnauthorizedError("Token contains invalid or unsupported status claim", ErrorCode.TOKEN_INVALID)
+      );
+    }
+  });
+
+  it("rejects access tokens containing malformed or non-UUID subject (sub)", async () => {
+    const key = new TextEncoder().encode(TEST_SECRET);
+
+    const badSubs = ["not-a-uuid", "12345", "550e8400-e29b-41d4-a716", "user_123456789", ""];
+
+    for (const badSub of badSubs) {
+      const token = await new SignJWT({ ...validPayload, sub: badSub })
+        .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+        .setIssuedAt()
+        .setExpirationTime("15m")
+        .setIssuer(TEST_ISSUER)
+        .setAudience(TEST_AUDIENCE)
+        .sign(key);
+
+      await expect(verifyAccessToken(token, { secret: TEST_SECRET })).rejects.toThrow(
+        new UnauthorizedError("Token missing valid account UUID subject (sub) claim", ErrorCode.TOKEN_INVALID)
+      );
+    }
+  });
+
+  it("rejects access tokens containing invalid email or non-boolean emailVerified", async () => {
+    const key = new TextEncoder().encode(TEST_SECRET);
+
+    // Bad email
+    const badEmailToken = await new SignJWT({ ...validPayload, email: "invalid-email-string" })
+      .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+      .setSubject(validPayload.sub)
+      .setIssuedAt()
+      .setExpirationTime("15m")
+      .setIssuer(TEST_ISSUER)
+      .setAudience(TEST_AUDIENCE)
+      .sign(key);
+
+    await expect(verifyAccessToken(badEmailToken, { secret: TEST_SECRET })).rejects.toThrow(
+      new UnauthorizedError("Token missing valid email claim", ErrorCode.TOKEN_INVALID)
+    );
+
+    // Non-boolean emailVerified
+    const nonBoolToken = await new SignJWT({ ...validPayload, emailVerified: "true" as any })
+      .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+      .setSubject(validPayload.sub)
+      .setIssuedAt()
+      .setExpirationTime("15m")
+      .setIssuer(TEST_ISSUER)
+      .setAudience(TEST_AUDIENCE)
+      .sign(key);
+
+    await expect(verifyAccessToken(nonBoolToken, { secret: TEST_SECRET })).rejects.toThrow(
+      new UnauthorizedError("Token missing valid emailVerified claim", ErrorCode.TOKEN_INVALID)
+    );
+  });
+
+  it("rejects access tokens missing valid numeric timestamps (iat, exp)", async () => {
+    const key = new TextEncoder().encode(TEST_SECRET);
+
+    // Token without iat
+    const tokenNoIat = await new SignJWT({ ...validPayload })
+      .setProtectedHeader({ alg: JWT_ALGORITHM, typ: "JWT" })
+      .setSubject(validPayload.sub)
+      .setExpirationTime("15m")
+      .setIssuer(TEST_ISSUER)
+      .setAudience(TEST_AUDIENCE)
+      .sign(key);
+
+    await expect(verifyAccessToken(tokenNoIat, { secret: TEST_SECRET })).rejects.toThrow(
+      new UnauthorizedError("Token missing valid issued-at (iat) timestamp claim", ErrorCode.TOKEN_INVALID)
+    );
   });
 
   it("rejects an access token with a tampered signature", async () => {
@@ -195,29 +419,70 @@ describe("JWT Access Token Security Module", () => {
   });
 
   it("validates required payload properties during signing", async () => {
+    // sub: empty or non-UUID
     await expect(
       signAccessToken({ ...validPayload, sub: "" }, { secret: TEST_SECRET })
-    ).rejects.toThrow("sub (account ID) must be a non-empty string");
+    ).rejects.toThrow("sub must be a valid account UUID string");
+    await expect(
+      signAccessToken({ ...validPayload, sub: "not-a-uuid" }, { secret: TEST_SECRET })
+    ).rejects.toThrow("sub must be a valid account UUID string");
 
+    // role: empty or invalid
     await expect(
       signAccessToken({ ...validPayload, role: "" as any }, { secret: TEST_SECRET })
-    ).rejects.toThrow("role must be a non-empty string");
+    ).rejects.toThrow("role must be one of");
+    await expect(
+      signAccessToken({ ...validPayload, role: "agency_admin" as any }, { secret: TEST_SECRET })
+    ).rejects.toThrow("role must be one of");
 
+    // email: empty or invalid format
     await expect(
       signAccessToken({ ...validPayload, email: "" }, { secret: TEST_SECRET })
-    ).rejects.toThrow("email must be a non-empty string");
+    ).rejects.toThrow("email must be a valid non-empty email string");
+    await expect(
+      signAccessToken({ ...validPayload, email: "invalid-email" }, { secret: TEST_SECRET })
+    ).rejects.toThrow("email must be a valid non-empty email string");
 
+    // emailVerified: non-boolean
     await expect(
       signAccessToken({ ...validPayload, emailVerified: "yes" as any }, { secret: TEST_SECRET })
     ).rejects.toThrow("emailVerified must be a boolean");
 
+    // type: invalid
     await expect(
-      signAccessToken({ ...validPayload, type: "" as any }, { secret: TEST_SECRET })
-    ).rejects.toThrow("type must be a non-empty string");
+      signAccessToken({ ...validPayload, type: "enterprise" as any }, { secret: TEST_SECRET })
+    ).rejects.toThrow("type must be one of");
 
+    // status: invalid
     await expect(
-      signAccessToken({ ...validPayload, status: "" as any }, { secret: TEST_SECRET })
-    ).rejects.toThrow("status must be a non-empty string");
+      signAccessToken({ ...validPayload, status: "archived" as any }, { secret: TEST_SECRET })
+    ).rejects.toThrow("status must be one of");
+
+    // gen: missing, zero, or negative
+    await expect(
+      signAccessToken({ ...validPayload, gen: 0 }, { secret: TEST_SECRET })
+    ).rejects.toThrow("gen must be a positive integer >= 1");
+    await expect(
+      signAccessToken({ ...validPayload, gen: -1 }, { secret: TEST_SECRET })
+    ).rejects.toThrow("gen must be a positive integer >= 1");
+    await expect(
+      signAccessToken({ ...validPayload, gen: 1.5 }, { secret: TEST_SECRET })
+    ).rejects.toThrow("gen must be a positive integer >= 1");
+  });
+
+  it("produces sanitized error responses without leaking secret keys or tokens", async () => {
+    let capturedError: any = null;
+    try {
+      await verifyAccessToken("invalid.malformed.token", { secret: TEST_SECRET });
+    } catch (err) {
+      capturedError = err;
+    }
+
+    expect(capturedError).toBeInstanceOf(UnauthorizedError);
+    expect(capturedError.code).toBe(ErrorCode.TOKEN_INVALID);
+    // Explicitly verify secret and internal tokens are not leaked
+    expect(capturedError.message).not.toContain(TEST_SECRET);
+    expect(capturedError.message).not.toContain("invalid.malformed.token");
   });
 
   it("rejects secrets containing fewer than 32 characters (256 bits)", async () => {
