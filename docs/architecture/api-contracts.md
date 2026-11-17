@@ -29,7 +29,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 - **Rate Limit**: 5 requests / min per IP.
 - **Validation Rules**:
   - `email`: RFC 5322 compliant, max 255 chars, lowercase.
-  - `password`: Min 8 chars, max 72 chars (Argon2id limit), must include 1 uppercase, 1 lowercase, 1 digit.
+  - `password`: Min 8 characters, max 72 characters (measured in Unicode code points; application-level policy for input bounding and DoS mitigation, distinct from Argon2id's maximum supported input length), must include 1 uppercase ASCII letter, 1 lowercase ASCII letter, 1 digit. No silent trimming or transformations.
   - `displayName`: 2 to 120 chars, trimmed.
   - `handle`: 3 to 50 chars, regex `^[a-z0-9_]+$`.
 - **Request Body**:

@@ -34,11 +34,27 @@ export const DEFAULT_ARGON2_OPTIONS: Readonly<Argon2CustomOptions & { type: 2 }>
 });
 
 /**
+ * Counts the number of Unicode code points in a string.
+ * Accurately handles supplementary characters (e.g. emoji and astral plane symbols)
+ * where a single code point spans two UTF-16 code units (surrogate pairs).
+ *
+ * @param str Candidate string
+ * @returns Number of Unicode code points
+ */
+export function countCodePoints(str: string): number {
+  return Array.from(str).length;
+}
+
+/**
  * Hashes a plaintext password using Argon2id with cryptographically secure random salt.
  * Produces a standard self-contained Modular Crypt Format (MCF) string:
  * $argon2id$v=19$m=65536,t=3,p=4$<16-byte-base64-salt>$<32-byte-base64-hash>
  *
- * @param password Plaintext password (1 to 72 characters)
+ * Note: The 72-character maximum threshold is an application-level API contract policy
+ * enforced for payload bounding and DoS mitigation, distinct from Argon2id's maximum
+ * supported input length (which supports inputs up to 2^32 - 1 bytes).
+ *
+ * @param password Plaintext password (1 to 72 Unicode code points)
  * @param options Optional Argon2 option overrides (e.g., lower cost during unit testing)
  * @returns Standard Argon2id MCF hash string
  */
@@ -46,11 +62,11 @@ export async function hashPassword(
   password: string,
   options?: Argon2CustomOptions
 ): Promise<string> {
-  if (typeof password !== "string" || password.length === 0) {
+  if (typeof password !== "string" || countCodePoints(password) === 0) {
     throw new Error("Password must be a non-empty string");
   }
 
-  if (password.length > 72) {
+  if (countCodePoints(password) > 72) {
     throw new Error("Password exceeds maximum length of 72 characters");
   }
 

@@ -272,6 +272,8 @@ The authentication module (`src/server/auth/`) provides reusable cryptographic u
 1. **No Plaintext Persistence**: Passwords are never stored, logged, or reflected in responses or traces.
 2. **Safe Error Handling**: `verifyPassword` catches malformed hashes, corrupted salts, and internal library exceptions, returning `false` safely without exposing internal details or crashing.
 3. **Lazy Re-Hashing**: `needsRehash` checks whether stored MCF strings match current target cost parameters, enabling zero-downtime parameter upgrades during authenticated logins.
-4. **Password Input Policy (Zod)**:
-   - `passwordCreationSchema`: 8–72 characters, $\ge 1$ uppercase letter, $\ge 1$ lowercase letter, $\ge 1$ digit. Whitespace is strictly preserved without silent trimming.
-   - `loginPasswordSchema`: 1–72 characters, non-empty string.
+4. **Password Input Policy (Zod & Unicode Code-Point Semantics)**:
+   - Password lengths are strictly evaluated in **Unicode code points** (`countCodePoints(str)` via `[...str].length`), correctly accommodating supplementary characters (e.g. emoji, astral symbols) spanning surrogate pairs.
+   - The 72-character maximum threshold is an **application-level API policy** established for payload bounding and DoS mitigation, distinct from Argon2id's maximum supported input length (which natively supports inputs up to $2^{32}-1$ bytes).
+   - `passwordCreationSchema`: 8–72 Unicode code points, $\ge 1$ uppercase ASCII letter, $\ge 1$ lowercase ASCII letter, $\ge 1$ numeric digit. Whitespace is strictly preserved without silent trimming.
+   - `loginPasswordSchema`: 1–72 Unicode code points, non-empty string. Both schemas and the hashing boundary enforce identical 72-code-point boundaries.

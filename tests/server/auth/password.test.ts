@@ -7,7 +7,10 @@ import {
   hashPassword,
   verifyPassword,
   needsRehash,
+  countCodePoints,
   DEFAULT_ARGON2_OPTIONS,
+  MIN_PASSWORD_CODE_POINTS,
+  MAX_PASSWORD_CODE_POINTS,
   passwordCreationSchema,
   loginPasswordSchema,
 } from "../../../src/server/auth";
@@ -86,12 +89,38 @@ describe("Argon2id Password Security Module", () => {
     await expect(hashPassword("")).rejects.toThrow("Password must be a non-empty string");
     await expect(hashPassword(null as any)).rejects.toThrow("Password must be a non-empty string");
     await expect(hashPassword(undefined as any)).rejects.toThrow("Password must be a non-empty string");
+  });
 
-    // Passwords exceeding 72 characters (Argon2 byte boundary)
-    const oversizedPassword = "A1!" + "x".repeat(70); // 73 chars
-    await expect(hashPassword(oversizedPassword)).rejects.toThrow(
+  it("enforces application-level 72 Unicode code-point limit during hashing", async () => {
+    // Exactly 72 Unicode code points (mix of ASCII and supplementary emoji characters)
+    // 68 emoji (2 UTF-16 code units each = 136) + 4 ASCII = 140 UTF-16 code units, but exactly 72 code points
+    const pass72 = "Ab1!" + "🌴".repeat(68);
+    expect(countCodePoints(pass72)).toBe(72);
+    expect(pass72.length).toBe(140);
+
+    // Hashing must succeed for 72 code points
+    const hash72 = await hashPassword(pass72);
+    expect(await verifyPassword(pass72, hash72)).toBe(true);
+
+    // 73 Unicode code points exceeds the application policy threshold
+    const pass73 = "Ab1!" + "🌴".repeat(69);
+    expect(countCodePoints(pass73)).toBe(73);
+    await expect(hashPassword(pass73)).rejects.toThrow(
       "Password exceeds maximum length of 72 characters"
     );
+  });
+
+  it("preserves leading and trailing whitespace exactly without silent trimming", async () => {
+    const untrimmedPassword = "  UntrimmedPassword123!  ";
+    const trimmedPassword = "UntrimmedPassword123!";
+
+    const hash = await hashPassword(untrimmedPassword);
+
+    // Verification with exact untrimmed string must succeed
+    expect(await verifyPassword(untrimmedPassword, hash)).toBe(true);
+
+    // Verification with trimmed string MUST fail, proving whitespace reached the hasher intact
+    expect(await verifyPassword(trimmedPassword, hash)).toBe(false);
   });
 
   it("detects when a hash needs re-hashing due to parameter differences", async () => {
@@ -112,6 +141,16 @@ describe("Argon2id Password Security Module", () => {
   });
 });
 
+describe("Unicode Code-Point Counting (countCodePoints)", () => {
+  it("counts code points correctly for ASCII, empty string, and supplementary characters", () => {
+    expect(countCodePoints("")).toBe(0);
+    expect(countCodePoints("Password")).toBe(8);
+    expect(countCodePoints("🌴")).toBe(1); // 2 UTF-16 code units, 1 code point
+    expect(countCodePoints("Kerala🌴Tourism")).toBe(14);
+    expect(countCodePoints("🏖️")).toBe(2); // Beach with umbrella (U+1F3D6 + U+FE0F variation selector)
+  });
+});
+
 describe("Password Zod Validation Schemas", () => {
   describe("passwordCreationSchema", () => {
     it("accepts valid passwords conforming to complexity criteria", () => {
@@ -129,14 +168,66 @@ describe("Password Zod Validation Schemas", () => {
       }
     });
 
+    it("accepts password with supplementary Unicode characters (emoji) at exactly 72 code points", () => {
+      // 4 ASCII + 68 emojis = 72 Unicode code points (140 UTF-16 code units)
+      const pass72 = "Ab1!" + "🌴".repeat(68);
+      expect(countCodePoints(pass72)).toBe(72);
+      expect(pass72.length).toBe(140);
+
+      const result = passwordCreationSchema.safeParse(pass72);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        // Must preserve the exact characters
+        expect(result.data).toBe(pass72);
+      }
+    });
+
+    it("rejects password with 73 Unicode code points", () => {
+      // 4 ASCII + 69 emojis = 73 Unicode code points
+      const pass73 = "Ab1!" + "🌴".repeat(69);
+      expect(countCodePoints(pass73)).toBe(73);
+
+      const result = passwordCreationSchema.safeParse(pass73);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(
+          result.error.issues.some((i) => i.message.includes("not exceed 72 characters"))
+        ).toBe(true);
+      }
+    });
+
+    it("accepts password with exactly 8 Unicode code points containing supplementary characters", () => {
+      // 7 ASCII + 1 emoji = 8 Unicode code points (9 UTF-16 code units)
+      const pass8 = "Ab1!xyz🌴";
+      expect(countCodePoints(pass8)).toBe(8);
+      expect(pass8.length).toBe(9);
+
+      const result = passwordCreationSchema.safeParse(pass8);
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects password with 7 Unicode code points containing supplementary characters", () => {
+      // 6 ASCII + 1 emoji = 7 Unicode code points (8 UTF-16 code units)
+      const pass7 = "Ab1!xy🌴";
+      expect(countCodePoints(pass7)).toBe(7);
+      expect(pass7.length).toBe(8);
+
+      const result = passwordCreationSchema.safeParse(pass7);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(
+          result.error.issues.some((i) => i.message.includes("at least 8 characters"))
+        ).toBe(true);
+      }
+    });
+
     it("strictly preserves leading/trailing whitespace without silent trimming", () => {
-      // User-submitted whitespace provides entropy and must not be trimmed
       const passWithSpaces = " Password123! ";
       const result = passwordCreationSchema.safeParse(passWithSpaces);
       expect(result.success).toBe(true);
       if (result.success) {
         expect(result.data).toBe(" Password123! ");
-        expect(result.data.length).toBe(14);
+        expect(countCodePoints(result.data)).toBe(14);
       }
     });
 
@@ -153,8 +244,10 @@ describe("Password Zod Validation Schemas", () => {
       }
     });
 
-    it("rejects passwords exceeding 72 characters", () => {
-      const longPassword = "A1a" + "x".repeat(70); // 73 chars
+    it("rejects passwords exceeding 72 ASCII characters", () => {
+      const longPassword = "A1a" + "x".repeat(70); // 73 code points
+      expect(countCodePoints(longPassword)).toBe(73);
+
       const result = passwordCreationSchema.safeParse(longPassword);
       expect(result.success).toBe(false);
       if (!result.success) {
@@ -196,10 +289,14 @@ describe("Password Zod Validation Schemas", () => {
   });
 
   describe("loginPasswordSchema", () => {
-    it("accepts any non-empty password up to 72 characters", () => {
+    it("accepts any non-empty password up to 72 Unicode code points", () => {
       expect(loginPasswordSchema.safeParse("anyPassword").success).toBe(true);
       expect(loginPasswordSchema.safeParse("simple").success).toBe(true);
       expect(loginPasswordSchema.safeParse("Password123!").success).toBe(true);
+
+      // 72 Unicode code points with emojis (140 UTF-16 code units)
+      const pass72 = "Ab1!" + "🌴".repeat(68);
+      expect(loginPasswordSchema.safeParse(pass72).success).toBe(true);
     });
 
     it("rejects empty password strings", () => {
@@ -212,9 +309,36 @@ describe("Password Zod Validation Schemas", () => {
       }
     });
 
-    it("rejects passwords exceeding 72 characters", () => {
-      const result = loginPasswordSchema.safeParse("x".repeat(73));
-      expect(result.success).toBe(false);
+    it("rejects passwords exceeding 72 Unicode code points", () => {
+      // 73 ASCII
+      expect(loginPasswordSchema.safeParse("x".repeat(73)).success).toBe(false);
+
+      // 73 code points with emojis
+      const pass73 = "Ab1!" + "🌴".repeat(69);
+      expect(loginPasswordSchema.safeParse(pass73).success).toBe(false);
+    });
+  });
+
+  describe("Consistency between Creation, Login, and Hashing Boundaries", () => {
+    it("treats 72 code points as valid across creation, login, and hashing", async () => {
+      const pass72 = "SecureP@ss1" + "🌴".repeat(61);
+      expect(countCodePoints(pass72)).toBe(72);
+
+      expect(passwordCreationSchema.safeParse(pass72).success).toBe(true);
+      expect(loginPasswordSchema.safeParse(pass72).success).toBe(true);
+      const hash = await hashPassword(pass72);
+      expect(await verifyPassword(pass72, hash)).toBe(true);
+    });
+
+    it("treats 73 code points as invalid across creation, login, and hashing", async () => {
+      const pass73 = "SecureP@ss1" + "🌴".repeat(62);
+      expect(countCodePoints(pass73)).toBe(73);
+
+      expect(passwordCreationSchema.safeParse(pass73).success).toBe(false);
+      expect(loginPasswordSchema.safeParse(pass73).success).toBe(false);
+      await expect(hashPassword(pass73)).rejects.toThrow(
+        "Password exceeds maximum length of 72 characters"
+      );
     });
   });
 });
