@@ -72,3 +72,16 @@ export {
   type AuthenticatedPrincipal,
   type AuthenticatedRequest,
 } from "./auth.types";
+
+// Tourist Account Registration (Task 10.4)
+export {
+  registerRequestSchema,
+  SUPPORTED_LANGUAGES,
+  type SupportedLanguage,
+  type RegisterRequestInput,
+} from "./register.schema";
+
+export {
+  registerTouristAccount,
+  type RegistrationResult,
+} from "../services/registration.service";

@@ -3,7 +3,7 @@
  * Configures centralized middleware, security headers, routing, and error handling.
  */
 
-import express, { Express } from "express";
+import express, { Express, RequestHandler } from "express";
 import helmet from "helmet";
 import cookieParser from "cookie-parser";
 import { PrismaClient } from "@prisma/client";
@@ -23,6 +23,7 @@ export interface AppOptions {
   prismaClient?: PrismaClient;
   corsOrigins?: string[];
   logger?: Logger;
+  rateLimiter?: RequestHandler;
 }
 
 export function createApp(options: AppOptions = {}): Express {
@@ -56,7 +57,13 @@ export function createApp(options: AppOptions = {}): Express {
   app.use("/health", createHealthRouter(options.prismaClient));
 
   // Versioned API routes
-  app.use("/api/v1", createApiRouter({ prismaClient: options.prismaClient }));
+  app.use(
+    "/api/v1",
+    createApiRouter({
+      prismaClient: options.prismaClient,
+      rateLimiter: options.rateLimiter,
+    })
+  );
 
   // 8. 404 Catch-All Handler
   app.use(notFoundHandler);

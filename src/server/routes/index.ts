@@ -3,12 +3,14 @@
  * Aggregates foundational routes. Future authentication and domain modules mount here.
  */
 
-import { Router } from "express";
+import { Router, RequestHandler } from "express";
 import { PrismaClient } from "@prisma/client";
 import { createHealthRouter } from "./health.routes";
+import { createAuthRouter } from "./auth.routes";
 
 export interface ApiRouterOptions {
   prismaClient?: PrismaClient;
+  rateLimiter?: RequestHandler;
 }
 
 export function createApiRouter(options: ApiRouterOptions = {}): Router {
@@ -16,6 +18,15 @@ export function createApiRouter(options: ApiRouterOptions = {}): Router {
 
   // Foundational health & readiness endpoints
   router.use("/health", createHealthRouter(options.prismaClient));
+
+  // Module A: Authentication & Identity endpoints
+  router.use(
+    "/auth",
+    createAuthRouter({
+      prismaClient: options.prismaClient,
+      rateLimiter: options.rateLimiter,
+    })
+  );
 
   return router;
 }

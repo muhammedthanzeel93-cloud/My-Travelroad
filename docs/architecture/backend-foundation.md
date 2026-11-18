@@ -405,3 +405,57 @@ The middleware layer (`src/server/middleware/`) provides reusable, modular Expre
 ### 12.6 Explicit Separation of Authentication and Authorization
 - **Authentication (`authenticate`)**: Verifies cryptographic token validity, confirms account existence in PostgreSQL, asserts baseline non-suspension and password freshness, and attaches the `AuthenticatedPrincipal`.
 - **Authorization (`requireRole`, `requireEmailVerified`, `requireAccountStatus`)**: Asserts capability permissions, email verification, and status eligibility. Downstream route handlers remain clean and focused on business logic.
+
+---
+
+## 13. Tourist Account Registration API (`POST /api/v1/auth/register`)
+
+### 13.1 Endpoint Architecture & Purpose
+The tourist registration endpoint provisions public traveler accounts and associated profile projections.
+- **URI**: `POST /api/v1/auth/register`
+- **Authentication**: None (Public).
+- **Rate Limit**: 5 requests per minute per client IP.
+- **Atomicity**: Single PostgreSQL transaction covering `Account`, `AccountSecurityCredential`, and `TouristProfile`.
+
+### 13.2 Request Validation Schema (`registerRequestSchema`)
+Enforced via strict Zod schema rejecting unexpected properties (`.strict()`):
+- **`email`**: Valid RFC 5322 format, maximum 255 characters, normalized to lowercase.
+- **`password`**: 8 to 72 Unicode code points, $\ge 1$ uppercase letter, $\ge 1$ lowercase letter, $\ge 1$ digit. Whitespace preserved exactly without silent trimming.
+- **`displayName`**: 2 to 120 characters, surrounding whitespace trimmed, non-empty.
+- **`handle`**: 3 to 50 characters, regex `^[a-z0-9_]+$`. Uppercase characters and special symbols rejected without silent conversion.
+- **`preferredLanguage`**: Strict allowlist (`['en', 'ml']`), default `'en'`.
+
+### 13.3 Atomic Transaction & Provisioning Invariants
+All records are created within a single `prisma.$transaction`:
+1. **`Account`**:
+   - `type`: `'individual'`
+   - `role`: `'traveler'`
+   - `status`: `'pending_verification'`
+   - `emailVerified`: `false`
+   - `phoneVerified`: `false`
+2. **`AccountSecurityCredential`**:
+   - `accountId`: `Account.id` (1:1)
+   - `passwordHash`: Argon2id MCF format ($argon2id$v=19$m=65536,t=3,p=4$...)
+   - `mfaEnabled`: `false`
+   - `failedLoginAttempts`: `0`
+3. **`TouristProfile`**:
+   - `accountId`: `Account.id` (1:1)
+   - `displayName`: Trimmed display name
+   - `handle`: Validated handle
+   - `preferredLanguage`: Selected or default language
+   - `travelPreferences`: Empty array `[]`
+   - `isPublic`: `true`
+
+### 13.4 Concurrency & Duplicate Handling
+- Concurrency-safe uniqueness is authoritatively enforced by PostgreSQL database constraints (`uq_accounts_email`, `uq_profiles_handle`, `idx_profiles_handle_lower`).
+- Database uniqueness constraint violations (`P2002`) are caught and translated into `409 ConflictError(ErrorCode.DUPLICATE_RESOURCE)` with a generic message: `"An account with the provided email or handle already exists."`.
+- Internal schema names, constraint names, SQL queries, and stack traces are never exposed.
+
+### 13.5 Rate Limiting & Spoofing Defense (`createRateLimiter`)
+- An in-memory rate limiter tracks request counts per IP over a 60-second sliding window.
+- In untrusted proxy configurations (`app.get("trust proxy")` is false), the client IP is extracted strictly from the underlying socket remote address (`req.socket.remoteAddress`), preventing forged `X-Forwarded-For` headers from bypassing throttling.
+- Exceeded rate limits return `429 TooManyRequestsError(ErrorCode.RATE_LIMIT_EXCEEDED)` along with standard `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers.
+
+### 13.6 Stage A Boundaries
+- Registration solely creates identity records. It does **not** authenticate the user, return JWT access tokens, set refresh cookies, or initiate email verification delivery.
+- The 15-table Stage A schema boundary is preserved without migrations.

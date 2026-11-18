@@ -1596,6 +1596,7 @@ components:
           example: amina_explorer
         preferredLanguage:
           type: string
+          enum: [en, ml]
           default: en
           example: en
 
