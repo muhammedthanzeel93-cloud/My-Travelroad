@@ -350,7 +350,7 @@ The authentication module (`src/server/auth/`) establishes reusable cryptographi
 The middleware layer (`src/server/middleware/`) provides reusable, modular Express middleware enforcing server-side identity verification, discrete role authorization, email verification gating, and lifecycle status checks:
 
 ### 12.1 Authentication Middleware (`authenticate`, `createAuthenticateMiddleware`)
-- **Protocol**: Reads HTTP `Authorization: Bearer <token>` header. Rejects missing, non-Bearer, or empty tokens with `401 UnauthorizedError(ErrorCode.AUTHENTICATION_REQUIRED)`.
+- **Protocol**: Reads HTTP `Authorization` header with case-insensitive Bearer scheme parsing (accepting `Bearer`, `bearer`, `BEARER`, `bEaReR` per RFC 6750). Rejects missing headers, unsupported schemes (`Basic`, `Digest`, etc.), or empty/whitespace tokens with `401 UnauthorizedError(ErrorCode.AUTHENTICATION_REQUIRED)`.
 - **Token Verification**: Calls the verified `verifyAccessToken()` primitive. Rejects expired (`TOKEN_EXPIRED`) or corrupted/tampered (`TOKEN_INVALID`) JWTs. Never implements a secondary verification path.
 - **Authoritative Database Synchronization**:
   - Queries PostgreSQL via Prisma `account.findUnique` selecting only minimal operational fields: `id`, `email`, `emailVerified`, `status`, `type`, `role`, and `securityCredentials.passwordChangedAt`.
@@ -362,8 +362,8 @@ The middleware layer (`src/server/middleware/`) provides reusable, modular Expre
   - Deactivated accounts (`status = 'deactivated'`) are rejected immediately with `403 ForbiddenError(ErrorCode.ACCOUNT_DEACTIVATED)`.
   - Unverified accounts (`status = 'pending_verification'`) successfully authenticate to allow access to initial self-service endpoints (`/auth/me`, `/auth/verify-email`, `/auth/resend-verification`), while downstream mutation guards enforce email verification.
 - **Stage A Password Change Invalidation**:
-  - If `AccountSecurityCredential.passwordChangedAt` is populated, the middleware verifies that the token's issued-at timestamp is not earlier than the password change timestamp (`claims.iat >= Math.floor(passwordChangedAt.getTime() / 1000)`).
-  - Tokens issued prior to a password change are rejected with `401 UnauthorizedError(ErrorCode.TOKEN_INVALID)`.
+  - If `AccountSecurityCredential.passwordChangedAt` is populated, the middleware verifies that the token's issued-at timestamp is strictly later than the password change timestamp (`claims.iat > Math.floor(passwordChangedAt.getTime() / 1000)`).
+  - Tokens issued in the same second as, or prior to, a password change (`claims.iat <= Math.floor(passwordChangedAt.getTime() / 1000)`) are conservatively rejected with `401 UnauthorizedError(ErrorCode.TOKEN_INVALID)`, requiring re-authentication.
 - **Fail-Closed Reliability**:
   - Database failures or connection drops fail closed, logging the error and returning `503 ServiceUnavailableError(ErrorCode.SERVICE_UNAVAILABLE)` without leaking database connection strings or internals.
 - **Dependency Injection**:

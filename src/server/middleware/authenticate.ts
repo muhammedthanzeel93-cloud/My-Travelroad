@@ -50,7 +50,7 @@ export function createAuthenticateMiddleware(
       }
 
       const trimmedHeader = authHeader.trim();
-      if (trimmedHeader === "Bearer") {
+      if (trimmedHeader.toLowerCase() === "bearer") {
         return next(
           new UnauthorizedError(
             "Authentication required: empty token",
@@ -59,7 +59,7 @@ export function createAuthenticateMiddleware(
         );
       }
 
-      if (!authHeader.startsWith("Bearer ")) {
+      if (!/^Bearer\s+/i.test(authHeader)) {
         return next(
           new UnauthorizedError(
             "Authentication required: malformed Authorization header, expected 'Bearer <token>'",
@@ -68,7 +68,7 @@ export function createAuthenticateMiddleware(
         );
       }
 
-      const token = authHeader.slice(7).trim();
+      const token = authHeader.replace(/^Bearer\s+/i, "").trim();
       if (!token) {
         return next(
           new UnauthorizedError(
@@ -142,7 +142,7 @@ export function createAuthenticateMiddleware(
         const passwordChangedUnix = Math.floor(
           account.securityCredentials.passwordChangedAt.getTime() / 1000
         );
-        if (claims.iat < passwordChangedUnix) {
+        if (claims.iat <= passwordChangedUnix) {
           return next(
             new UnauthorizedError(
               "Session has been invalidated due to password change",

@@ -87,8 +87,10 @@ describe("Opaque Refresh Token Security Module", () => {
     const otherCreds = generateRefreshToken();
     expect(verifyRefreshTokenHash(otherCreds.rawToken, creds.tokenHash)).toBe(false);
 
-    // Tampered token
-    const tamperedRaw = creds.rawToken.slice(0, -1) + "f";
+    // Tampered token (guaranteeing different character)
+    const lastChar = creds.rawToken.slice(-1);
+    const replacement = lastChar === "a" ? "b" : "a";
+    const tamperedRaw = creds.rawToken.slice(0, -1) + replacement;
     expect(verifyRefreshTokenHash(tamperedRaw, creds.tokenHash)).toBe(false);
 
     // Empty or non-string inputs

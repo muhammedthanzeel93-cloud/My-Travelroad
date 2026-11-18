@@ -6,6 +6,7 @@ import { describe, it, expect, vi } from "vitest";
 import express, { Express } from "express";
 import request from "supertest";
 import { PrismaClient } from "@prisma/client";
+import { SignJWT } from "jose";
 import { createAuthenticateMiddleware } from "../../../src/server/middleware/authenticate";
 import { errorHandler } from "../../../src/server/middleware/error-handler";
 import { signAccessToken, AccessTokenPayload } from "../../../src/server/auth";
@@ -22,6 +23,22 @@ const basePayload: AccessTokenPayload = {
   status: "active",
   gen: 1,
 };
+
+async function createControlledToken(
+  payload: AccessTokenPayload,
+  iat: number,
+  exp: number
+): Promise<string> {
+  const key = new TextEncoder().encode(TEST_SECRET);
+  return await new SignJWT({ ...payload })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setSubject(payload.sub)
+    .setIssuedAt(iat)
+    .setExpirationTime(exp)
+    .setIssuer("https://mytravelroad.com")
+    .setAudience("https://mytravelroad.com")
+    .sign(key);
+}
 
 function createTestApp(prismaMock: unknown): Express {
   const app = express();
@@ -56,31 +73,67 @@ describe("Authentication Middleware", () => {
     expect(res.body.error.message).toContain("missing Authorization header");
   });
 
-  it("rejects request when Authorization header is malformed (no Bearer prefix)", async () => {
-    const app = createTestApp({});
+  it.each(["Bearer", "bearer", "BEARER", "bEaReR"])(
+    "accepts valid Bearer scheme casing '%s'",
+    async (scheme) => {
+      const mockPrisma = {
+        account: {
+          findUnique: vi.fn().mockResolvedValue({
+            id: TEST_ACCOUNT_ID,
+            email: "traveler@mytravelroad.com",
+            emailVerified: true,
+            status: "active",
+            type: "individual",
+            role: "traveler",
+            securityCredentials: null,
+          }),
+        },
+      };
 
-    const res = await request(app)
-      .get("/protected")
-      .set("Authorization", "Basic dXNlcjpwYXNz");
+      const app = createTestApp(mockPrisma);
+      const token = await signAccessToken(basePayload, { secret: TEST_SECRET });
 
-    expect(res.status).toBe(401);
-    expect(res.body.success).toBe(false);
-    expect(res.body.error.code).toBe("AUTHENTICATION_REQUIRED");
-    expect(res.body.error.message).toContain("malformed Authorization header");
-  });
+      const res = await request(app)
+        .get("/protected")
+        .set("Authorization", `${scheme} ${token}`);
 
-  it("rejects request when Bearer token is empty or whitespace", async () => {
-    const app = createTestApp({});
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.auth.accountId).toBe(TEST_ACCOUNT_ID);
+    }
+  );
 
-    const res = await request(app)
-      .get("/protected")
-      .set("Authorization", "Bearer    ");
+  it.each(["Bearer", "bearer", "BEARER", "bEaReR"])(
+    "rejects request when Bearer token is empty or whitespace for casing '%s'",
+    async (scheme) => {
+      const app = createTestApp({});
 
-    expect(res.status).toBe(401);
-    expect(res.body.success).toBe(false);
-    expect(res.body.error.code).toBe("AUTHENTICATION_REQUIRED");
-    expect(res.body.error.message).toContain("empty token");
-  });
+      const res = await request(app)
+        .get("/protected")
+        .set("Authorization", `${scheme}    `);
+
+      expect(res.status).toBe(401);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error.code).toBe("AUTHENTICATION_REQUIRED");
+      expect(res.body.error.message).toContain("empty token");
+    }
+  );
+
+  it.each(["Basic dXNlcjpwYXNz", "Token abcxyz", "Digest realm=test", "BearerToken123"])(
+    "rejects request with unsupported authorization scheme or malformed header '%s'",
+    async (authHeader) => {
+      const app = createTestApp({});
+
+      const res = await request(app)
+        .get("/protected")
+        .set("Authorization", authHeader);
+
+      expect(res.status).toBe(401);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error.code).toBe("AUTHENTICATION_REQUIRED");
+      expect(res.body.error.message).toContain("malformed Authorization header");
+    }
+  );
 
   it("rejects request when JWT has an invalid signature", async () => {
     const app = createTestApp({});
@@ -227,70 +280,190 @@ describe("Authentication Middleware", () => {
     expect(res.body.error.message).toContain("Account has been deactivated");
   });
 
-  it("rejects request when token was issued prior to password change (Stage A invalidation)", async () => {
-    const token = await signAccessToken(basePayload, { secret: TEST_SECRET });
+  describe("Password-Change Invalidation (Controlled Timestamps)", () => {
+    // Controlled reference point relative to current time ensuring token is valid and unexpired
+    const BASE_TIME = Math.floor(Date.now() / 1000) - 100;
 
-    // Simulate password changed 100 seconds in the future relative to token iat
-    const futureDate = new Date(Date.now() + 100000);
+    it("rejects token issued prior to password change (iat < passwordChangedAt)", async () => {
+      // Token issued 10 seconds before password change
+      const token = await createControlledToken(
+        basePayload,
+        BASE_TIME - 10,
+        BASE_TIME + 890
+      );
+      const passwordChangedAt = new Date(BASE_TIME * 1000);
 
-    const mockPrisma = {
-      account: {
-        findUnique: vi.fn().mockResolvedValue({
-          id: TEST_ACCOUNT_ID,
-          email: "traveler@mytravelroad.com",
-          emailVerified: true,
-          status: "active",
-          type: "individual",
-          role: "traveler",
-          securityCredentials: {
-            passwordChangedAt: futureDate,
-          },
-        }),
-      },
-    };
+      const mockPrisma = {
+        account: {
+          findUnique: vi.fn().mockResolvedValue({
+            id: TEST_ACCOUNT_ID,
+            email: "traveler@mytravelroad.com",
+            emailVerified: true,
+            status: "active",
+            type: "individual",
+            role: "traveler",
+            securityCredentials: {
+              passwordChangedAt,
+            },
+          }),
+        },
+      };
 
-    const app = createTestApp(mockPrisma);
+      const app = createTestApp(mockPrisma);
 
-    const res = await request(app)
-      .get("/protected")
-      .set("Authorization", `Bearer ${token}`);
+      const res = await request(app)
+        .get("/protected")
+        .set("Authorization", `Bearer ${token}`);
 
-    expect(res.status).toBe(401);
-    expect(res.body.success).toBe(false);
-    expect(res.body.error.code).toBe("TOKEN_INVALID");
-    expect(res.body.error.message).toContain("Session has been invalidated due to password change");
-  });
+      expect(res.status).toBe(401);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error.code).toBe("TOKEN_INVALID");
+      expect(res.body.error.message).toContain("Session has been invalidated due to password change");
+    });
 
-  it("accepts request when token was issued after password change", async () => {
-    // Password changed in the past (10 minutes ago)
-    const pastDate = new Date(Date.now() - 600000);
+    it("rejects token issued in the exact same second as password change (iat === passwordChangedAt)", async () => {
+      // Token issued at exact same second as password change
+      const token = await createControlledToken(
+        basePayload,
+        BASE_TIME,
+        BASE_TIME + 900
+      );
+      const passwordChangedAt = new Date(BASE_TIME * 1000);
 
-    const mockPrisma = {
-      account: {
-        findUnique: vi.fn().mockResolvedValue({
-          id: TEST_ACCOUNT_ID,
-          email: "traveler@mytravelroad.com",
-          emailVerified: true,
-          status: "active",
-          type: "individual",
-          role: "traveler",
-          securityCredentials: {
-            passwordChangedAt: pastDate,
-          },
-        }),
-      },
-    };
+      const mockPrisma = {
+        account: {
+          findUnique: vi.fn().mockResolvedValue({
+            id: TEST_ACCOUNT_ID,
+            email: "traveler@mytravelroad.com",
+            emailVerified: true,
+            status: "active",
+            type: "individual",
+            role: "traveler",
+            securityCredentials: {
+              passwordChangedAt,
+            },
+          }),
+        },
+      };
 
-    const app = createTestApp(mockPrisma);
-    const token = await signAccessToken(basePayload, { secret: TEST_SECRET });
+      const app = createTestApp(mockPrisma);
 
-    const res = await request(app)
-      .get("/protected")
-      .set("Authorization", `Bearer ${token}`);
+      const res = await request(app)
+        .get("/protected")
+        .set("Authorization", `Bearer ${token}`);
 
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-    expect(res.body.auth.accountId).toBe(TEST_ACCOUNT_ID);
+      expect(res.status).toBe(401);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error.code).toBe("TOKEN_INVALID");
+      expect(res.body.error.message).toContain("Session has been invalidated due to password change");
+    });
+
+    it("rejects token issued in the same second when password change has fractional milliseconds", async () => {
+      // Token issued at BASE_TIME; password changed at BASE_TIME + 650ms
+      const token = await createControlledToken(
+        basePayload,
+        BASE_TIME,
+        BASE_TIME + 900
+      );
+      const passwordChangedAt = new Date(BASE_TIME * 1000 + 650);
+
+      const mockPrisma = {
+        account: {
+          findUnique: vi.fn().mockResolvedValue({
+            id: TEST_ACCOUNT_ID,
+            email: "traveler@mytravelroad.com",
+            emailVerified: true,
+            status: "active",
+            type: "individual",
+            role: "traveler",
+            securityCredentials: {
+              passwordChangedAt,
+            },
+          }),
+        },
+      };
+
+      const app = createTestApp(mockPrisma);
+
+      const res = await request(app)
+        .get("/protected")
+        .set("Authorization", `Bearer ${token}`);
+
+      expect(res.status).toBe(401);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error.code).toBe("TOKEN_INVALID");
+      expect(res.body.error.message).toContain("Session has been invalidated due to password change");
+    });
+
+    it("accepts token issued strictly after password change (iat > passwordChangedAt)", async () => {
+      // Token issued 5 seconds after password change
+      const token = await createControlledToken(
+        basePayload,
+        BASE_TIME + 5,
+        BASE_TIME + 905
+      );
+      const passwordChangedAt = new Date(BASE_TIME * 1000);
+
+      const mockPrisma = {
+        account: {
+          findUnique: vi.fn().mockResolvedValue({
+            id: TEST_ACCOUNT_ID,
+            email: "traveler@mytravelroad.com",
+            emailVerified: true,
+            status: "active",
+            type: "individual",
+            role: "traveler",
+            securityCredentials: {
+              passwordChangedAt,
+            },
+          }),
+        },
+      };
+
+      const app = createTestApp(mockPrisma);
+
+      const res = await request(app)
+        .get("/protected")
+        .set("Authorization", `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.auth.accountId).toBe(TEST_ACCOUNT_ID);
+    });
+
+    it("accepts token when account has no passwordChangedAt timestamp", async () => {
+      const token = await createControlledToken(
+        basePayload,
+        BASE_TIME,
+        BASE_TIME + 900
+      );
+
+      const mockPrisma = {
+        account: {
+          findUnique: vi.fn().mockResolvedValue({
+            id: TEST_ACCOUNT_ID,
+            email: "traveler@mytravelroad.com",
+            emailVerified: true,
+            status: "active",
+            type: "individual",
+            role: "traveler",
+            securityCredentials: {
+              passwordChangedAt: null,
+            },
+          }),
+        },
+      };
+
+      const app = createTestApp(mockPrisma);
+
+      const res = await request(app)
+        .get("/protected")
+        .set("Authorization", `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.auth.accountId).toBe(TEST_ACCOUNT_ID);
+    });
   });
 
   it("fails closed with 503 SERVICE_UNAVAILABLE when database throws an error without leaking secrets", async () => {
