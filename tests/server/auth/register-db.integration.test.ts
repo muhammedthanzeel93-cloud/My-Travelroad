@@ -11,7 +11,55 @@ import { verifyPassword } from "../../../src/server/auth/password";
 import { ConflictError } from "../../../src/server/errors/app-error";
 import { ErrorCode } from "../../../src/server/errors/error-codes";
 
-async function isPortReachable(port: number, host: string, timeoutMs = 500): Promise<boolean> {
+/**
+ * Extracts connection parameters dynamically from DATABASE_URL.
+ */
+function parseDatabaseConfig(urlStr: string | undefined): { host: string; port: number; database: string } {
+  if (!urlStr) {
+    throw new Error(
+      "DATABASE_URL environment variable is missing or empty. Please set DATABASE_URL in your test environment or .env file."
+    );
+  }
+  try {
+    const parsed = new URL(urlStr);
+    return {
+      host: parsed.hostname || "127.0.0.1",
+      port: parsed.port ? parseInt(parsed.port, 10) : 5432,
+      database: parsed.pathname.replace(/^\//, ""),
+    };
+  } catch {
+    throw new Error(
+      `Invalid DATABASE_URL format: ${urlStr}. Expected postgresql://user:password@host:port/database`
+    );
+  }
+}
+
+/**
+ * Prohibits running destructive integration test suites against production databases.
+ */
+function assertTestDatabaseSafety(databaseUrl: string, databaseName: string): void {
+  if (process.env.NODE_ENV === "production") {
+    throw new Error(
+      "SAFETY CHECK FAILED: Refusing to run integration tests with destructive cleanup when NODE_ENV is 'production'."
+    );
+  }
+  const lowerUrl = databaseUrl.toLowerCase();
+  const lowerName = databaseName.toLowerCase();
+  if (
+    lowerName.includes("prod") ||
+    lowerName.includes("production") ||
+    lowerUrl.includes("production")
+  ) {
+    throw new Error(
+      `SAFETY CHECK FAILED: Database name '${databaseName}' appears to be a production database. Integration tests require an isolated test database.`
+    );
+  }
+}
+
+/**
+ * Probes socket reachability with a strict timeout to prevent worker pool hangs.
+ */
+async function isPortReachable(port: number, host: string, timeoutMs = 1000): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = new net.Socket();
     socket.setTimeout(timeoutMs);
@@ -33,48 +81,66 @@ async function isPortReachable(port: number, host: string, timeoutMs = 500): Pro
 }
 
 describe("PostgreSQL Integration: Tourist Account Registration", () => {
-  let isDatabaseAvailable = false;
-  const createdAccountIds: string[] = [];
+  const createdAccountIds = new Set<string>();
+  const createdEmails = new Set<string>();
 
   beforeAll(async () => {
-    const portOpen = await isPortReachable(5432, "127.0.0.1", 500);
-    if (!portOpen) {
-      isDatabaseAvailable = false;
-      return;
+    const databaseUrl = process.env.DATABASE_URL;
+    const { host, port, database } = parseDatabaseConfig(databaseUrl);
+    assertTestDatabaseSafety(databaseUrl!, database);
+
+    const reachable = await isPortReachable(port, host, 1000);
+    if (!reachable) {
+      throw new Error(
+        `\n==============================================================================\n` +
+          `POSTGRESQL CONNECTION ERROR: Cannot reach PostgreSQL at ${host}:${port}.\n` +
+          `The tourist registration database integration suite requires a running PostgreSQL instance.\n\n` +
+          `How to configure and start the test database:\n` +
+          `  1. Ensure PostgreSQL is running (e.g. Docker:\n` +
+          `     docker run --name mytravelroad-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgis/postgis:15-3.3)\n` +
+          `  2. Set DATABASE_URL in .env to your test database: e.g.\n` +
+          `     postgresql://postgres:postgres@127.0.0.1:5432/mytravelroad?schema=public\n` +
+          `  3. Apply database migrations: npx prisma migrate deploy\n` +
+          `==============================================================================\n`
+      );
     }
-    isDatabaseAvailable = await checkDatabaseHealth();
+
+    const isHealthy = await checkDatabaseHealth();
+    if (!isHealthy) {
+      throw new Error(
+        `\n==============================================================================\n` +
+          `POSTGRESQL HEALTH CHECK FAILED: Connected to port ${port} on ${host}, but 'SELECT 1' failed.\n` +
+          `Please ensure database '${database}' exists and migrations have been applied.\n` +
+          `==============================================================================\n`
+      );
+    }
   });
 
   afterEach(async () => {
-    if (isDatabaseAvailable && createdAccountIds.length > 0) {
-      const idsToDelete = [...createdAccountIds];
-      createdAccountIds.length = 0;
-      try {
-        await prisma.account.deleteMany({
-          where: { id: { in: idsToDelete } },
-        });
-      } catch {
-        // Cleanup best-effort
-      }
+    if (createdAccountIds.size > 0 || createdEmails.size > 0) {
+      const ids = Array.from(createdAccountIds);
+      const emails = Array.from(createdEmails);
+      createdAccountIds.clear();
+      createdEmails.clear();
+
+      await prisma.account.deleteMany({
+        where: {
+          OR: [{ id: { in: ids } }, { email: { in: emails } }],
+        },
+      });
     }
   });
 
   afterAll(async () => {
-    if (isDatabaseAvailable) {
-      await prisma.$disconnect();
-    }
+    await prisma.$disconnect();
   });
 
   it("successfully creates all three records (Account, SecurityCredential, TouristProfile) in PostgreSQL", async () => {
-    if (!isDatabaseAvailable) {
-      expect(true).toBe(true);
-      return;
-    }
-
     const uniqueSuffix = `${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const email = `pg_success_${uniqueSuffix}@example.com`;
     const handle = `pg_succ_${uniqueSuffix}`;
     const password = "ValidPassword123!";
+    createdEmails.add(email);
 
     const result = await registerTouristAccount(
       {
@@ -88,7 +154,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
     );
 
     expect(result.account.id).toBeDefined();
-    createdAccountIds.push(result.account.id);
+    createdAccountIds.add(result.account.id);
 
     // 1. Verify Account record in PostgreSQL
     const dbAccount = await prisma.account.findUnique({
@@ -124,63 +190,78 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
     expect(dbProfile?.isPublic).toBe(true);
   });
 
-  it("rolls back the entire transaction if credential or profile creation fails, leaving no orphaned account", async () => {
-    if (!isDatabaseAvailable) {
-      expect(true).toBe(true);
-      return;
-    }
-
+  it("rolls back the entire transaction if profile creation fails, leaving no orphaned account or credentials", async () => {
     const uniqueSuffix = `${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const email = `pg_rollback_${uniqueSuffix}@example.com`;
+    const handle = `pg_rb_${uniqueSuffix}`;
+    createdEmails.add(email);
 
-    // Execute transaction that intentionally fails on profile insertion (e.g. check constraint violation on handle length)
-    let caughtError: unknown = null;
+    // Install temporary database failure mechanism: trigger that raises exception on INSERT to tourist_profiles
+    await prisma.$executeRawUnsafe(`
+      CREATE OR REPLACE FUNCTION trg_test_fail_profile_insert()
+      RETURNS trigger AS $$
+      BEGIN
+        RAISE EXCEPTION 'TEST_INDUCED_PROFILE_INSERT_FAILURE';
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+
+    await prisma.$executeRawUnsafe(`
+      DROP TRIGGER IF EXISTS trg_test_fail_profile ON tourist_profiles;
+      CREATE TRIGGER trg_test_fail_profile
+      BEFORE INSERT ON tourist_profiles
+      FOR EACH ROW
+      EXECUTE FUNCTION trg_test_fail_profile_insert();
+    `);
+
     try {
-      await prisma.$transaction(async (tx) => {
-        const account = await tx.account.create({
-          data: {
+      let caughtError: unknown = null;
+      try {
+        await registerTouristAccount(
+          {
             email,
-            type: "individual",
-            role: "traveler",
-            status: "pending_verification",
-            emailVerified: false,
-            phoneVerified: false,
+            password: "ValidPassword123!",
+            displayName: "Rollback User",
+            handle,
+            preferredLanguage: "en",
           },
-        });
+          prisma
+        );
+      } catch (err) {
+        caughtError = err;
+      }
 
-        await tx.accountSecurityCredential.create({
-          data: {
-            accountId: account.id,
-            passwordHash: "$argon2id$v=19$m=65536,t=3,p=4$fakehash",
-            mfaEnabled: false,
-            failedLoginAttempts: 0,
-          },
-        });
+      // Must reject due to the induced database layer failure
+      expect(caughtError).not.toBeNull();
 
-        // Deliberately throw an error to trigger transaction rollback
-        throw new Error("Simulated profile failure triggering transaction rollback");
+      // Verify that NO records were committed in PostgreSQL (atomic transaction rollback)
+      const orphanedAccount = await prisma.account.findUnique({
+        where: { email },
       });
-    } catch (err) {
-      caughtError = err;
+      expect(orphanedAccount).toBeNull();
+
+      const orphanedCredential = await prisma.accountSecurityCredential.findFirst({
+        where: { account: { email } },
+      });
+      expect(orphanedCredential).toBeNull();
+
+      const orphanedProfile = await prisma.touristProfile.findFirst({
+        where: { handle },
+      });
+      expect(orphanedProfile).toBeNull();
+    } finally {
+      // Safe teardown: always drop the temporary test trigger and function
+      await prisma.$executeRawUnsafe(`
+        DROP TRIGGER IF EXISTS trg_test_fail_profile ON tourist_profiles;
+        DROP FUNCTION IF EXISTS trg_test_fail_profile_insert();
+      `);
     }
-
-    expect(caughtError).not.toBeNull();
-
-    // Verify that the Account was NOT persisted in PostgreSQL (rollback verified)
-    const orphanedAccount = await prisma.account.findUnique({
-      where: { email },
-    });
-    expect(orphanedAccount).toBeNull();
   });
 
   it("enforces PostgreSQL duplicate email constraint (uq_accounts_email) and returns 409 DUPLICATE_RESOURCE", async () => {
-    if (!isDatabaseAvailable) {
-      expect(true).toBe(true);
-      return;
-    }
-
     const uniqueSuffix = `${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const sharedEmail = `pg_dup_email_${uniqueSuffix}@example.com`;
+    createdEmails.add(sharedEmail);
 
     // 1. First registration succeeds
     const firstRes = await registerTouristAccount(
@@ -193,7 +274,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
       },
       prisma
     );
-    createdAccountIds.push(firstRes.account.id);
+    createdAccountIds.add(firstRes.account.id);
 
     // 2. Second registration with the same email must be rejected by PostgreSQL constraint
     let conflictError: ConflictError | null = null;
@@ -227,18 +308,17 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
   });
 
   it("enforces PostgreSQL duplicate handle constraint (uq_profiles_handle) and returns 409 DUPLICATE_RESOURCE", async () => {
-    if (!isDatabaseAvailable) {
-      expect(true).toBe(true);
-      return;
-    }
-
     const uniqueSuffix = `${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const sharedHandle = `pg_dup_handle_${uniqueSuffix}`;
+    const emailOne = `pg_handle_one_${uniqueSuffix}@example.com`;
+    const emailTwo = `pg_handle_two_${uniqueSuffix}@example.com`;
+    createdEmails.add(emailOne);
+    createdEmails.add(emailTwo);
 
     // 1. First registration succeeds
     const firstRes = await registerTouristAccount(
       {
-        email: `pg_handle_one_${uniqueSuffix}@example.com`,
+        email: emailOne,
         password: "ValidPassword123!",
         displayName: "First User",
         handle: sharedHandle,
@@ -246,14 +326,14 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
       },
       prisma
     );
-    createdAccountIds.push(firstRes.account.id);
+    createdAccountIds.add(firstRes.account.id);
 
     // 2. Second registration with the same handle must be rejected by PostgreSQL
     let conflictError: ConflictError | null = null;
     try {
       await registerTouristAccount(
         {
-          email: `pg_handle_two_${uniqueSuffix}@example.com`,
+          email: emailTwo,
           password: "ValidPassword123!",
           displayName: "Second User",
           handle: sharedHandle,
@@ -280,13 +360,9 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
   });
 
   it("handles two concurrent registration attempts with identical email: exactly one succeeds and one returns 409", async () => {
-    if (!isDatabaseAvailable) {
-      expect(true).toBe(true);
-      return;
-    }
-
     const uniqueSuffix = `${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const sharedEmail = `pg_concurrent_email_${uniqueSuffix}@example.com`;
+    createdEmails.add(sharedEmail);
 
     const payloadA = {
       email: sharedEmail,
@@ -319,7 +395,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
 
     // Track successful account for cleanup
     const fulfilledResult = successes[0] as PromiseFulfilledResult<any>;
-    createdAccountIds.push(fulfilledResult.value.account.id);
+    createdAccountIds.add(fulfilledResult.value.account.id);
 
     // Verify rejection error is 409 DUPLICATE_RESOURCE
     const rejectedResult = rejections[0] as PromiseRejectedResult;
@@ -335,16 +411,15 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
   });
 
   it("handles two concurrent registration attempts with identical handle: exactly one succeeds and one returns 409", async () => {
-    if (!isDatabaseAvailable) {
-      expect(true).toBe(true);
-      return;
-    }
-
     const uniqueSuffix = `${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const sharedHandle = `pg_conc_hnd_${uniqueSuffix}`;
+    const emailA = `conc_user_a_${uniqueSuffix}@example.com`;
+    const emailB = `conc_user_b_${uniqueSuffix}@example.com`;
+    createdEmails.add(emailA);
+    createdEmails.add(emailB);
 
     const payloadA = {
-      email: `conc_user_a_${uniqueSuffix}@example.com`,
+      email: emailA,
       password: "PasswordA123!",
       displayName: "Concurrent User A",
       handle: sharedHandle,
@@ -352,7 +427,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
     };
 
     const payloadB = {
-      email: `conc_user_b_${uniqueSuffix}@example.com`,
+      email: emailB,
       password: "PasswordB123!",
       displayName: "Concurrent User B",
       handle: sharedHandle,
@@ -372,7 +447,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
     expect(rejections.length).toBe(1);
 
     const fulfilledResult = successes[0] as PromiseFulfilledResult<any>;
-    createdAccountIds.push(fulfilledResult.value.account.id);
+    createdAccountIds.add(fulfilledResult.value.account.id);
 
     const rejectedResult = rejections[0] as PromiseRejectedResult;
     expect(rejectedResult.reason).toBeInstanceOf(ConflictError);

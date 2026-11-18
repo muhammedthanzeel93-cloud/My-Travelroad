@@ -550,17 +550,21 @@ END;
 $$;
 
 -- ------------------------------------------------------------------------------
--- Test 15: Concurrent Registration Race Conflict Invariant
+-- Test 15: Sequential Duplicate Registration Conflict Invariant (PostgreSQL Unique Constraint Integrity)
 -- ------------------------------------------------------------------------------
+-- Note: This test verifies PostgreSQL unique constraint enforcement on sequential
+-- duplicate registration inserts within the database engine. Genuine multi-client
+-- concurrent registration race conditions are verified at the application service
+-- layer via Vitest Promise.allSettled tests in tests/server/auth/register-db.integration.test.ts.
 DO $$
 DECLARE
-    v_email TEXT := 'race_test@mytravelroad.local';
+    v_email TEXT := 'conflict_test@mytravelroad.local';
     v_acc1 UUID := gen_random_uuid();
     v_acc2 UUID := gen_random_uuid();
     v_success_count INTEGER := 0;
     v_conflict_count INTEGER := 0;
 BEGIN
-    -- Candidate 1
+    -- Candidate 1: Initial insertion succeeds
     BEGIN
         INSERT INTO accounts (id, email, type, role, status)
         VALUES (v_acc1, v_email, 'individual', 'traveler', 'pending_verification');
@@ -569,7 +573,7 @@ BEGIN
         v_conflict_count := v_conflict_count + 1;
     END;
 
-    -- Candidate 2 (racing on the same email)
+    -- Candidate 2: Sequential duplicate insert on identical email must raise unique_violation
     BEGIN
         INSERT INTO accounts (id, email, type, role, status)
         VALUES (v_acc2, v_email, 'individual', 'traveler', 'pending_verification');
@@ -579,11 +583,11 @@ BEGIN
     END;
 
     IF v_success_count != 1 OR v_conflict_count != 1 THEN
-        RAISE EXCEPTION 'TEST 15 FAILED: Concurrent race simulation did not result in exactly 1 success and 1 conflict (success: %, conflict: %)',
+        RAISE EXCEPTION 'TEST 15 FAILED: Sequential duplicate registration test did not result in exactly 1 success and 1 conflict (success: %, conflict: %)',
             v_success_count, v_conflict_count;
     END IF;
 
-    RAISE NOTICE 'Test 15 PASSED: Concurrent duplicate registration race invariant verified in PostgreSQL.';
+    RAISE NOTICE 'Test 15 PASSED: Sequential duplicate registration conflict invariant verified in PostgreSQL (concurrent races verified via Vitest integration tests).';
 END;
 $$;
 
