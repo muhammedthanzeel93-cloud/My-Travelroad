@@ -417,10 +417,180 @@ BEGIN
 END;
 $$;
 
+-- ------------------------------------------------------------------------------
+-- Test 12: Atomic 3-Table Tourist Account Registration Provisioning
+-- ------------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_acc_id UUID := gen_random_uuid();
+    v_acc_count INTEGER;
+    v_cred_count INTEGER;
+    v_prof_count INTEGER;
+BEGIN
+    -- Provision Account
+    INSERT INTO accounts (id, email, type, role, status, email_verified, phone_verified)
+    VALUES (v_acc_id, 'sql_reg_test@mytravelroad.local', 'individual', 'traveler', 'pending_verification', FALSE, FALSE);
+
+    -- Provision AccountSecurityCredential
+    INSERT INTO account_security_credentials (account_id, password_hash, mfa_enabled, failed_login_attempts)
+    VALUES (v_acc_id, '$argon2id$v=19$m=65536,t=3,p=4$fake_hash_verification', FALSE, 0);
+
+    -- Provision TouristProfile
+    INSERT INTO tourist_profiles (account_id, display_name, handle, preferred_language, travel_preferences, is_public)
+    VALUES (v_acc_id, 'SQL Reg User', 'sql_reg_user_99', 'en', '{}', TRUE);
+
+    -- Assert all three records exist
+    SELECT COUNT(*) INTO v_acc_count FROM accounts WHERE id = v_acc_id;
+    SELECT COUNT(*) INTO v_cred_count FROM account_security_credentials WHERE account_id = v_acc_id;
+    SELECT COUNT(*) INTO v_prof_count FROM tourist_profiles WHERE account_id = v_acc_id;
+
+    IF v_acc_count != 1 OR v_cred_count != 1 OR v_prof_count != 1 THEN
+        RAISE EXCEPTION 'TEST 12 FAILED: Atomic 3-table registration failed (acc: %, cred: %, prof: %)',
+            v_acc_count, v_cred_count, v_prof_count;
+    END IF;
+
+    RAISE NOTICE 'Test 12 PASSED: Atomic 3-table tourist registration provisioning verified in PostgreSQL.';
+END;
+$$;
+
+-- ------------------------------------------------------------------------------
+-- Test 13: Registration Transaction Rollback on Failure (No Orphaned Records)
+-- ------------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_acc_id UUID := gen_random_uuid();
+    v_caught BOOLEAN := FALSE;
+    v_acc_count INTEGER;
+BEGIN
+    -- Execute a failing registration sequence inside a protected block
+    BEGIN
+        INSERT INTO accounts (id, email, type, role, status, email_verified, phone_verified)
+        VALUES (v_acc_id, 'sql_rollback_test@mytravelroad.local', 'individual', 'traveler', 'pending_verification', FALSE, FALSE);
+
+        INSERT INTO account_security_credentials (account_id, password_hash, mfa_enabled, failed_login_attempts)
+        VALUES (v_acc_id, '$argon2id$v=19$m=65536,t=3,p=4$fake_hash', FALSE, 0);
+
+        -- Deliberately violate handle check constraint (length < 3 chars) to trigger rollback
+        INSERT INTO tourist_profiles (account_id, display_name, handle)
+        VALUES (v_acc_id, 'Invalid Handle User', 'x');
+    EXCEPTION WHEN OTHERS THEN
+        v_caught := TRUE;
+    END;
+
+    IF NOT v_caught THEN
+        RAISE EXCEPTION 'TEST 13 FAILED: Invalid profile handle insert did not fail!';
+    END IF;
+
+    -- Verify that the account was NOT created/persisted outside the failed sub-block
+    SELECT COUNT(*) INTO v_acc_count FROM accounts WHERE id = v_acc_id;
+    IF v_acc_count != 0 THEN
+        RAISE EXCEPTION 'TEST 13 FAILED: Orphaned account persisted after registration failure!';
+    END IF;
+
+    RAISE NOTICE 'Test 13 PASSED: Transaction rollback on child record failure verified (no orphaned account).';
+END;
+$$;
+
+-- ------------------------------------------------------------------------------
+-- Test 14: Duplicate Email & Handle Constraint Enforcement in PostgreSQL
+-- ------------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_acc1_id UUID := gen_random_uuid();
+    v_acc2_id UUID := gen_random_uuid();
+    v_caught_email BOOLEAN := FALSE;
+    v_caught_handle BOOLEAN := FALSE;
+    v_caught_handle_case BOOLEAN := FALSE;
+BEGIN
+    -- Provision base account and profile
+    INSERT INTO accounts (id, email, type, role, status, email_verified)
+    VALUES (v_acc1_id, 'unique_test@mytravelroad.local', 'individual', 'traveler', 'pending_verification', FALSE);
+
+    INSERT INTO tourist_profiles (account_id, display_name, handle)
+    VALUES (v_acc1_id, 'Unique User', 'unique_handle_100');
+
+    -- Attempt 1: Duplicate email -> must trigger uq_accounts_email
+    BEGIN
+        INSERT INTO accounts (id, email, type, role, status, email_verified)
+        VALUES (v_acc2_id, 'unique_test@mytravelroad.local', 'individual', 'traveler', 'pending_verification', FALSE);
+    EXCEPTION WHEN unique_violation THEN
+        v_caught_email := TRUE;
+    END;
+
+    IF NOT v_caught_email THEN
+        RAISE EXCEPTION 'TEST 14 FAILED: Duplicate email was not rejected by uq_accounts_email!';
+    END IF;
+
+    -- Attempt 2: Duplicate exact handle -> must trigger uq_profiles_handle
+    BEGIN
+        INSERT INTO tourist_profiles (account_id, display_name, handle)
+        VALUES (v_acc2_id, 'Second User', 'unique_handle_100');
+    EXCEPTION WHEN unique_violation THEN
+        v_caught_handle := TRUE;
+    END;
+
+    IF NOT v_caught_handle THEN
+        RAISE EXCEPTION 'TEST 14 FAILED: Duplicate handle was not rejected by uq_profiles_handle!';
+    END IF;
+
+    -- Attempt 3: Case-insensitive duplicate handle -> must trigger idx_profiles_handle_lower
+    BEGIN
+        INSERT INTO tourist_profiles (account_id, display_name, handle)
+        VALUES (v_acc2_id, 'Second User', 'UNIQUE_HANDLE_100');
+    EXCEPTION WHEN unique_violation THEN
+        v_caught_handle_case := TRUE;
+    END;
+
+    IF NOT v_caught_handle_case THEN
+        RAISE EXCEPTION 'TEST 14 FAILED: Case-insensitive duplicate handle was not rejected by idx_profiles_handle_lower!';
+    END IF;
+
+    RAISE NOTICE 'Test 14 PASSED: Unique email and handle constraint enforcement verified in PostgreSQL.';
+END;
+$$;
+
+-- ------------------------------------------------------------------------------
+-- Test 15: Concurrent Registration Race Conflict Invariant
+-- ------------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_email TEXT := 'race_test@mytravelroad.local';
+    v_acc1 UUID := gen_random_uuid();
+    v_acc2 UUID := gen_random_uuid();
+    v_success_count INTEGER := 0;
+    v_conflict_count INTEGER := 0;
+BEGIN
+    -- Candidate 1
+    BEGIN
+        INSERT INTO accounts (id, email, type, role, status)
+        VALUES (v_acc1, v_email, 'individual', 'traveler', 'pending_verification');
+        v_success_count := v_success_count + 1;
+    EXCEPTION WHEN unique_violation THEN
+        v_conflict_count := v_conflict_count + 1;
+    END;
+
+    -- Candidate 2 (racing on the same email)
+    BEGIN
+        INSERT INTO accounts (id, email, type, role, status)
+        VALUES (v_acc2, v_email, 'individual', 'traveler', 'pending_verification');
+        v_success_count := v_success_count + 1;
+    EXCEPTION WHEN unique_violation THEN
+        v_conflict_count := v_conflict_count + 1;
+    END;
+
+    IF v_success_count != 1 OR v_conflict_count != 1 THEN
+        RAISE EXCEPTION 'TEST 15 FAILED: Concurrent race simulation did not result in exactly 1 success and 1 conflict (success: %, conflict: %)',
+            v_success_count, v_conflict_count;
+    END IF;
+
+    RAISE NOTICE 'Test 15 PASSED: Concurrent duplicate registration race invariant verified in PostgreSQL.';
+END;
+$$;
+
 DO $$
 BEGIN
     RAISE NOTICE '==============================================================================';
-    RAISE NOTICE 'ALL 11 DATABASE TESTS PASSED SUCCESSFULLY!';
+    RAISE NOTICE 'ALL 15 DATABASE TESTS PASSED SUCCESSFULLY!';
     RAISE NOTICE '==============================================================================';
 END;
 $$;

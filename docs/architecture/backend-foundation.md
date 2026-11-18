@@ -451,10 +451,17 @@ All records are created within a single `prisma.$transaction`:
 - Database uniqueness constraint violations (`P2002`) are caught and translated into `409 ConflictError(ErrorCode.DUPLICATE_RESOURCE)` with a generic message: `"An account with the provided email or handle already exists."`.
 - Internal schema names, constraint names, SQL queries, and stack traces are never exposed.
 
-### 13.5 Rate Limiting & Spoofing Defense (`createRateLimiter`)
-- An in-memory rate limiter tracks request counts per IP over a 60-second sliding window.
-- In untrusted proxy configurations (`app.get("trust proxy")` is false), the client IP is extracted strictly from the underlying socket remote address (`req.socket.remoteAddress`), preventing forged `X-Forwarded-For` headers from bypassing throttling.
-- Exceeded rate limits return `429 TooManyRequestsError(ErrorCode.RATE_LIMIT_EXCEEDED)` along with standard `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers.
+### 13.5 Rate Limiting, Spoofing Defense & Multi-Instance Deployment Boundary (`createRateLimiter`)
+- **Process-Local Scope & Stage A Invariants**:
+  - The Stage A rate limiter maintains request counts in a process-local in-memory `Map` over a 60-second sliding window (5 requests per minute per IP).
+  - In untrusted proxy configurations (`app.get("trust proxy")` is false), the client IP is extracted strictly from the underlying socket remote address (`req.socket.remoteAddress`), preventing forged `X-Forwarded-For` headers from bypassing throttling.
+  - Exceeded rate limits return `429 TooManyRequestsError(ErrorCode.RATE_LIMIT_EXCEEDED)` along with standard `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers.
+- **Multi-Instance Deployment Boundary & Shared Rate Limiting**:
+  - Because counters are stored in an in-memory `Map`, each Node.js process maintains an isolated counter. In a horizontally scaled multi-instance deployment (e.g., behind a load balancer, reverse proxy cluster, or container replicas), requests from a single client IP distributed across $N$ instances could permit up to $N \times 5$ requests per minute.
+  - Before deploying My Travelroad across multiple application instances, rate limiting must be transitioned to a shared rate-limiting mechanism:
+    1. **Distributed Cache (Stage A+)**: A shared Redis-backed sliding-window counter using atomic Lua evaluation or sliding-log sorted sets (`ZADD`, `ZREMRANGEBYSCORE`).
+    2. **Edge / API Gateway Throttling**: Centralized rate limiting at the ingress or reverse proxy layer (e.g., NGINX `limit_req_zone`, Cloudflare Rate Limiting Rules, or AWS WAF Rate-Based Rules), terminating abusive traffic before reaching backend application instances.
+  - Consistent with Stage A boundaries, no Redis dependency or database rate-limiting schema is introduced in this phase.
 
 ### 13.6 Stage A Boundaries
 - Registration solely creates identity records. It does **not** authenticate the user, return JWT access tokens, set refresh cookies, or initiate email verification delivery.
