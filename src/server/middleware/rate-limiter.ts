@@ -122,3 +122,13 @@ export const registrationRateLimiter = createRateLimiter({
   max: 5,
   message: "Too many registration attempts. Please try again later.",
 });
+
+/**
+ * Default login rate limiter: 5 requests per minute per IP.
+ * Enforces per-IP login throttling matching api-contracts.md Module A Section 2.
+ */
+export const loginRateLimiter = createRateLimiter({
+  windowMs: 60_000,
+  max: 5,
+  message: "Too many login attempts. Please try again later.",
+});

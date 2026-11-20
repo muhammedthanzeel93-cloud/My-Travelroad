@@ -74,6 +74,15 @@ export class ValidationError extends AppError {
   }
 }
 
+export class LockedError extends AppError {
+  constructor(
+    message = "Account is temporarily locked due to excessive failed login attempts.",
+    code: string = ErrorCode.ACCOUNT_LOCKED
+  ) {
+    super(423, code, message);
+  }
+}
+
 export class TooManyRequestsError extends AppError {
   constructor(message = "Too many requests. Please try again later.") {
     super(429, ErrorCode.RATE_LIMIT_EXCEEDED, message);

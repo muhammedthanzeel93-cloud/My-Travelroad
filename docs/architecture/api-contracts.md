@@ -91,7 +91,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 {
   "success": true,
   "data": {
-    "accessToken": "eyJhbGciOiJSUzI1NiIs...",
+    "accessToken": "eyJhbGciOiJIUzI1NiIs...",
     "tokenType": "Bearer",
     "expiresIn": 900,
     "account": {
@@ -110,7 +110,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 {
   "success": true,
   "data": {
-    "accessToken": "eyJhbGciOiJSUzI1NiIs...",
+    "accessToken": "eyJhbGciOiJIUzI1NiIs...",
     "tokenType": "Bearer",
     "expiresIn": 900,
     "account": {
@@ -162,7 +162,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 {
   "success": true,
   "data": {
-    "accessToken": "eyJhbGciOiJSUzI1NiIs...",
+    "accessToken": "eyJhbGciOiJIUzI1NiIs...",
     "tokenType": "Bearer",
     "expiresIn": 900
   }

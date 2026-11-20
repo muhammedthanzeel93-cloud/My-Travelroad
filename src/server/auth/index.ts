@@ -85,3 +85,14 @@ export {
   registerTouristAccount,
   type RegistrationResult,
 } from "../services/registration.service";
+
+// User Login (Task 10.5)
+export {
+  loginRequestSchema,
+  type LoginRequestInput,
+} from "./login.schema";
+
+export {
+  authenticateLogin,
+  type LoginResult,
+} from "../services/login.service";
