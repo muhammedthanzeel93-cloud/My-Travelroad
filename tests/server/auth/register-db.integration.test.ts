@@ -5,11 +5,18 @@
 
 import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import net from "net";
-import { prisma, checkDatabaseHealth } from "../../../src/lib/db";
+import { PrismaClient } from "@prisma/client";
+import { PRISMA_LOG_CONFIG } from "../../../src/lib/db";
 import { registerTouristAccount } from "../../../src/server/services/registration.service";
 import { verifyPassword } from "../../../src/server/auth/password";
 import { ConflictError } from "../../../src/server/errors/app-error";
 import { ErrorCode } from "../../../src/server/errors/error-codes";
+
+/**
+ * Dedicated PrismaClient instance explicitly bound to the validated test database URL.
+ * Guarantees zero target mismatch between safety checks and database operations.
+ */
+let testPrisma: PrismaClient;
 
 /**
  * Extracts connection parameters dynamically from a database URL.
@@ -128,13 +135,31 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
       );
     }
 
-    const isHealthy = await checkDatabaseHealth();
-    if (!isHealthy) {
+    // Initialize dedicated PrismaClient explicitly configured with the validated test database URL
+    testPrisma = new PrismaClient({
+      datasources: {
+        db: {
+          url: databaseUrl,
+        },
+      },
+      log: PRISMA_LOG_CONFIG,
+    });
+
+    // Query active database identity to mathematically confirm the Prisma client matches the validated test target
+    try {
+      const identityResult = await testPrisma.$queryRaw<Array<{ current_database: string }>>`
+        SELECT current_database();
+      `;
+      const effectiveDatabase = identityResult[0]?.current_database;
+      if (effectiveDatabase !== database) {
+        throw new Error(
+          `SAFETY CHECK FAILED: Effective database identity '${effectiveDatabase}' does not match expected test database '${database}'. Aborting.`
+        );
+      }
+    } catch (err) {
+      await testPrisma.$disconnect();
       throw new Error(
-        `\n==============================================================================\n` +
-          `POSTGRESQL HEALTH CHECK FAILED: Connected to port ${port} on ${host}, but 'SELECT 1' failed.\n` +
-          `Please ensure database '${database}' exists and migrations have been applied.\n` +
-          `==============================================================================\n`
+        `POSTGRESQL HEALTH/IDENTITY CHECK FAILED: Connected to port ${port} on ${host}, but database validation query failed: ${err instanceof Error ? err.message : String(err)}`
       );
     }
   });
@@ -144,7 +169,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
       const ids = Array.from(createdAccountIds);
       const emails = Array.from(createdEmails);
       try {
-        await prisma.account.deleteMany({
+        await testPrisma.account.deleteMany({
           where: {
             OR: [{ id: { in: ids } }, { email: { in: emails } }],
           },
@@ -164,10 +189,11 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
 
   afterAll(async () => {
     try {
-      if (createdAccountIds.size > 0 || createdEmails.size > 0) {
+      if (testPrisma && (createdAccountIds.size > 0 || createdEmails.size > 0)) {
         const ids = Array.from(createdAccountIds);
         const emails = Array.from(createdEmails);
-        await prisma.account.deleteMany({
+        // Do NOT swallow cleanup failures in afterAll; let failures propagate
+        await testPrisma.account.deleteMany({
           where: {
             OR: [{ id: { in: ids } }, { email: { in: emails } }],
           },
@@ -175,10 +201,10 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
         createdAccountIds.clear();
         createdEmails.clear();
       }
-    } catch (err) {
-      console.error("Warning: afterAll final sweep cleanup encountered an error:", err);
     } finally {
-      await prisma.$disconnect();
+      if (testPrisma) {
+        await testPrisma.$disconnect();
+      }
     }
   });
 
@@ -197,14 +223,14 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
         handle,
         preferredLanguage: "en",
       },
-      prisma
+      testPrisma
     );
 
     expect(result.account.id).toBeDefined();
     createdAccountIds.add(result.account.id);
 
     // 1. Verify Account record in PostgreSQL
-    const dbAccount = await prisma.account.findUnique({
+    const dbAccount = await testPrisma.account.findUnique({
       where: { id: result.account.id },
     });
     expect(dbAccount).not.toBeNull();
@@ -216,7 +242,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
     expect(dbAccount?.phoneVerified).toBe(false);
 
     // 2. Verify AccountSecurityCredential record in PostgreSQL
-    const dbCredentials = await prisma.accountSecurityCredential.findUnique({
+    const dbCredentials = await testPrisma.accountSecurityCredential.findUnique({
       where: { accountId: result.account.id },
     });
     expect(dbCredentials).not.toBeNull();
@@ -226,7 +252,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
     expect(await verifyPassword(password, dbCredentials!.passwordHash!)).toBe(true);
 
     // 3. Verify TouristProfile record in PostgreSQL
-    const dbProfile = await prisma.touristProfile.findUnique({
+    const dbProfile = await testPrisma.touristProfile.findUnique({
       where: { accountId: result.account.id },
     });
     expect(dbProfile).not.toBeNull();
@@ -243,86 +269,69 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
     const handle = `pg_rb_fail_${uniqueSuffix}`;
     createdEmails.add(email);
 
-    // Setup: Create isolated failure function independently (not batched)
-    await prisma.$executeRawUnsafe(`
-      CREATE OR REPLACE FUNCTION fn_test_isolated_fail_profile()
-      RETURNS trigger AS $$
-      BEGIN
-        IF NEW.handle LIKE 'pg_rb_fail_%' THEN
-          RAISE EXCEPTION 'TEST_INDUCED_PROFILE_INSERT_FAILURE';
-        END IF;
-        RETURN NEW;
-      END;
-      $$ LANGUAGE plpgsql;
-    `);
+    // Test-only failure injection: Proxy testPrisma to simulate a profile-creation failure
+    // inside the real PostgreSQL transaction, triggering Prisma's authoritative ROLLBACK
+    // without creating or modifying ANY database triggers, functions, or schema objects.
+    const failingPrismaClient = new Proxy(testPrisma, {
+      get(target, prop, receiver) {
+        if (prop === "$transaction") {
+          return async (fn: (tx: any) => Promise<any>) => {
+            return target.$transaction(async (realTx: any) => {
+              const failingTx = new Proxy(realTx, {
+                get(tTarget, tProp) {
+                  if (tProp === "touristProfile") {
+                    return {
+                      ...tTarget.touristProfile,
+                      create: async () => {
+                        throw new Error("TEST_INDUCED_PROFILE_INSERT_FAILURE");
+                      },
+                    };
+                  }
+                  return Reflect.get(tTarget, tProp);
+                },
+              });
+              return fn(failingTx);
+            });
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
 
-    // Setup: Ensure any previous trigger is dropped independently
-    await prisma.$executeRawUnsafe(
-      "DROP TRIGGER IF EXISTS trg_test_isolated_fail_profile ON tourist_profiles;"
-    );
-
-    // Setup: Create scoped trigger with row-level WHEN filter independently
-    // This ensures only rows with handle matching 'pg_rb_fail_%' are intercepted, preventing global disruption
-    await prisma.$executeRawUnsafe(`
-      CREATE TRIGGER trg_test_isolated_fail_profile
-      BEFORE INSERT ON tourist_profiles
-      FOR EACH ROW
-      WHEN (NEW.handle LIKE 'pg_rb_fail_%')
-      EXECUTE FUNCTION fn_test_isolated_fail_profile();
-    `);
-
+    let caughtError: unknown = null;
     try {
-      let caughtError: unknown = null;
-      try {
-        await registerTouristAccount(
-          {
-            email,
-            password: "ValidPassword123!",
-            displayName: "Rollback User",
-            handle,
-            preferredLanguage: "en",
-          },
-          prisma
-        );
-      } catch (err) {
-        caughtError = err;
-      }
-
-      // Must reject due to the induced database layer failure
-      expect(caughtError).not.toBeNull();
-
-      // Verify that NO records were committed in PostgreSQL (atomic transaction rollback)
-      const orphanedAccount = await prisma.account.findUnique({
-        where: { email },
-      });
-      expect(orphanedAccount).toBeNull();
-
-      const orphanedCredential = await prisma.accountSecurityCredential.findFirst({
-        where: { account: { email } },
-      });
-      expect(orphanedCredential).toBeNull();
-
-      const orphanedProfile = await prisma.touristProfile.findFirst({
-        where: { handle },
-      });
-      expect(orphanedProfile).toBeNull();
-    } finally {
-      // Safe teardown: Drop trigger and function independently with defensive error handling
-      try {
-        await prisma.$executeRawUnsafe(
-          "DROP TRIGGER IF EXISTS trg_test_isolated_fail_profile ON tourist_profiles;"
-        );
-      } catch (err) {
-        console.error("Warning: Failed to drop test trigger trg_test_isolated_fail_profile:", err);
-      }
-      try {
-        await prisma.$executeRawUnsafe(
-          "DROP FUNCTION IF EXISTS fn_test_isolated_fail_profile();"
-        );
-      } catch (err) {
-        console.error("Warning: Failed to drop test function fn_test_isolated_fail_profile:", err);
-      }
+      await registerTouristAccount(
+        {
+          email,
+          password: "ValidPassword123!",
+          displayName: "Rollback User",
+          handle,
+          preferredLanguage: "en",
+        },
+        failingPrismaClient as unknown as PrismaClient
+      );
+    } catch (err) {
+      caughtError = err;
     }
+
+    // Must reject due to the transaction failure
+    expect(caughtError).not.toBeNull();
+
+    // Verify atomic rollback in PostgreSQL: real database records were not committed
+    const orphanedAccount = await testPrisma.account.findUnique({
+      where: { email },
+    });
+    expect(orphanedAccount).toBeNull();
+
+    const orphanedCredential = await testPrisma.accountSecurityCredential.findFirst({
+      where: { account: { email } },
+    });
+    expect(orphanedCredential).toBeNull();
+
+    const orphanedProfile = await testPrisma.touristProfile.findFirst({
+      where: { handle },
+    });
+    expect(orphanedProfile).toBeNull();
   });
 
   it("enforces PostgreSQL duplicate email constraint (uq_accounts_email) and returns 409 DUPLICATE_RESOURCE", async () => {
@@ -339,7 +348,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
         handle: `user_one_${uniqueSuffix}`,
         preferredLanguage: "en",
       },
-      prisma
+      testPrisma
     );
     createdAccountIds.add(firstRes.account.id);
 
@@ -354,7 +363,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
           handle: `user_two_${uniqueSuffix}`,
           preferredLanguage: "en",
         },
-        prisma
+        testPrisma
       );
     } catch (err) {
       if (err instanceof ConflictError) {
@@ -368,7 +377,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
     expect(conflictError?.message).toBe("An account with the provided email or handle already exists.");
 
     // Confirm PostgreSQL only has exactly 1 account with this email
-    const count = await prisma.account.count({
+    const count = await testPrisma.account.count({
       where: { email: sharedEmail },
     });
     expect(count).toBe(1);
@@ -391,7 +400,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
         handle: sharedHandle,
         preferredLanguage: "en",
       },
-      prisma
+      testPrisma
     );
     createdAccountIds.add(firstRes.account.id);
 
@@ -406,7 +415,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
           handle: sharedHandle,
           preferredLanguage: "en",
         },
-        prisma
+        testPrisma
       );
     } catch (err) {
       if (err instanceof ConflictError) {
@@ -420,7 +429,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
     expect(conflictError?.message).toBe("An account with the provided email or handle already exists.");
 
     // Confirm PostgreSQL only has exactly 1 profile with this handle
-    const count = await prisma.touristProfile.count({
+    const count = await testPrisma.touristProfile.count({
       where: { handle: sharedHandle },
     });
     expect(count).toBe(1);
@@ -449,8 +458,8 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
 
     // Fire both registration requests concurrently into PostgreSQL
     const [resultA, resultB] = await Promise.allSettled([
-      registerTouristAccount(payloadA, prisma),
-      registerTouristAccount(payloadB, prisma),
+      registerTouristAccount(payloadA, testPrisma),
+      registerTouristAccount(payloadB, testPrisma),
     ]);
 
     const successes = [resultA, resultB].filter((r) => r.status === "fulfilled");
@@ -471,7 +480,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
     expect(rejectedResult.reason.code).toBe(ErrorCode.DUPLICATE_RESOURCE);
 
     // Confirm only 1 account exists in PostgreSQL
-    const accountCount = await prisma.account.count({
+    const accountCount = await testPrisma.account.count({
       where: { email: sharedEmail },
     });
     expect(accountCount).toBe(1);
@@ -503,8 +512,8 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
 
     // Fire both registration requests concurrently into PostgreSQL
     const [resultA, resultB] = await Promise.allSettled([
-      registerTouristAccount(payloadA, prisma),
-      registerTouristAccount(payloadB, prisma),
+      registerTouristAccount(payloadA, testPrisma),
+      registerTouristAccount(payloadB, testPrisma),
     ]);
 
     const successes = [resultA, resultB].filter((r) => r.status === "fulfilled");
@@ -522,7 +531,7 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
     expect(rejectedResult.reason.code).toBe(ErrorCode.DUPLICATE_RESOURCE);
 
     // Confirm only 1 profile exists in PostgreSQL with this handle
-    const profileCount = await prisma.touristProfile.count({
+    const profileCount = await testPrisma.touristProfile.count({
       where: { handle: sharedHandle },
     });
     expect(profileCount).toBe(1);
