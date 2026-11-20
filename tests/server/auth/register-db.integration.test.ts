@@ -12,12 +12,13 @@ import { ConflictError } from "../../../src/server/errors/app-error";
 import { ErrorCode } from "../../../src/server/errors/error-codes";
 
 /**
- * Extracts connection parameters dynamically from DATABASE_URL.
+ * Extracts connection parameters dynamically from a database URL.
+ * Never exposes raw credentials or the full connection URL in error messages.
  */
 function parseDatabaseConfig(urlStr: string | undefined): { host: string; port: number; database: string } {
   if (!urlStr) {
     throw new Error(
-      "DATABASE_URL environment variable is missing or empty. Please set DATABASE_URL in your test environment or .env file."
+      "Database URL is missing or empty. Please set TEST_DATABASE_URL or DATABASE_URL in your test environment or .env file."
     );
   }
   try {
@@ -29,29 +30,50 @@ function parseDatabaseConfig(urlStr: string | undefined): { host: string; port: 
     };
   } catch {
     throw new Error(
-      `Invalid DATABASE_URL format: ${urlStr}. Expected postgresql://user:password@host:port/database`
+      "Invalid database URL format. Expected standard postgresql://[user[:password]@]host[:port]/database format."
     );
   }
 }
 
 /**
- * Prohibits running destructive integration test suites against production databases.
+ * Strict database safety guard enforcing explicit opt-in and rejecting production targets.
+ * Fails closed if configuration is ambiguous or missing. Never logs credentials.
  */
-function assertTestDatabaseSafety(databaseUrl: string, databaseName: string): void {
-  if (process.env.NODE_ENV === "production") {
+function assertTestDatabaseSafety(databaseName: string, host: string): void {
+  // 1. Explicit opt-in requirement
+  if (process.env.ALLOW_DESTRUCTIVE_DB_TESTS !== "true") {
     throw new Error(
-      "SAFETY CHECK FAILED: Refusing to run integration tests with destructive cleanup when NODE_ENV is 'production'."
+      `\n==============================================================================\n` +
+        `TEST DATABASE SAFETY ERROR: Destructive database integration tests are disabled.\n` +
+        `To protect development and production data, integration tests require explicit opt-in.\n\n` +
+        `To run these tests against an isolated test database:\n` +
+        `  1. Set ALLOW_DESTRUCTIVE_DB_TESTS=true\n` +
+        `  2. Set TEST_DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/mytravelroad_test?schema=public\n` +
+        `  3. Run migrations: DATABASE_URL=$TEST_DATABASE_URL npx prisma migrate deploy\n` +
+        `==============================================================================\n`
     );
   }
-  const lowerUrl = databaseUrl.toLowerCase();
-  const lowerName = databaseName.toLowerCase();
-  if (
-    lowerName.includes("prod") ||
-    lowerName.includes("production") ||
-    lowerUrl.includes("production")
-  ) {
+
+  // 2. Reject production environment
+  if (process.env.NODE_ENV === "production") {
     throw new Error(
-      `SAFETY CHECK FAILED: Database name '${databaseName}' appears to be a production database. Integration tests require an isolated test database.`
+      "SAFETY CHECK FAILED: Refusing to run destructive database integration tests when NODE_ENV is 'production'."
+    );
+  }
+
+  // 3. Reject production database names
+  const lowerName = databaseName.toLowerCase();
+  if (lowerName.includes("prod") || lowerName.includes("production")) {
+    throw new Error(
+      `SAFETY CHECK FAILED: Database name '${databaseName}' appears to be a production database. Integration tests require an isolated test database (e.g. 'mytravelroad_test').`
+    );
+  }
+
+  // 4. Reject production host targets
+  const lowerHost = host.toLowerCase();
+  if (lowerHost.includes("prod") || lowerHost.includes("production")) {
+    throw new Error(
+      `SAFETY CHECK FAILED: Host '${host}' appears to be a production server. Integration tests must run against an isolated local or test container instance.`
     );
   }
 }
@@ -85,9 +107,10 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
   const createdEmails = new Set<string>();
 
   beforeAll(async () => {
-    const databaseUrl = process.env.DATABASE_URL;
+    // Prefer dedicated TEST_DATABASE_URL, falling back to DATABASE_URL
+    const databaseUrl = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
     const { host, port, database } = parseDatabaseConfig(databaseUrl);
-    assertTestDatabaseSafety(databaseUrl!, database);
+    assertTestDatabaseSafety(database, host);
 
     const reachable = await isPortReachable(port, host, 1000);
     if (!reachable) {
@@ -98,9 +121,9 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
           `How to configure and start the test database:\n` +
           `  1. Ensure PostgreSQL is running (e.g. Docker:\n` +
           `     docker run --name mytravelroad-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgis/postgis:15-3.3)\n` +
-          `  2. Set DATABASE_URL in .env to your test database: e.g.\n` +
-          `     postgresql://postgres:postgres@127.0.0.1:5432/mytravelroad?schema=public\n` +
-          `  3. Apply database migrations: npx prisma migrate deploy\n` +
+          `  2. Set ALLOW_DESTRUCTIVE_DB_TESTS=true in your environment\n` +
+          `  3. Set TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/mytravelroad?schema=public\n` +
+          `  4. Apply database migrations: npx prisma migrate deploy\n` +
           `==============================================================================\n`
       );
     }
@@ -120,19 +143,43 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
     if (createdAccountIds.size > 0 || createdEmails.size > 0) {
       const ids = Array.from(createdAccountIds);
       const emails = Array.from(createdEmails);
-      createdAccountIds.clear();
-      createdEmails.clear();
-
-      await prisma.account.deleteMany({
-        where: {
-          OR: [{ id: { in: ids } }, { email: { in: emails } }],
-        },
-      });
+      try {
+        await prisma.account.deleteMany({
+          where: {
+            OR: [{ id: { in: ids } }, { email: { in: emails } }],
+          },
+        });
+        // Clear tracked sets ONLY after successful deletion
+        createdAccountIds.clear();
+        createdEmails.clear();
+      } catch (err) {
+        // Do not clear the sets if deletion fails so identifiers remain available for diagnosis or afterAll
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `CLEANUP FAILURE: Failed to delete test accounts (${ids.length} IDs, ${emails.length} emails): ${msg}`
+        );
+      }
     }
   });
 
   afterAll(async () => {
-    await prisma.$disconnect();
+    try {
+      if (createdAccountIds.size > 0 || createdEmails.size > 0) {
+        const ids = Array.from(createdAccountIds);
+        const emails = Array.from(createdEmails);
+        await prisma.account.deleteMany({
+          where: {
+            OR: [{ id: { in: ids } }, { email: { in: emails } }],
+          },
+        });
+        createdAccountIds.clear();
+        createdEmails.clear();
+      }
+    } catch (err) {
+      console.error("Warning: afterAll final sweep cleanup encountered an error:", err);
+    } finally {
+      await prisma.$disconnect();
+    }
   });
 
   it("successfully creates all three records (Account, SecurityCredential, TouristProfile) in PostgreSQL", async () => {
@@ -193,25 +240,35 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
   it("rolls back the entire transaction if profile creation fails, leaving no orphaned account or credentials", async () => {
     const uniqueSuffix = `${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const email = `pg_rollback_${uniqueSuffix}@example.com`;
-    const handle = `pg_rb_${uniqueSuffix}`;
+    const handle = `pg_rb_fail_${uniqueSuffix}`;
     createdEmails.add(email);
 
-    // Install temporary database failure mechanism: trigger that raises exception on INSERT to tourist_profiles
+    // Setup: Create isolated failure function independently (not batched)
     await prisma.$executeRawUnsafe(`
-      CREATE OR REPLACE FUNCTION trg_test_fail_profile_insert()
+      CREATE OR REPLACE FUNCTION fn_test_isolated_fail_profile()
       RETURNS trigger AS $$
       BEGIN
-        RAISE EXCEPTION 'TEST_INDUCED_PROFILE_INSERT_FAILURE';
+        IF NEW.handle LIKE 'pg_rb_fail_%' THEN
+          RAISE EXCEPTION 'TEST_INDUCED_PROFILE_INSERT_FAILURE';
+        END IF;
+        RETURN NEW;
       END;
       $$ LANGUAGE plpgsql;
     `);
 
+    // Setup: Ensure any previous trigger is dropped independently
+    await prisma.$executeRawUnsafe(
+      "DROP TRIGGER IF EXISTS trg_test_isolated_fail_profile ON tourist_profiles;"
+    );
+
+    // Setup: Create scoped trigger with row-level WHEN filter independently
+    // This ensures only rows with handle matching 'pg_rb_fail_%' are intercepted, preventing global disruption
     await prisma.$executeRawUnsafe(`
-      DROP TRIGGER IF EXISTS trg_test_fail_profile ON tourist_profiles;
-      CREATE TRIGGER trg_test_fail_profile
+      CREATE TRIGGER trg_test_isolated_fail_profile
       BEFORE INSERT ON tourist_profiles
       FOR EACH ROW
-      EXECUTE FUNCTION trg_test_fail_profile_insert();
+      WHEN (NEW.handle LIKE 'pg_rb_fail_%')
+      EXECUTE FUNCTION fn_test_isolated_fail_profile();
     `);
 
     try {
@@ -250,11 +307,21 @@ describe("PostgreSQL Integration: Tourist Account Registration", () => {
       });
       expect(orphanedProfile).toBeNull();
     } finally {
-      // Safe teardown: always drop the temporary test trigger and function
-      await prisma.$executeRawUnsafe(`
-        DROP TRIGGER IF EXISTS trg_test_fail_profile ON tourist_profiles;
-        DROP FUNCTION IF EXISTS trg_test_fail_profile_insert();
-      `);
+      // Safe teardown: Drop trigger and function independently with defensive error handling
+      try {
+        await prisma.$executeRawUnsafe(
+          "DROP TRIGGER IF EXISTS trg_test_isolated_fail_profile ON tourist_profiles;"
+        );
+      } catch (err) {
+        console.error("Warning: Failed to drop test trigger trg_test_isolated_fail_profile:", err);
+      }
+      try {
+        await prisma.$executeRawUnsafe(
+          "DROP FUNCTION IF EXISTS fn_test_isolated_fail_profile();"
+        );
+      } catch (err) {
+        console.error("Warning: Failed to drop test function fn_test_isolated_fail_profile:", err);
+      }
     }
   });
 
