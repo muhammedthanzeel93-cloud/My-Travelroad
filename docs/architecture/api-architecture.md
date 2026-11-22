@@ -236,14 +236,14 @@ sequenceDiagram
     DB-->>AuthAPI: Account & Argon2id Hash
     AuthAPI->>AuthAPI: Verify Argon2id Password Hash
     AuthAPI->>AuthAPI: Generate Short-Lived Access Token (JWT, 15m)
-    AuthAPI->>AuthAPI: Generate Cryptographic Refresh Token (30d)
-    AuthAPI-->>Client: 200 OK + JSON { accessToken } + Set-Cookie (refreshToken, HttpOnly)
+    Note over AuthAPI,Client: Refresh token issuance & Redis session persistence deferred to Task 10.6
+    AuthAPI-->>Client: 200 OK + JSON { accessToken }
     
     Note over Client,AuthAPI: Subsequent API Requests
     Client->>AuthAPI: GET /api/v1/profiles/me (Header: Authorization: Bearer <accessToken>)
     AuthAPI-->>Client: 200 OK + Profile Data
 
-    Note over Client,AuthAPI: Access Token Expiration & Refresh Flow
+    Note over Client,AuthAPI: Access Token Expiration & Refresh Flow (Task 10.6+)
     Client->>AuthAPI: POST /api/v1/auth/refresh (Cookie: refreshToken)
     AuthAPI->>AuthAPI: Validate & Rotate Refresh Token
     AuthAPI-->>Client: 200 OK + JSON { accessToken: newJwt } + Set-Cookie (newRefreshToken)
@@ -853,6 +853,11 @@ Every endpoint explicitly defines authorization rules across six discrete caller
 ---
 
 ## 8. Rate-Limiting & Abuse Prevention Policy
+
+### 8.1 Architecture & Production Deployment Constraints
+- **In-Memory Process-Local Implementation**: The active rate limiter implementation (`src/server/middleware/rate-limiter.ts`) manages IP hitting counts in an in-memory process-local store (`Map<string, RateLimitRecord>`). This is suitable only for single-process deployments and development environments.
+- **Multi-Instance Distributed Rate Limiting Requirement**: In a multi-instance production cluster (e.g., behind a load balancer, multi-pod Kubernetes, or clustered worker processes), individual application instances do not share memory counters. A shared distributed rate limiter backed by Redis (using sliding-window Lua scripts or Redis sorted sets) must be deployed before scaling out multi-instance production workloads.
+- **Proxy Trust & Reverse Proxy Configuration**: The rate limiter inspects client IP addresses using Express `req.ip`. In production environments behind reverse proxies (e.g., Cloudflare, AWS ALB, Nginx), Express `trust proxy` must be configured explicitly and safely to avoid accepting spoofed client IP addresses from untrusted `X-Forwarded-For` request headers.
 
 Rate limits are enforced at the API gateway layer using an atomic sliding window counter (e.g., Redis or database-backed rate limiter) segmented by caller IP address and authenticated Account ID.
 

@@ -8,6 +8,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import request from "supertest";
 import { PrismaClient } from "@prisma/client";
 import { createApp } from "../../../src/server/app";
+import * as passwordModule from "../../../src/server/auth/password";
 import { hashPassword, verifyPassword } from "../../../src/server/auth/password";
 import { verifyAccessToken } from "../../../src/server/auth/jwt";
 import { loginRateLimiter } from "../../../src/server/middleware/rate-limiter";
@@ -37,10 +38,30 @@ describe("POST /api/v1/auth/login", () => {
     updateSecurityCredential?: (args: any) => Promise<any>;
     updateAccount?: (args: any) => Promise<any>;
     transactionFn?: (fn: (tx: any) => Promise<any>) => Promise<any>;
+    queryRawFn?: any;
   } = {}) {
     let currentAccount = options.account;
-    const updateSecurityCredentialSpy = options.updateSecurityCredential ?? vi.fn().mockResolvedValue({});
+    const updateSecurityCredentialSpy = options.updateSecurityCredential ?? vi.fn().mockImplementation(async ({ data }: any) => {
+      if (currentAccount?.securityCredentials) {
+        if (data.failedLoginAttempts !== undefined) {
+          currentAccount.securityCredentials.failedLoginAttempts = data.failedLoginAttempts;
+        }
+        if (data.lockedUntil !== undefined) {
+          currentAccount.securityCredentials.lockedUntil = data.lockedUntil;
+        }
+      }
+      return {};
+    });
     const updateAccountSpy = options.updateAccount ?? vi.fn().mockResolvedValue({});
+
+    const queryRawSpy = options.queryRawFn ?? vi.fn().mockImplementation(async () => {
+      return [
+        {
+          failed_login_attempts: currentAccount?.securityCredentials?.failedLoginAttempts ?? 0,
+          locked_until: currentAccount?.securityCredentials?.lockedUntil ?? null,
+        },
+      ];
+    });
 
     const mockPrisma = {
       account: {
@@ -58,10 +79,12 @@ describe("POST /api/v1/auth/login", () => {
       accountSecurityCredential: {
         update: updateSecurityCredentialSpy,
       },
+      $queryRaw: queryRawSpy,
       $transaction: options.transactionFn ?? vi.fn().mockImplementation(async (fn: (tx: any) => Promise<any>) => {
         return fn({
           account: { update: updateAccountSpy },
           accountSecurityCredential: { update: updateSecurityCredentialSpy },
+          $queryRaw: queryRawSpy,
         });
       }),
     };
@@ -70,6 +93,7 @@ describe("POST /api/v1/auth/login", () => {
       prisma: mockPrisma as unknown as PrismaClient,
       updateSecurityCredentialSpy,
       updateAccountSpy,
+      queryRawSpy,
     };
   }
 
@@ -383,7 +407,7 @@ describe("POST /api/v1/auth/login", () => {
       });
     });
 
-    it("safely handles malformed stored password hash returning 401 without throwing 500", async () => {
+    it("safely handles malformed stored password hash returning 401 without throwing 500, executing dummy verification and recording failure", async () => {
       const mockAccount = {
         id: "e7b0a880-922c-47b2-9a57-0b1a78e7f101",
         email: "amina.rahman@example.com",
@@ -399,8 +423,10 @@ describe("POST /api/v1/auth/login", () => {
         },
       };
 
-      const { prisma } = createMockPrisma({ account: mockAccount });
+      const { prisma, updateSecurityCredentialSpy } = createMockPrisma({ account: mockAccount });
       const app = createApp({ prismaClient: prisma });
+
+      const verifyPasswordSpy = vi.spyOn(passwordModule, "verifyPassword");
 
       const res = await request(app)
         .post("/api/v1/auth/login")
@@ -408,6 +434,111 @@ describe("POST /api/v1/auth/login", () => {
 
       expect(res.status).toBe(401);
       expect(res.body.error.code).toBe("INVALID_CREDENTIALS");
+      expect(res.body.error.message).toBe("Invalid email or password");
+      // Must not leak the malformed hash in response body or headers
+      expect(JSON.stringify(res.body)).not.toContain("invalid_malformed_hash_format");
+
+      // Verify dummy hash path was executed to equalize execution timing
+      expect(verifyPasswordSpy).toHaveBeenCalledWith(
+        VALID_LOGIN_PAYLOAD.password,
+        loginService.DUMMY_ARGON2_HASH
+      );
+
+      // Verify failure was recorded (failed-login protection not bypassed)
+      expect(updateSecurityCredentialSpy).toHaveBeenCalledWith({
+        where: { accountId: "e7b0a880-922c-47b2-9a57-0b1a78e7f101" },
+        data: {
+          failedLoginAttempts: 1,
+          lockedUntil: null,
+        },
+      });
+
+      verifyPasswordSpy.mockRestore();
+    });
+
+    it("treats non-Argon2id hash (e.g. bcrypt $2b$) as unsupported, executing dummy verification and incrementing attempts", async () => {
+      const mockAccount = {
+        id: "e7b0a880-922c-47b2-9a57-0b1a78e7f101",
+        email: "amina.rahman@example.com",
+        role: "traveler",
+        type: "individual",
+        status: "active",
+        emailVerified: true,
+        securityCredentials: {
+          accountId: "e7b0a880-922c-47b2-9a57-0b1a78e7f101",
+          passwordHash: "$2b$12$e8uqVlE7mYy3y3bWfP.nOO5E11Yf8qjN1vOa9U5kUuG6E5u9K2W2a",
+          failedLoginAttempts: 1,
+          lockedUntil: null,
+        },
+      };
+
+      const { prisma, updateSecurityCredentialSpy } = createMockPrisma({ account: mockAccount });
+      const app = createApp({ prismaClient: prisma });
+
+      const verifyPasswordSpy = vi.spyOn(passwordModule, "verifyPassword");
+
+      const res = await request(app)
+        .post("/api/v1/auth/login")
+        .send(VALID_LOGIN_PAYLOAD);
+
+      expect(res.status).toBe(401);
+      expect(res.body.error.code).toBe("INVALID_CREDENTIALS");
+
+      expect(verifyPasswordSpy).toHaveBeenCalledWith(
+        VALID_LOGIN_PAYLOAD.password,
+        loginService.DUMMY_ARGON2_HASH
+      );
+
+      expect(updateSecurityCredentialSpy).toHaveBeenCalledWith({
+        where: { accountId: "e7b0a880-922c-47b2-9a57-0b1a78e7f101" },
+        data: {
+          failedLoginAttempts: 2,
+          lockedUntil: null,
+        },
+      });
+
+      verifyPasswordSpy.mockRestore();
+    });
+
+    it("aborts successful login with 423 ACCOUNT_LOCKED if a concurrent failed attempt locked the account", async () => {
+      const mockAccount = {
+        id: "e7b0a880-922c-47b2-9a57-0b1a78e7f101",
+        email: "amina.rahman@example.com",
+        role: "traveler",
+        type: "individual",
+        status: "active",
+        emailVerified: true,
+        securityCredentials: {
+          accountId: "e7b0a880-922c-47b2-9a57-0b1a78e7f101",
+          passwordHash: mockPasswordHash,
+          failedLoginAttempts: 4,
+          lockedUntil: null, // initially looks unlocked
+        },
+      };
+
+      // When $queryRaw runs inside recordSuccessfulLogin, simulate that another concurrent transaction locked it
+      const concurrentLockedUntil = new Date(Date.now() + 15 * 60 * 1000);
+      const queryRawFn = vi.fn().mockResolvedValue([
+        {
+          failed_login_attempts: 5,
+          locked_until: concurrentLockedUntil,
+        },
+      ]);
+
+      const { prisma, updateAccountSpy } = createMockPrisma({
+        account: mockAccount,
+        queryRawFn,
+      });
+      const app = createApp({ prismaClient: prisma });
+
+      const res = await request(app)
+        .post("/api/v1/auth/login")
+        .send(VALID_LOGIN_PAYLOAD);
+
+      expect(res.status).toBe(423);
+      expect(res.body.error.code).toBe("ACCOUNT_LOCKED");
+      // Must not update lastLoginAt when aborting due to concurrent lock
+      expect(updateAccountSpy).not.toHaveBeenCalled();
     });
   });
 

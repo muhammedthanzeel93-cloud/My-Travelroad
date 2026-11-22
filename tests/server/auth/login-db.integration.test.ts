@@ -472,4 +472,288 @@ describe("PostgreSQL Integration: User Authentication & Login", () => {
     expect(cred?.failedLoginAttempts).toBe(0);
     expect(cred?.lockedUntil).toBeNull();
   });
+
+  // ============================================================================
+  // Concurrency & Row-Level Locking Verification
+  // ============================================================================
+
+  it("handles concurrent failed logins starting from known counter without lost updates", async () => {
+    const uniqueSuffix = `concurrent_lost_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+    const email = `pg_conc_lost_${uniqueSuffix}@example.com`;
+    const password = "ValidPassword123!";
+    const handle = `pg_c_lost_${uniqueSuffix.slice(-20)}`;
+    createdEmails.add(email);
+
+    const regResult = await registerTouristAccount(
+      {
+        email,
+        password,
+        displayName: "Concurrent Lost Updates User",
+        handle,
+        preferredLanguage: "en",
+      },
+      testPrisma
+    );
+    createdAccountIds.add(regResult.account.id);
+
+    // Initial state: 0 failed attempts, unlocked
+    let cred = await testPrisma.accountSecurityCredential.findUnique({
+      where: { accountId: regResult.account.id },
+    });
+    expect(cred?.failedLoginAttempts).toBe(0);
+    expect(cred?.lockedUntil).toBeNull();
+
+    // Fire 4 concurrent failed login attempts with wrong password
+    const results = await Promise.allSettled([
+      authenticateLogin({ email, password: "WrongPassword1" }, testPrisma),
+      authenticateLogin({ email, password: "WrongPassword2" }, testPrisma),
+      authenticateLogin({ email, password: "WrongPassword3" }, testPrisma),
+      authenticateLogin({ email, password: "WrongPassword4" }, testPrisma),
+    ]);
+
+    // All 4 attempts must be rejected with 401 INVALID_CREDENTIALS
+    for (const res of results) {
+      expect(res.status).toBe("rejected");
+      if (res.status === "rejected") {
+        expect(res.reason).toBeInstanceOf(UnauthorizedError);
+        expect((res.reason as UnauthorizedError).code).toBe(ErrorCode.INVALID_CREDENTIALS);
+      }
+    }
+
+    // Authoritative check against PostgreSQL: all 4 increments MUST be accounted for (zero lost updates)
+    cred = await testPrisma.accountSecurityCredential.findUnique({
+      where: { accountId: regResult.account.id },
+    });
+    expect(cred?.failedLoginAttempts).toBe(4);
+    expect(cred?.lockedUntil).toBeNull();
+  });
+
+  it("enforces lockout threshold under concurrent failed logins producing a 15-minute lock", async () => {
+    const uniqueSuffix = `concurrent_lock_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+    const email = `pg_conc_lock_${uniqueSuffix}@example.com`;
+    const password = "ValidPassword123!";
+    const handle = `pg_c_lock_${uniqueSuffix.slice(-20)}`;
+    createdEmails.add(email);
+
+    const regResult = await registerTouristAccount(
+      {
+        email,
+        password,
+        displayName: "Concurrent Lockout User",
+        handle,
+        preferredLanguage: "en",
+      },
+      testPrisma
+    );
+    createdAccountIds.add(regResult.account.id);
+
+    // Pre-set failed attempts to 3
+    await testPrisma.accountSecurityCredential.update({
+      where: { accountId: regResult.account.id },
+      data: { failedLoginAttempts: 3 },
+    });
+
+    const beforeAttempts = Date.now();
+
+    // Fire 3 concurrent failed login attempts (reaching 5 threshold)
+    const results = await Promise.allSettled([
+      authenticateLogin({ email, password: "WrongPasswordA" }, testPrisma),
+      authenticateLogin({ email, password: "WrongPasswordB" }, testPrisma),
+      authenticateLogin({ email, password: "WrongPasswordC" }, testPrisma),
+    ]);
+
+    // All 3 attempts rejected with UnauthorizedError
+    for (const res of results) {
+      expect(res.status).toBe("rejected");
+      if (res.status === "rejected") {
+        expect(res.reason).toBeInstanceOf(UnauthorizedError);
+      }
+    }
+
+    // Verify PostgreSQL state: threshold capped at 5 and 15-minute lock established
+    const cred = await testPrisma.accountSecurityCredential.findUnique({
+      where: { accountId: regResult.account.id },
+    });
+    expect(cred?.failedLoginAttempts).toBe(5);
+    expect(cred?.lockedUntil).not.toBeNull();
+
+    const lockDurationMs = cred!.lockedUntil!.getTime() - beforeAttempts;
+    expect(lockDurationMs).toBeGreaterThanOrEqual(15 * 60 * 1000 - 2000);
+    expect(lockDurationMs).toBeLessThanOrEqual(15 * 60 * 1000 + 10000);
+  });
+
+  it("rejects login attempts with 423 ACCOUNT_LOCKED after lock is established without modifying counter or lock duration", async () => {
+    const uniqueSuffix = `post_lock_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+    const email = `pg_post_lock_${uniqueSuffix}@example.com`;
+    const password = "ValidPassword123!";
+    const handle = `pg_p_lock_${uniqueSuffix.slice(-20)}`;
+    createdEmails.add(email);
+
+    const regResult = await registerTouristAccount(
+      {
+        email,
+        password,
+        displayName: "Post Lockout User",
+        handle,
+        preferredLanguage: "en",
+      },
+      testPrisma
+    );
+    createdAccountIds.add(regResult.account.id);
+
+    const establishedLockedUntil = new Date(Date.now() + 14 * 60 * 1000);
+    await testPrisma.accountSecurityCredential.update({
+      where: { accountId: regResult.account.id },
+      data: {
+        failedLoginAttempts: 5,
+        lockedUntil: establishedLockedUntil,
+      },
+    });
+
+    // Attempt login with incorrect password
+    let wrongPwError: unknown;
+    try {
+      await authenticateLogin({ email, password: "WrongPassword!" }, testPrisma);
+    } catch (err) {
+      wrongPwError = err;
+    }
+    expect(wrongPwError).toBeInstanceOf(LockedError);
+    expect((wrongPwError as LockedError).statusCode).toBe(423);
+    expect((wrongPwError as LockedError).code).toBe(ErrorCode.ACCOUNT_LOCKED);
+
+    // Attempt login with correct password
+    let correctPwError: unknown;
+    try {
+      await authenticateLogin({ email, password }, testPrisma);
+    } catch (err) {
+      correctPwError = err;
+    }
+    expect(correctPwError).toBeInstanceOf(LockedError);
+    expect((correctPwError as LockedError).statusCode).toBe(423);
+    expect((correctPwError as LockedError).code).toBe(ErrorCode.ACCOUNT_LOCKED);
+
+    // Query database: state MUST NOT have been mutated
+    const cred = await testPrisma.accountSecurityCredential.findUnique({
+      where: { accountId: regResult.account.id },
+    });
+    expect(cred?.failedLoginAttempts).toBe(5);
+    expect(cred?.lockedUntil?.getTime()).toBe(establishedLockedUntil.getTime());
+  });
+
+  it("starts a new failure cycle on expired lock with concurrent failures without lost updates", async () => {
+    const uniqueSuffix = `expired_lock_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+    const email = `pg_exp_lock_${uniqueSuffix}@example.com`;
+    const password = "ValidPassword123!";
+    const handle = `pg_e_lock_${uniqueSuffix.slice(-20)}`;
+    createdEmails.add(email);
+
+    const regResult = await registerTouristAccount(
+      {
+        email,
+        password,
+        displayName: "Expired Lockout User",
+        handle,
+        preferredLanguage: "en",
+      },
+      testPrisma
+    );
+    createdAccountIds.add(regResult.account.id);
+
+    // Set lock expired 2 minutes ago with 5 failed attempts
+    const expiredTime = new Date(Date.now() - 2 * 60 * 1000);
+    await testPrisma.accountSecurityCredential.update({
+      where: { accountId: regResult.account.id },
+      data: {
+        failedLoginAttempts: 5,
+        lockedUntil: expiredTime,
+      },
+    });
+
+    // Concurrently execute 3 failed login attempts
+    const results = await Promise.allSettled([
+      authenticateLogin({ email, password: "WrongPassword1" }, testPrisma),
+      authenticateLogin({ email, password: "WrongPassword2" }, testPrisma),
+      authenticateLogin({ email, password: "WrongPassword3" }, testPrisma),
+    ]);
+
+    for (const res of results) {
+      expect(res.status).toBe("rejected");
+      if (res.status === "rejected") {
+        expect(res.reason).toBeInstanceOf(UnauthorizedError);
+      }
+    }
+
+    // Verify PostgreSQL state: expired lock was cleared, and 3 failed attempts counted cleanly
+    const cred = await testPrisma.accountSecurityCredential.findUnique({
+      where: { accountId: regResult.account.id },
+    });
+    expect(cred?.failedLoginAttempts).toBe(3);
+    expect(cred?.lockedUntil).toBeNull();
+  });
+
+  it("maintains consistent database state when successful login races with concurrent failed attempts", async () => {
+    const uniqueSuffix = `race_success_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+    const email = `pg_race_${uniqueSuffix}@example.com`;
+    const password = "ValidPassword123!";
+    const handle = `pg_race_${uniqueSuffix.slice(-20)}`;
+    createdEmails.add(email);
+
+    const regResult = await registerTouristAccount(
+      {
+        email,
+        password,
+        displayName: "Race Success User",
+        handle,
+        preferredLanguage: "en",
+      },
+      testPrisma
+    );
+    createdAccountIds.add(regResult.account.id);
+
+    // Set 3 failed attempts
+    await testPrisma.accountSecurityCredential.update({
+      where: { accountId: regResult.account.id },
+      data: { failedLoginAttempts: 3 },
+    });
+
+    // Concurrently execute 1 legitimate login and 2 failed logins
+    const results = await Promise.allSettled([
+      authenticateLogin({ email, password }, testPrisma),
+      authenticateLogin({ email, password: "WrongPassword1" }, testPrisma),
+      authenticateLogin({ email, password: "WrongPassword2" }, testPrisma),
+    ]);
+
+    // Inspect PostgreSQL database state to verify consistency invariants
+    const cred = await testPrisma.accountSecurityCredential.findUnique({
+      where: { accountId: regResult.account.id },
+    });
+    const account = await testPrisma.account.findUnique({
+      where: { id: regResult.account.id },
+    });
+
+    const successResult = results[0];
+    if (successResult.status === "fulfilled") {
+      // Valid login succeeded: token issued
+      expect(successResult.value.accessToken).toBeDefined();
+      expect(account?.lastLoginAt).not.toBeNull();
+
+      // Because the success reset attempts to 0, subsequent failed attempts in the batch
+      // incremented from 0. State is unlocked and attempts is 1 or 2.
+      expect(cred?.lockedUntil).toBeNull();
+      expect(cred?.failedLoginAttempts).toBeGreaterThanOrEqual(0);
+      expect(cred?.failedLoginAttempts).toBeLessThanOrEqual(2);
+    } else {
+      // Valid login was rejected: the 2 failed attempts must have locked the account first!
+      expect(successResult.reason).toBeInstanceOf(LockedError);
+      expect(cred?.failedLoginAttempts).toBe(5);
+      expect(cred?.lockedUntil).not.toBeNull();
+    }
+
+    // Invariant: Failed attempts must never exceed 5
+    expect(cred!.failedLoginAttempts).toBeLessThanOrEqual(5);
+    // Invariant: If locked, attempts must be 5
+    if (cred!.lockedUntil !== null) {
+      expect(cred!.failedLoginAttempts).toBe(5);
+    }
+  });
 });

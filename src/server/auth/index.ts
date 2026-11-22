@@ -95,4 +95,9 @@ export {
 export {
   authenticateLogin,
   type LoginResult,
+  FAILED_LOGIN_LOCKOUT_THRESHOLD,
+  LOCKOUT_DURATION_MS,
+  DUMMY_ARGON2_HASH,
+  ARGON2ID_MCF_REGEX,
+  isValidArgon2idHash,
 } from "../services/login.service";

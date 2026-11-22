@@ -74,10 +74,11 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ### 2. Login Account
 - **Endpoint**: `POST /api/v1/auth/login`
-- **Purpose**: Authenticates credentials, returns short-lived JWT access token, and sets rotating HttpOnly refresh cookie.
+- **Purpose**: Authenticates credentials and returns a short-lived JWT access token.
 - **Authentication**: None (Public).
 - **Permissions**: None. Rejects accounts with `type = 'system'`. Accounts with `status = 'pending_verification'` receive a scoped access token with `emailVerified: false`.
 - **Rate Limit**: 5 requests / min per IP.
+- **Refresh Token Status**: Issuance of rotating HttpOnly refresh cookies (`Set-Cookie: refreshToken=...`) and Redis session persistence is deferred to Task 10.6. In Task 10.5, the login endpoint returns the standard JSON response envelope containing the short-lived JWT access token without refresh cookies.
 - **Request Body**:
 ```json
 {
@@ -86,7 +87,6 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 }
 ```
 - **Successful Response — Active Account (`200 OK`)**:
-  - **Headers**: `Set-Cookie: refreshToken=rt_550e8400-e29b-41d4-a716-446655440001_a1b2c3d4e5f6...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`
 ```json
 {
   "success": true,
@@ -105,7 +105,6 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 }
 ```
 - **Successful Response — Pending Verification Account (`200 OK`)**:
-  - **Headers**: `Set-Cookie: refreshToken=rt_550e8400-e29b-41d4-a716-446655440001_a1b2c3d4e5f6...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`
 ```json
 {
   "success": true,

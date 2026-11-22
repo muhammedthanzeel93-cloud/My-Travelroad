@@ -1,6 +1,15 @@
 /**
  * My Travelroad — In-Memory IP Rate Limiting Middleware
  * Enforces per-IP request throttling with RFC 6585 headers and spoofing defense.
+ *
+ * Production Deployment Constraints:
+ * 1. Process-Local State: This rate limiter uses in-memory process-local state (`Map`).
+ *    It is appropriate only for single-process deployment or local development.
+ * 2. Multi-Instance Deployments: In a multi-instance or clustered production environment,
+ *    separate instances do not share counters. A distributed/shared rate limiter backed
+ *    by Redis is required before multi-instance production deployment.
+ * 3. Reverse Proxy Configuration: Proxy trust (`trust proxy`) must be configured explicitly
+ *    and safely in Express to prevent spoofed `X-Forwarded-For` headers from bypassing limits.
  */
 
 import { Request, Response, NextFunction, RequestHandler } from "express";
