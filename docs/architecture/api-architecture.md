@@ -219,8 +219,14 @@ graph LR
     C -->|Public Profile API| P
 ```
 
-### 6.2 Dual-Token Session Lifecycle
-The API implements an industry-standard dual-token authentication model:
+### 6.2 Access Token and Future Refresh-Token Lifecycle
+
+The platform's authentication architecture distinguishes between current Stage A login token delivery and planned future refresh-token session infrastructure:
+
+- **Current Stage A / Task 10.5:** The login endpoint (`POST /api/v1/auth/login`) returns a short-lived HS256 JWT access token directly in the JSON response body (`{ "accessToken": "<jwt>" }`). No refresh token or refresh cookie is issued.
+- **Future Task 10.6+:** Refresh-token issuance, token family rotation, secure browser cookie delivery (`HttpOnly`, `Secure`, `SameSite=Strict`), and Redis session persistence will be implemented in the subsequent task.
+
+The following sequence diagram illustrates the active Stage A login flow alongside the planned future refresh-flow functionality (deferred to Task 10.6+):
 
 ```mermaid
 sequenceDiagram
@@ -236,14 +242,14 @@ sequenceDiagram
     DB-->>AuthAPI: Account & Argon2id Hash
     AuthAPI->>AuthAPI: Verify Argon2id Password Hash
     AuthAPI->>AuthAPI: Generate Short-Lived Access Token (JWT, 15m)
-    Note over AuthAPI,Client: Refresh token issuance & Redis session persistence deferred to Task 10.6
+    Note over AuthAPI,Client: Stage A / Task 10.5: Access token only; refresh token deferred to Task 10.6+
     AuthAPI-->>Client: 200 OK + JSON { accessToken }
     
-    Note over Client,AuthAPI: Subsequent API Requests
+    Note over Client,AuthAPI: Subsequent Authenticated API Requests
     Client->>AuthAPI: GET /api/v1/profiles/me (Header: Authorization: Bearer <accessToken>)
     AuthAPI-->>Client: 200 OK + Profile Data
 
-    Note over Client,AuthAPI: Access Token Expiration & Refresh Flow (Task 10.6+)
+    Note over Client,AuthAPI: Planned Future Refresh Flow (Deferred to Task 10.6+)
     Client->>AuthAPI: POST /api/v1/auth/refresh (Cookie: refreshToken)
     AuthAPI->>AuthAPI: Validate & Rotate Refresh Token
     AuthAPI-->>Client: 200 OK + JSON { accessToken: newJwt } + Set-Cookie (newRefreshToken)
@@ -269,7 +275,7 @@ sequenceDiagram
      ```
    - **Token Generation Compatibility Claim (`gen`)**: An integer claim (`gen: 1`) included in the access token for schema compatibility. The approved Stage A database schema (`accounts`, `account_security_credentials`) does not contain a `token_generation` column. In Stage A, credential invalidation following a password change is enforced using `AccountSecurityCredential.passwordChangedAt` (`claims.iat <= passwordChangedUnix`), and account access lifecycle is asserted via authoritative `Account.status` checks in the authentication middleware. Operative generation-based durable revocation (`account.token_generation`) and multi-device outbox revocation are explicitly deferred to the future Stage A+ schema migration.
    - **Delivery**: Returned in JSON response body. Transmitted in client requests via header: `Authorization: Bearer <accessToken>`.
-2. **Long-Lived Refresh Token**:
+2. **Long-Lived Refresh Token (Planned — Deferred to Task 10.6+)**:
    - **Lifespan**: 30 days (sliding window).
    - **Format**: High-entropy cryptographically random string (256-bit CSPRNG).
    - **Storage**: Transmitted in an `HttpOnly`, `Secure`, `SameSite=Strict` browser cookie with path restricted to `/api/v1/auth`.
