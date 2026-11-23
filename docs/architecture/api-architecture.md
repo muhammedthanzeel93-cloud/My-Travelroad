@@ -251,7 +251,7 @@ sequenceDiagram
 
 1. **Short-Lived Access Token (JWT)**:
    - **Lifespan**: 15 minutes.
-   - **Format**: Signed JWT (RS256 or HMAC-SHA256 with 256-bit entropy secret).
+   - **Format**: Signed JWT strictly using HMAC-SHA256 (HS256). Token signing and verification are pinned to HS256 (rejecting 'none', RS256, HS384, and HS512). The signing secret must satisfy the approved minimum entropy requirement of 256 bits (at least 32 characters). RS256 is not implemented and must not be presented as an available alternative unless separately approved and implemented.
    - **Payload Claims**:
      ```json
      {
@@ -267,7 +267,7 @@ sequenceDiagram
        "aud": "https://mytravelroad.com"
      }
      ```
-   - **Durable Generation Claim (`gen`)**: An integer representing the account's durable revocation generation in PostgreSQL at the moment of token issuance. Any mutating or privileged database check asserts that `jwt.gen === account.token_generation`; any generation mismatch (`jwt.gen !== account.token_generation`) is immediately rejected fail-closed with `401 Unauthorized` (`code: 'TOKEN_INVALID'`).
+   - **Token Generation Compatibility Claim (`gen`)**: An integer claim (`gen: 1`) included in the access token for schema compatibility. The approved Stage A database schema (`accounts`, `account_security_credentials`) does not contain a `token_generation` column. In Stage A, credential invalidation following a password change is enforced using `AccountSecurityCredential.passwordChangedAt` (`claims.iat <= passwordChangedUnix`), and account access lifecycle is asserted via authoritative `Account.status` checks in the authentication middleware. Operative generation-based durable revocation (`account.token_generation`) and multi-device outbox revocation are explicitly deferred to the future Stage A+ schema migration.
    - **Delivery**: Returned in JSON response body. Transmitted in client requests via header: `Authorization: Bearer <accessToken>`.
 2. **Long-Lived Refresh Token**:
    - **Lifespan**: 30 days (sliding window).
@@ -651,14 +651,14 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
      - **Future Stage A+ Endpoint (`POST /auth/logout-all`)**: Multi-device account-wide `logout-all` is explicitly designated as a **future Stage A+ endpoint**. It will be introduced into the API contracts, authorization matrix, and OpenAPI specification upon deployment of the Stage A+ schema migration (`accounts.token_generation` and `account_revocation_jobs`). Stage A does not claim durable multi-device logout-all support before this database migration is deployed.
 
 7. **Zero-Trust Index Authorization & Crash Resilience**:
-   - **Administrative Index vs. Authorization Credential**: `account_sessions:{accountId}` is strictly an inverted index for administrative fan-out, **never an authorization credential**. A request presenting a token or session is never authorized merely because an entry exists in `account_sessions`. A request is authorized ONLY if:
-     1. PostgreSQL live status check asserts `Account.status === 'active'` AND `jwt.gen === account.token_generation`.
+   - **Administrative Index vs. Authorization Credential**: `account_sessions:{accountId}` is strictly an inverted index for administrative fan-out, **never an authorization credential**. A request presenting a token or session is never authorized merely because an entry exists in `account_sessions`. In Stage A, a request is authorized ONLY if:
+     1. PostgreSQL live status check asserts `Account.status === 'active'` (and for mutating/privileged operations, `jwt.iat > passwordChangedAt`).
      2. `revoked_accounts:{accountId}` fast-path cache tombstone is absent.
-     3. For refresh: PostgreSQL check confirms `family.tokenGeneration === account.token_generation`, Redis `family:{familyId}` exists, `isCompromised == 0`, and `token_lookup:{familyId}:{tokenHash}` matches.
+     3. For refresh (Task 10.6+): Redis `family:{familyId}` exists, `isCompromised == 0`, and `token_lookup:{familyId}:{tokenHash}` matches. (Note: Future Stage A+ generation-based validation `family.tokenGeneration === account.token_generation` is deferred).
    - **Worker Crash Resilience & Lazy Eviction**:
      - If an application worker crashes after the Lua rotation script but before updating `account_sessions:{accountId}`, the stale index entry has **zero security impact**: presenting `oldSessionId` is immediately rejected because its underlying `session` and `token_lookup` keys were deleted atomically.
      - Whenever `account_sessions:{accountId}` is enumerated (e.g., during active session listing, password reset, or future Stage A+ logout-all), dead entries are lazily evicted: if `EXISTS session:{familyId}:{sessionId}` is false, the application executes `SREM account_sessions:{accountId} "{familyId}:{sessionId}"`.
-   - **Authoritative Database Override**: If Redis is completely degraded, offline, or experiencing network partitions, the live database status check (`SELECT status, role, token_generation FROM accounts WHERE id = :id`) executed on all mutating and privileged routes acts as an authoritative, fail-closed security boundary, blocking suspended, deactivated, or generation-mismatched credentials immediately.
+   - **Authoritative Database Override**: If Redis is completely degraded, offline, or experiencing network partitions, the live database status check (`SELECT status, role FROM accounts WHERE id = :id` and `passwordChangedAt` in `account_security_credentials`) executed on all mutating and privileged routes acts as an authoritative, fail-closed security boundary, blocking suspended, deactivated, or password-changed credentials immediately.
 
 8. **Redis Deployment Topology & Cluster Hash-Slot Constraints**:
    - **Primary Stage A Deployment Topology**: High-Availability **Redis Sentinel (Standalone Primary + Replicas)**. All keys reside within a single primary Redis keyspace. Multi-key Lua scripts execute across arbitrary key names without cluster slot restrictions.
@@ -813,14 +813,15 @@ Because JSON Web Tokens are stateless, deleting Redis refresh sessions prevents 
 1. **Upper Bound Exposure Window**: Access tokens enforce a strict **15-minute maximum lifespan** ($900\text{ seconds}$).
 2. **Live Database Status Assertion on All Mutations & Privileged Routes**:
    - The backend **never trusts stale JWT claims alone** for state-modifying or privileged operations.
-   - Every administrative call under `/api/v1/admin/*`, profile update (`PATCH /profiles/me`), bookmark operation (`POST /saved-destinations`), and token refresh executes an active database lookup (`SELECT status, role, token_generation FROM accounts WHERE id = :id`) within the execution transaction.
+   - Every administrative call under `/api/v1/admin/*`, profile update (`PATCH /profiles/me`), bookmark operation (`POST /saved-destinations`), and token refresh executes an active database lookup (`SELECT status, role FROM accounts WHERE id = :id`, joining `account_security_credentials.password_changed_at`) within the execution transaction.
    - If the account is marked `suspended` or `deactivated`, or if the caller's database role no longer matches the JWT role claim, the request is aborted immediately with `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'` or `'ACCOUNT_DEACTIVATED'`).
-   - If the access token's generation claim does not match the database (`jwt.gen !== account.token_generation`), the token is rejected immediately with `401 Unauthorized` (`code: 'TOKEN_INVALID'`), defeating stale or mismatched tokens even within their 15-minute lifespan.
+   - If the access token was issued prior to the last password change timestamp (`jwt.iat <= passwordChangedUnix`), the token is rejected immediately with `401 Unauthorized` (`code: 'TOKEN_INVALID'`), defeating stale credentials.
+   - *Deferred Stage A+ Revocation*: Operative generation-based token rejection (`jwt.gen !== account.token_generation`) and the `accounts.token_generation` column are deferred to the future Stage A+ schema migration.
 3. **Gateway Fast-Revocation Blocklist (Ephemeral Cache for Read Endpoints)**:
    - When an account is suspended, deactivated, or undergoes an account-wide revocation (password reset or future Stage A+ logout-all), the security service sets an ephemeral blocklist key in Redis:
      `revoked_accounts:{accountId}` (TTL: 900s / 15 minutes, matching the access token lifespan).
    - The API Gateway authentication middleware checks `EXISTS revoked_accounts:{accountId}` on incoming requests as an early optimization. This fast-rejects requests within milliseconds without burdening the primary PostgreSQL database with queries on high-concurrency read traffic.
-   - **Ephemeral Cache Only**: `revoked_accounts:{accountId}` is strictly an ephemeral gateway cache and **never** the authoritative revocation barrier. Authoritative security relies on durable state: the PostgreSQL `token_generation` epoch for access tokens and refresh families, and the `Account.status` lifecycle. If Redis is unavailable or the 15-minute tombstone expires, previously invalidated credentials can never regain validity.
+   - **Ephemeral Cache Only**: `revoked_accounts:{accountId}` is strictly an ephemeral gateway cache and **never** the authoritative revocation barrier. Authoritative security relies on durable state: the PostgreSQL `passwordChangedAt` timestamp for password invalidation, and the `Account.status` lifecycle. If Redis is unavailable or the 15-minute tombstone expires, previously invalidated credentials can never regain validity.
 
 ---
 
@@ -854,12 +855,23 @@ Every endpoint explicitly defines authorization rules across six discrete caller
 
 ## 8. Rate-Limiting & Abuse Prevention Policy
 
-### 8.1 Architecture & Production Deployment Constraints
-- **In-Memory Process-Local Implementation**: The active rate limiter implementation (`src/server/middleware/rate-limiter.ts`) manages IP hitting counts in an in-memory process-local store (`Map<string, RateLimitRecord>`). This is suitable only for single-process deployments and development environments.
-- **Multi-Instance Distributed Rate Limiting Requirement**: In a multi-instance production cluster (e.g., behind a load balancer, multi-pod Kubernetes, or clustered worker processes), individual application instances do not share memory counters. A shared distributed rate limiter backed by Redis (using sliding-window Lua scripts or Redis sorted sets) must be deployed before scaling out multi-instance production workloads.
-- **Proxy Trust & Reverse Proxy Configuration**: The rate limiter inspects client IP addresses using Express `req.ip`. In production environments behind reverse proxies (e.g., Cloudflare, AWS ALB, Nginx), Express `trust proxy` must be configured explicitly and safely to avoid accepting spoofed client IP addresses from untrusted `X-Forwarded-For` request headers.
+### 8.1 Implementation Status & Production Deployment Requirements
+The platform enforces a clear distinction between the current local/single-process rate limiter and the distributed rate limiter required for production clusters:
 
-Rate limits are enforced at the API gateway layer using an atomic sliding window counter (e.g., Redis or database-backed rate limiter) segmented by caller IP address and authenticated Account ID.
+1. **Current Implementation (Single-Process / Development)**:
+   - **Store**: In-memory process-local store (`Map<string, RateLimitRecord>`) implemented in `src/server/middleware/rate-limiter.ts`.
+   - **Algorithm**: Fixed-window counter with periodic 5-minute background memory cleanup.
+   - **Keying**: Client IP address extracted via `req.ip` (or socket remote address).
+   - **Deployment Scope**: Appropriate strictly for single-process deployments and local development environments.
+   - **Limitation**: Process-local instances **do not share counters** across multiple processes or container replicas. It does not use Redis or an API-gateway distributed sliding window.
+
+2. **Future Production Scaling Requirements (Multi-Instance Clusters)**:
+   - **Distributed Counter Store**: Multi-instance production deployments (e.g. Kubernetes pods, multiple Node.js worker processes, load-balanced clusters) must deploy a shared distributed rate limiter backed by Redis.
+   - **Algorithm**: Atomic sliding-window rate limiting executed via Redis Lua scripts or sorted sets (`ZADD`/`ZREMRANGEBYSCORE`).
+   - **Segmentation**: Sliding-window tracking segmented by caller IP for public authentication endpoints and by authenticated `Account.id` for authenticated tourist/administrative APIs.
+   - **Reverse Proxy & Proxy Trust Configuration**: In production environments behind reverse proxies or CDNs (Cloudflare, AWS ALB, Nginx), Express `trust proxy` must be explicitly and safely configured to avoid accepting spoofed client IP addresses from untrusted `X-Forwarded-For` request headers.
+
+### 8.2 Tier Allocation Policy Targets
 
 | Category / Endpoint Pattern | Rate Limit Window | Key / Segment | Purpose / Protection |
 | :--- | :--- | :--- | :--- |

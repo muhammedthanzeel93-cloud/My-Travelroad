@@ -98,6 +98,6 @@ export {
   FAILED_LOGIN_LOCKOUT_THRESHOLD,
   LOCKOUT_DURATION_MS,
   DUMMY_ARGON2_HASH,
-  ARGON2ID_MCF_REGEX,
   isValidArgon2idHash,
+  isCanonicalBase64,
 } from "../services/login.service";

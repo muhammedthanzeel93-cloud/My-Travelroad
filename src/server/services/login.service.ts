@@ -33,23 +33,82 @@ export const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 minutes
  * Standard dummy Argon2id hash used to equalize execution timing
  * when candidate accounts do not exist or contain malformed stored hashes,
  * preventing account enumeration and state-detection side channels.
- * Conforms to RFC 9106 Modular Crypt Format (Argon2id, v=19, m=65536, t=3, p=4).
+ * Conforms strictly to RFC 9106 Modular Crypt Format (Argon2id, v=19, m=65536, t=3, p=4,
+ * 16-byte salt, 32-byte digest).
  */
 export const DUMMY_ARGON2_HASH =
-  "$argon2id$v=19$m=65536,t=3,p=4$c29tZXJhbmRvbXNhbHQxMjM$0123456789012345678901234567890123456789012";
+  "$argon2id$v=19$m=65536,t=3,p=4$1G7pO+iiNcV0ev/jZ+l4ZA$ScOGasAOdi2F2+HKaO7Cm0PtlIOFYqtZOd6WYe566jI";
 
 /**
- * Modular Crypt Format (MCF) regex for Argon2id hashes:
- * $argon2id$v=19$m=<memoryCost>,t=<timeCost>,p=<parallelism>$<base64Salt>$<base64Hash>
+ * Validates whether a candidate string is valid, canonical Base64 encoding
+ * representing a buffer of the exact expected byte length.
+ *
+ * @param str Base64 candidate string
+ * @param expectedByteLength Expected decoded buffer length in bytes
+ * @returns true if valid, canonical Base64 with exact byte length
  */
-export const ARGON2ID_MCF_REGEX =
-  /^\$argon2id\$v=19\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+$/;
+export function isCanonicalBase64(str: string, expectedByteLength: number): boolean {
+  if (typeof str !== "string" || str.length === 0) return false;
+  // Standard Base64 characters with up to 2 optional padding characters
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(str)) return false;
+
+  const buf = Buffer.from(str, "base64");
+  if (buf.length !== expectedByteLength) return false;
+
+  // Canonical check: re-encoding to Base64 without padding must exactly match the unpadded input
+  const unpaddedInput = str.replace(/=+$/, "");
+  const unpaddedReencoded = buf.toString("base64").replace(/=+$/, "");
+  return unpaddedInput === unpaddedReencoded;
+}
 
 /**
- * Validates whether a candidate string conforms to standard Argon2id MCF structure.
+ * Strict validator for Argon2id Modular Crypt Format (MCF) hashes.
+ * Ensures the stored hash conforms strictly to approved production parameters:
+ * - Prefix: $argon2id$
+ * - Version: v=19
+ * - Parameters: m=65536,t=3,p=4
+ * - Salt: canonical Base64 decoding to exactly 16 bytes (128 bits)
+ * - Digest: canonical Base64 decoding to exactly 32 bytes (256 bits)
+ *
+ * Any malformed, truncated, unsupported, or parameter-mismatched hash is rejected,
+ * routing execution through dummy Argon2id verification to equalize timing.
  */
 export function isValidArgon2idHash(hash: unknown): hash is string {
-  return typeof hash === "string" && ARGON2ID_MCF_REGEX.test(hash);
+  if (typeof hash !== "string" || !hash.startsWith("$")) {
+    return false;
+  }
+
+  const parts = hash.split("$");
+  // Expected format: $argon2id$v=19$m=65536,t=3,p=4$<salt>$<digest>
+  // parts[0] is "", parts[1] is "argon2id", parts[2] is "v=19",
+  // parts[3] is "m=65536,t=3,p=4", parts[4] is salt, parts[5] is digest
+  if (parts.length !== 6) {
+    return false;
+  }
+
+  if (parts[1] !== "argon2id") {
+    return false;
+  }
+
+  if (parts[2] !== "v=19") {
+    return false;
+  }
+
+  if (parts[3] !== "m=65536,t=3,p=4") {
+    return false;
+  }
+
+  // Salt: must decode to exactly 16 bytes with canonical Base64
+  if (!isCanonicalBase64(parts[4], 16)) {
+    return false;
+  }
+
+  // Digest: must decode to exactly 32 bytes with canonical Base64
+  if (!isCanonicalBase64(parts[5], 32)) {
+    return false;
+  }
+
+  return true;
 }
 
 export interface LoginResult {

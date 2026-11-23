@@ -540,6 +540,147 @@ describe("POST /api/v1/auth/login", () => {
       // Must not update lastLoginAt when aborting due to concurrent lock
       expect(updateAccountSpy).not.toHaveBeenCalled();
     });
+
+    // ==========================================================================
+    // Strict Argon2id MCF Validation & Timing Defense (Task 10.5-R2)
+    // ==========================================================================
+    describe("Strict Argon2id MCF Validation & Timing Defense (R2.4)", () => {
+      const validSalt16 = "1G7pO+iiNcV0ev/jZ+l4ZA"; // 16 bytes base64
+      const validDigest32 = "ScOGasAOdi2F2+HKaO7Cm0PtlIOFYqtZOd6WYe566jI"; // 32 bytes base64
+      const validProductionHash = `$argon2id$v=19$m=65536,t=3,p=4$${validSalt16}$${validDigest32}`;
+
+      it("1. accepts a valid production Argon2id hash", () => {
+        expect(loginService.isValidArgon2idHash(validProductionHash)).toBe(true);
+        expect(loginService.isValidArgon2idHash(mockPasswordHash)).toBe(true);
+      });
+
+      it("2. rejects wrong memory parameter (m=32768)", () => {
+        const wrongMemHash = `$argon2id$v=19$m=32768,t=3,p=4$${validSalt16}$${validDigest32}`;
+        expect(loginService.isValidArgon2idHash(wrongMemHash)).toBe(false);
+      });
+
+      it("3. rejects wrong time parameter (t=2)", () => {
+        const wrongTimeHash = `$argon2id$v=19$m=65536,t=2,p=4$${validSalt16}$${validDigest32}`;
+        expect(loginService.isValidArgon2idHash(wrongTimeHash)).toBe(false);
+      });
+
+      it("4. rejects wrong parallelism parameter (p=2)", () => {
+        const wrongParallelismHash = `$argon2id$v=19$m=65536,t=3,p=2$${validSalt16}$${validDigest32}`;
+        expect(loginService.isValidArgon2idHash(wrongParallelismHash)).toBe(false);
+      });
+
+      it("5. rejects wrong version parameter (v=18)", () => {
+        const wrongVersionHash = `$argon2id$v=18$m=65536,t=3,p=4$${validSalt16}$${validDigest32}`;
+        expect(loginService.isValidArgon2idHash(wrongVersionHash)).toBe(false);
+      });
+
+      it("6. rejects invalid Base64 salt", () => {
+        const invalidB64SaltHash = `$argon2id$v=19$m=65536,t=3,p=4$1G7pO+iiNcV0ev/jZ+l4Z!$${validDigest32}`;
+        expect(loginService.isValidArgon2idHash(invalidB64SaltHash)).toBe(false);
+      });
+
+      it("7. rejects invalid Base64 digest", () => {
+        const invalidB64DigestHash = `$argon2id$v=19$m=65536,t=3,p=4$${validSalt16}$ScOGasAOdi2F2+HKaO7Cm0PtlIOFYqtZOd6WYe566j!`;
+        expect(loginService.isValidArgon2idHash(invalidB64DigestHash)).toBe(false);
+      });
+
+      it("8. rejects incorrect salt length (15 bytes)", () => {
+        const salt15Bytes = Buffer.alloc(15, 0xaa).toString("base64");
+        const wrongSaltLenHash = `$argon2id$v=19$m=65536,t=3,p=4$${salt15Bytes}$${validDigest32}`;
+        expect(loginService.isValidArgon2idHash(wrongSaltLenHash)).toBe(false);
+      });
+
+      it("9. rejects incorrect digest length (16 bytes)", () => {
+        const digest16Bytes = Buffer.alloc(16, 0xbb).toString("base64");
+        const wrongDigestLenHash = `$argon2id$v=19$m=65536,t=3,p=4$${validSalt16}$${digest16Bytes}`;
+        expect(loginService.isValidArgon2idHash(wrongDigestLenHash)).toBe(false);
+      });
+
+      it("10. rejects truncated hash", () => {
+        const truncatedHash = `$argon2id$v=19$m=65536,t=3,p=4$${validSalt16}`;
+        expect(loginService.isValidArgon2idHash(truncatedHash)).toBe(false);
+      });
+
+      it("11. rejects unsupported bcrypt hash", () => {
+        const bcryptHash = "$2b$12$e8uqVlE7mYy3y3bWfP.nOO5E11Yf8qjN1vOa9U5kUuG6E5u9K2W2a";
+        expect(loginService.isValidArgon2idHash(bcryptHash)).toBe(false);
+      });
+
+      it("12. rejects missing, null, or empty stored hash", () => {
+        expect(loginService.isValidArgon2idHash(null)).toBe(false);
+        expect(loginService.isValidArgon2idHash(undefined)).toBe(false);
+        expect(loginService.isValidArgon2idHash("")).toBe(false);
+      });
+
+      // Endpoint verification: all invalid cases execute dummy Argon2id verification and record failed attempts
+      const invalidHashCases = [
+        { label: "wrong memory (m=32768)", hash: `$argon2id$v=19$m=32768,t=3,p=4$${validSalt16}$${validDigest32}` },
+        { label: "wrong time (t=2)", hash: `$argon2id$v=19$m=65536,t=2,p=4$${validSalt16}$${validDigest32}` },
+        { label: "wrong parallelism (p=2)", hash: `$argon2id$v=19$m=65536,t=3,p=2$${validSalt16}$${validDigest32}` },
+        { label: "wrong version (v=18)", hash: `$argon2id$v=18$m=65536,t=3,p=4$${validSalt16}$${validDigest32}` },
+        { label: "invalid Base64 salt", hash: `$argon2id$v=19$m=65536,t=3,p=4$1G7pO+iiNcV0ev/jZ+l4Z!$${validDigest32}` },
+        { label: "invalid Base64 digest", hash: `$argon2id$v=19$m=65536,t=3,p=4$${validSalt16}$ScOGasAOdi2F2+HKaO7Cm0PtlIOFYqtZOd6WYe566j!` },
+        { label: "incorrect salt length (15 bytes)", hash: `$argon2id$v=19$m=65536,t=3,p=4$${Buffer.alloc(15, 0xaa).toString("base64")}$${validDigest32}` },
+        { label: "incorrect digest length (16 bytes)", hash: `$argon2id$v=19$m=65536,t=3,p=4$${validSalt16}$${Buffer.alloc(16, 0xbb).toString("base64")}` },
+        { label: "truncated hash", hash: `$argon2id$v=19$m=65536,t=3,p=4$${validSalt16}` },
+        { label: "unsupported bcrypt hash", hash: "$2b$12$e8uqVlE7mYy3y3bWfP.nOO5E11Yf8qjN1vOa9U5kUuG6E5u9K2W2a" },
+        { label: "missing null stored hash", hash: null },
+      ];
+
+      invalidHashCases.forEach(({ label, hash }) => {
+        it(`endpoint: executes dummy verification and records failed attempt for ${label}`, async () => {
+          const mockAccount = {
+            id: "e7b0a880-922c-47b2-9a57-0b1a78e7f101",
+            email: "amina.rahman@example.com",
+            role: "traveler",
+            type: "individual",
+            status: "active",
+            emailVerified: true,
+            securityCredentials: {
+              accountId: "e7b0a880-922c-47b2-9a57-0b1a78e7f101",
+              passwordHash: hash,
+              failedLoginAttempts: 0,
+              lockedUntil: null,
+            },
+          };
+
+          const { prisma, updateSecurityCredentialSpy } = createMockPrisma({ account: mockAccount });
+          const app = createApp({ prismaClient: prisma });
+
+          const verifyPasswordSpy = vi.spyOn(passwordModule, "verifyPassword");
+
+          const res = await request(app)
+            .post("/api/v1/auth/login")
+            .send(VALID_LOGIN_PAYLOAD);
+
+          expect(res.status).toBe(401);
+          expect(res.body.error.code).toBe("INVALID_CREDENTIALS");
+          expect(res.body.error.message).toBe("Invalid email or password");
+
+          // Must never leak hash content
+          if (hash) {
+            expect(JSON.stringify(res.body)).not.toContain(hash);
+          }
+
+          // Must execute dummy Argon2id verification with DUMMY_ARGON2_HASH
+          expect(verifyPasswordSpy).toHaveBeenCalledWith(
+            VALID_LOGIN_PAYLOAD.password,
+            loginService.DUMMY_ARGON2_HASH
+          );
+
+          // Must record failed login attempt (protection not bypassed)
+          expect(updateSecurityCredentialSpy).toHaveBeenCalledWith({
+            where: { accountId: "e7b0a880-922c-47b2-9a57-0b1a78e7f101" },
+            data: {
+              failedLoginAttempts: 1,
+              lockedUntil: null,
+            },
+          });
+
+          verifyPasswordSpy.mockRestore();
+        });
+      });
+    });
   });
 
   // ============================================================================
