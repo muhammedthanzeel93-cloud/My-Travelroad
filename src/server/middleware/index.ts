@@ -22,5 +22,11 @@ export {
 export {
   createRateLimiter,
   registrationRateLimiter,
+  loginRateLimiter,
   getClientIp,
 } from "./rate-limiter";
+export {
+  csrfProtectionMiddleware,
+  REQUIRED_CSRF_HEADER,
+  REQUIRED_CSRF_VALUE,
+} from "./csrf";

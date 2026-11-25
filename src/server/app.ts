@@ -18,12 +18,14 @@ import {
 import { notFoundHandler, errorHandler } from "./middleware/error-handler";
 import { createHealthRouter } from "./routes/health.routes";
 import { createApiRouter } from "./routes";
+import { RedisSessionStore } from "./redis/session.store";
 
 export interface AppOptions {
   prismaClient?: PrismaClient;
   corsOrigins?: string[];
   logger?: Logger;
   rateLimiter?: RequestHandler;
+  sessionStore?: RedisSessionStore;
 }
 
 export function createApp(options: AppOptions = {}): Express {
@@ -62,6 +64,7 @@ export function createApp(options: AppOptions = {}): Express {
     createApiRouter({
       prismaClient: options.prismaClient,
       rateLimiter: options.rateLimiter,
+      sessionStore: options.sessionStore,
     })
   );
 

@@ -8,10 +8,13 @@
  * - docs/architecture/api-architecture.md (Section 6.1 & 6.2)
  */
 
+import crypto from "node:crypto";
 import { PrismaClient } from "@prisma/client";
 import { prisma as defaultPrisma } from "../../lib/db";
 import { verifyPassword } from "../auth/password";
 import { signAccessToken, ACCESS_TOKEN_EXPIRATION_SECONDS } from "../auth/jwt";
+import { generateRefreshToken } from "../auth/refresh-token";
+import { RedisSessionStore } from "../redis/session.store";
 import { LoginRequestInput } from "../auth/login.schema";
 import { UserRole, AccountType, AccountStatus } from "../../types/domain/account.types";
 import {
@@ -122,6 +125,7 @@ export interface LoginResult {
     status: string;
     emailVerified: boolean;
   };
+  rawRefreshToken?: string;
 }
 
 /**
@@ -239,7 +243,9 @@ async function recordSuccessfulLogin(
  */
 export async function authenticateLogin(
   input: LoginRequestInput,
-  prismaClient: PrismaClient = defaultPrisma
+  prismaClient: PrismaClient = defaultPrisma,
+  sessionStore?: RedisSessionStore,
+  metadata?: { ipAddress?: string; userAgent?: string }
 ): Promise<LoginResult> {
   const normalizedEmail = input.email.toLowerCase();
 
@@ -335,7 +341,27 @@ export async function authenticateLogin(
   // 6. Successful Authentication: Concurrency-safe reset of failed attempts & update lastLoginAt
   await recordSuccessfulLogin(prismaClient, account.id);
 
-  // 7. Issue short-lived JWT access token using approved HS256 signing
+  // 7. Session persistence in Redis (when sessionStore is configured)
+  let rawRefreshToken: string | undefined;
+
+  if (sessionStore) {
+    const familyId = crypto.randomUUID();
+    const tokenCreds = generateRefreshToken(familyId);
+    const sessionId = crypto.randomUUID();
+
+    await sessionStore.createInitialSession({
+      familyId,
+      sessionId,
+      tokenHash: tokenCreds.tokenHash,
+      accountId: account.id,
+      ipAddress: metadata?.ipAddress,
+      userAgent: metadata?.userAgent,
+    });
+
+    rawRefreshToken = tokenCreds.rawToken;
+  }
+
+  // 8. Issue short-lived JWT access token using approved HS256 signing
   const accessToken = await signAccessToken({
     sub: account.id,
     email: account.email,
@@ -346,7 +372,7 @@ export async function authenticateLogin(
     gen: 1,
   });
 
-  // 8. Return standardized safe login result envelope
+  // 9. Return standardized safe login result envelope
   return {
     accessToken,
     tokenType: "Bearer",
@@ -358,5 +384,6 @@ export async function authenticateLogin(
       status: account.status,
       emailVerified: account.emailVerified,
     },
+    ...(rawRefreshToken ? { rawRefreshToken } : {}),
   };
 }

@@ -78,7 +78,7 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 - **Authentication**: None (Public).
 - **Permissions**: None. Rejects accounts with `type = 'system'`. Accounts with `status = 'pending_verification'` receive a scoped access token with `emailVerified: false`.
 - **Rate Limit**: 5 requests / min per IP.
-- **Refresh Token Status**: Issuance of rotating HttpOnly refresh cookies (`Set-Cookie: refreshToken=...`) and Redis session persistence is deferred to Task 10.6. In Task 10.5, the login endpoint returns the standard JSON response envelope containing the short-lived JWT access token without refresh cookies.
+- **Refresh Token Cookie**: Sets rotating HttpOnly cookie `refreshToken=rt_<familyId>_<64hex>` (`HttpOnly; Secure; SameSite=Strict; Path=/api/v1/auth; Max-Age=2592000`) and provisions an isolated token family and session in Redis. The raw refresh token is strictly delivered via cookie and is never exposed in the JSON response body.
 - **Request Body**:
 ```json
 {

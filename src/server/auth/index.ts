@@ -101,3 +101,26 @@ export {
   isValidArgon2idHash,
   isCanonicalBase64,
 } from "../services/login.service";
+
+// Session & Refresh Token Management (Task 10.6)
+export {
+  SessionService,
+  type RefreshSessionResult,
+  type SessionClientMetadata,
+} from "../services/session.service";
+export {
+  RedisSessionStore,
+  type FamilyRecord,
+  type SessionRecord,
+  type TokenLookupData,
+  type CreateSessionParams,
+  type RotateSessionParams,
+  type RotationScriptResult,
+  type ReplayRevocationParams,
+  type ReplayRevocationResult,
+  type LogoutParams,
+  type LogoutScriptResult,
+  SESSION_TTL_SECONDS,
+  TOMBSTONE_TTL_SECONDS,
+  COMPROMISED_FAMILY_TTL_SECONDS,
+} from "../redis";

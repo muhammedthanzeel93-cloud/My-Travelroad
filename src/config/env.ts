@@ -130,6 +130,17 @@ export const envSchema = z.object({
     .min(32, "JWT_SECRET must be at least 32 characters long for 256-bit entropy"),
   JWT_ISSUER: z.string().default("https://mytravelroad.com"),
   JWT_AUDIENCE: z.string().default("https://mytravelroad.com"),
+  REDIS_URL: z.string().optional(),
+  REDIS_HOST: z.string().default("127.0.0.1"),
+  REDIS_PORT: z.coerce.number().int().min(1).max(65535).default(6379),
+  REDIS_PASSWORD: z.string().optional(),
+  REDIS_KEY_PREFIX: z.string().default(""),
+  REDIS_TLS_ENABLED: z
+    .union([z.boolean(), z.enum(["true", "false"])])
+    .transform((val) => val === true || val === "true")
+    .default(false),
+  REDIS_SENTINEL_HOSTS: z.string().optional(),
+  REDIS_SENTINEL_MASTER: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

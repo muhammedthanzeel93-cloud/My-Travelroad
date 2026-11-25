@@ -219,14 +219,14 @@ graph LR
     C -->|Public Profile API| P
 ```
 
-### 6.2 Access Token and Future Refresh-Token Lifecycle
+### 6.2 Access Token and Refresh-Token Session Lifecycle
 
-The platform's authentication architecture distinguishes between current Stage A login token delivery and planned future refresh-token session infrastructure:
+The platform's authentication architecture implements a secure single-device session lifecycle with rotating refresh tokens and short-lived access tokens:
 
-- **Current Stage A / Task 10.5:** The login endpoint (`POST /api/v1/auth/login`) returns a short-lived HS256 JWT access token directly in the JSON response body (`{ "accessToken": "<jwt>" }`). No refresh token or refresh cookie is issued.
-- **Future Task 10.6+:** Refresh-token issuance, token family rotation, secure browser cookie delivery (`HttpOnly`, `Secure`, `SameSite=Strict`), and Redis session persistence will be implemented in the subsequent task.
+- **Stage A / Task 10.6 Implementation:** The login endpoint (`POST /api/v1/auth/login`) issues a short-lived HS256 JWT access token in the JSON response body and provisions an isolated token family in Redis, setting a rotating `refreshToken` cookie (`HttpOnly`, `Secure` in production, `SameSite=Strict`, `Path=/api/v1/auth`, `Max-Age=2592000`). `POST /api/v1/auth/refresh` rotates the token family using deterministic atomic Redis Lua scripts, enforcing anti-CSRF headers, account lifecycle, and password-change checks. `POST /api/v1/auth/logout` revokes the caller's specific session.
+- **Deferred Stage A+ Architecture:** Multi-device account-wide logout (`POST /api/v1/auth/logout-all`), database generation increments (`accounts.token_generation`), and asynchronous revocation outbox jobs (`account_revocation_jobs`) are explicitly deferred to the Stage A+ database migration.
 
-The following sequence diagram illustrates the active Stage A login flow alongside the planned future refresh-flow functionality (deferred to Task 10.6+):
+The following sequence diagram illustrates the active Stage A login, subsequent request, and token refresh lifecycle:
 
 ```mermaid
 sequenceDiagram
@@ -234,6 +234,7 @@ sequenceDiagram
     actor User as Tourist / Admin
     participant Client as Frontend Client
     participant AuthAPI as Auth API (/api/v1/auth)
+    participant Redis as Redis Session Store
     participant DB as PostgreSQL Database
 
     User->>Client: Enters Email & Password
@@ -241,17 +242,19 @@ sequenceDiagram
     AuthAPI->>DB: Query Account & Credentials by Email
     DB-->>AuthAPI: Account & Argon2id Hash
     AuthAPI->>AuthAPI: Verify Argon2id Password Hash
+    AuthAPI->>Redis: Persist Initial Family & Session (familyId, sessionId, tokenHash)
     AuthAPI->>AuthAPI: Generate Short-Lived Access Token (JWT, 15m)
-    Note over AuthAPI,Client: Stage A / Task 10.5: Access token only; refresh token deferred to Task 10.6+
-    AuthAPI-->>Client: 200 OK + JSON { accessToken }
+    AuthAPI-->>Client: 200 OK + JSON { accessToken } + Set-Cookie (refreshToken)
     
     Note over Client,AuthAPI: Subsequent Authenticated API Requests
     Client->>AuthAPI: GET /api/v1/profiles/me (Header: Authorization: Bearer <accessToken>)
     AuthAPI-->>Client: 200 OK + Profile Data
 
-    Note over Client,AuthAPI: Planned Future Refresh Flow (Deferred to Task 10.6+)
-    Client->>AuthAPI: POST /api/v1/auth/refresh (Cookie: refreshToken)
-    AuthAPI->>AuthAPI: Validate & Rotate Refresh Token
+    Note over Client,AuthAPI: Access Token Expiration & Token Rotation Flow
+    Client->>AuthAPI: POST /api/v1/auth/refresh (Cookie: refreshToken, Header: X-Requested-With: XMLHttpRequest)
+    AuthAPI->>Redis: Pre-Read Family & Replay Check
+    AuthAPI->>DB: Authoritative Status & passwordChangedAt Check
+    AuthAPI->>Redis: Execute Atomic Lua Rotation Script
     AuthAPI-->>Client: 200 OK + JSON { accessToken: newJwt } + Set-Cookie (newRefreshToken)
 ```
 
@@ -275,7 +278,7 @@ sequenceDiagram
      ```
    - **Token Generation Compatibility Claim (`gen`)**: An integer claim (`gen: 1`) included in the access token for schema compatibility. The approved Stage A database schema (`accounts`, `account_security_credentials`) does not contain a `token_generation` column. In Stage A, credential invalidation following a password change is enforced using `AccountSecurityCredential.passwordChangedAt` (`claims.iat <= passwordChangedUnix`), and account access lifecycle is asserted via authoritative `Account.status` checks in the authentication middleware. Operative generation-based durable revocation (`account.token_generation`) and multi-device outbox revocation are explicitly deferred to the future Stage A+ schema migration.
    - **Delivery**: Returned in JSON response body. Transmitted in client requests via header: `Authorization: Bearer <accessToken>`.
-2. **Long-Lived Refresh Token (Planned — Deferred to Task 10.6+)**:
+2. **Long-Lived Refresh Token (Stage A / Task 10.6)**:
    - **Lifespan**: 30 days (sliding window).
    - **Format**: High-entropy cryptographically random string (256-bit CSPRNG).
    - **Storage**: Transmitted in an `HttpOnly`, `Secure`, `SameSite=Strict` browser cookie with path restricted to `/api/v1/auth`.
