@@ -288,6 +288,7 @@ export class RedisSessionStore {
       TOMBSTONE_TTL_SECONDS.toString(),
       expiresAt,
       oldSessionId ?? "",
+      params.tombstonePayload ?? "",
     ];
 
     try {
@@ -305,9 +306,11 @@ export class RedisSessionStore {
         };
       }
 
+      const failureReason = (Array.isArray(result) ? result[1] : "UNKNOWN_ROTATION_ERROR") as any;
       return {
         success: false,
-        reason: (Array.isArray(result) ? result[1] : "UNKNOWN_ROTATION_ERROR") as any,
+        reason: failureReason,
+        error: failureReason,
       };
     } catch (err) {
       this.handleRedisError(err);
@@ -377,8 +380,12 @@ export class RedisSessionStore {
             this.accountSessionsKey(params.accountId),
             `${familyId}:${expectedActiveSessionId}`
           );
-        } catch {
-          // Best effort decoupled index maintenance
+        } catch (sremErr) {
+          // Log index cleanup failure for background reconciliation without masking primary family revocation
+          console.error(
+            `[SessionStore] Failed to prune account session index for account ${params.accountId}:`,
+            sremErr
+          );
         }
       }
 

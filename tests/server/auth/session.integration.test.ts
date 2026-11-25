@@ -9,6 +9,7 @@ import RedisMock from "ioredis-mock";
 import { RedisSessionStore } from "../../../src/server/redis/session.store";
 import { SessionService } from "../../../src/server/services/session.service";
 import { generateRefreshToken } from "../../../src/server/auth/refresh-token";
+import * as jwtModule from "../../../src/server/auth/jwt";
 import { UnauthorizedError, ForbiddenError } from "../../../src/server/errors/app-error";
 import { ErrorCode } from "../../../src/server/errors/error-codes";
 
@@ -202,12 +203,19 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
     // Legitimate rotation on Device A
     await sessionService.rotateRefreshSession(tokenA1.rawToken, {}, mockPrisma);
 
-    // Replay attack on Device A after grace window
-    // Simulate tokenA1 rotated 20 seconds ago
-    await redis.set(
-      `revoked_token:{${familyA}}:${tokenA1.tokenHash}`,
-      new Date(Date.now() - 20000).toISOString()
-    );
+    // Replay attack on Device A after recovery window
+    // Simulate tokenA1 rotated 35 seconds ago (exceeding 30s recovery window)
+    const tombstoneRawA = await redis.get(`revoked_token:{${familyA}}:${tokenA1.tokenHash}`);
+    if (tombstoneRawA) {
+      const tombA = JSON.parse(tombstoneRawA);
+      tombA.rotatedAt = new Date(Date.now() - 35000).toISOString();
+      await redis.set(`revoked_token:{${familyA}}:${tokenA1.tokenHash}`, JSON.stringify(tombA));
+    } else {
+      await redis.set(
+        `revoked_token:{${familyA}}:${tokenA1.tokenHash}`,
+        new Date(Date.now() - 35000).toISOString()
+      );
+    }
 
     await expect(
       sessionService.rotateRefreshSession(tokenA1.rawToken, {}, mockPrisma)
@@ -469,7 +477,7 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
       expect(fam?.activeTokenHash).toBe(token.tokenHash);
     });
 
-    it("client retry within 15-second grace window does not trigger family compromise", async () => {
+    it("client retry within 30-second recovery window recovers replacement credentials without compromising family", async () => {
       const familyId = crypto.randomUUID();
       const token = generateRefreshToken(familyId);
       const sessionId = crypto.randomUUID();
@@ -484,12 +492,12 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
       // 1. Rotate token
       const rotation = await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
 
-      // 2. Client immediately retries with the old token (within grace window)
-      await expect(
-        sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma)
-      ).rejects.toThrow(
-        new UnauthorizedError("Refresh token has already been rotated", ErrorCode.TOKEN_INVALID)
-      );
+      // 2. Client immediately retries with the old token (within 30-second recovery window)
+      const retryResult = await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
+
+      // Recovers the exact same replacement credentials
+      expect(retryResult.accessToken).toBe(rotation.accessToken);
+      expect(retryResult.newRawRefreshToken).toBe(rotation.newRawRefreshToken);
 
       // 3. Family MUST NOT be marked compromised!
       const fam = await sessionStore.getFamily(familyId);
@@ -499,6 +507,95 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
       // 4. Replacement token from rotation is STILL valid!
       const rotation2 = await sessionService.rotateRefreshSession(rotation.newRawRefreshToken, {}, mockPrisma);
       expect(rotation2.accessToken).toBeDefined();
+    });
+
+    it("client retry after 30-second recovery window triggers replay detection and compromises family", async () => {
+      const familyId = crypto.randomUUID();
+      const token = generateRefreshToken(familyId);
+      const sessionId = crypto.randomUUID();
+
+      await sessionStore.createInitialSession({
+        familyId,
+        sessionId,
+        tokenHash: token.tokenHash,
+        accountId: validAccountId,
+      });
+
+      // 1. Rotate token
+      await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
+
+      // 2. Simulate tombstone expired beyond 30-second recovery window (35 seconds ago)
+      const tombstoneRaw = await redis.get(`revoked_token:{${familyId}}:${token.tokenHash}`);
+      expect(tombstoneRaw).not.toBeNull();
+      const tombstoneObj = JSON.parse(tombstoneRaw!);
+      tombstoneObj.rotatedAt = new Date(Date.now() - 35000).toISOString();
+      await redis.set(`revoked_token:{${familyId}}:${token.tokenHash}`, JSON.stringify(tombstoneObj));
+
+      // 3. Present old token again: replay detection triggers fail-closed
+      await expect(
+        sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma)
+      ).rejects.toThrow(
+        new UnauthorizedError(
+          "Refresh token replay detected. Session family has been revoked.",
+          ErrorCode.TOKEN_REPLAY_DETECTED
+        )
+      );
+
+      // 4. Family MUST be compromised and session pruned from account index
+      const fam = await sessionStore.getFamily(familyId);
+      expect(fam?.isCompromised).toBe(true);
+
+      const acctSessions = await redis.smembers(`account_sessions:${validAccountId}`);
+      expect(acctSessions).not.toContain(`${familyId}:${sessionId}`);
+    });
+
+    it("prunes account session index for the compromised family while leaving other device sessions intact", async () => {
+      const family1 = crypto.randomUUID();
+      const token1 = generateRefreshToken(family1);
+      const session1 = crypto.randomUUID();
+
+      const family2 = crypto.randomUUID();
+      const token2 = generateRefreshToken(family2);
+      const session2 = crypto.randomUUID();
+
+      // Device 1
+      await sessionStore.createInitialSession({
+        familyId: family1,
+        sessionId: session1,
+        tokenHash: token1.tokenHash,
+        accountId: validAccountId,
+      });
+
+      // Device 2
+      await sessionStore.createInitialSession({
+        familyId: family2,
+        sessionId: session2,
+        tokenHash: token2.tokenHash,
+        accountId: validAccountId,
+      });
+
+      // Rotate Device 1
+      await sessionService.rotateRefreshSession(token1.rawToken, {}, mockPrisma);
+
+      // Age tombstone past 30-second recovery window
+      const tombstoneRaw = await redis.get(`revoked_token:{${family1}}:${token1.tokenHash}`);
+      const tombstoneObj = JSON.parse(tombstoneRaw!);
+      tombstoneObj.rotatedAt = new Date(Date.now() - 35000).toISOString();
+      await redis.set(`revoked_token:{${family1}}:${token1.tokenHash}`, JSON.stringify(tombstoneObj));
+
+      // Trigger replay on Device 1
+      await expect(
+        sessionService.rotateRefreshSession(token1.rawToken, {}, mockPrisma)
+      ).rejects.toThrow(UnauthorizedError);
+
+      // Device 1 must be pruned from account index
+      const acctSessions = await redis.smembers(`account_sessions:${validAccountId}`);
+      expect(acctSessions).not.toContain(`${family1}:${session1}`);
+
+      // Device 2 session MUST remain in account index and valid!
+      expect(acctSessions).toContain(`${family2}:${session2}`);
+      const fam2 = await sessionStore.getFamily(family2);
+      expect(fam2?.isCompromised).toBe(false);
     });
 
     it("Redis outage during logout throws ServiceUnavailableError and does not swallow error", async () => {
@@ -527,15 +624,33 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
         accountId: validAccountId,
       });
 
-      // Mock signAccessToken by mocking crypto or invalid account
-      mockPrisma.account.findUnique.mockResolvedValueOnce({
-        ...validAccount,
-        id: "invalid-uuid-that-fails-signing", // or make signing fail
-      });
+      // Genuine Vitest spy on signAccessToken to simulate signing failure before Redis mutation
+      const signSpy = vi
+        .spyOn(jwtModule, "signAccessToken")
+        .mockRejectedValueOnce(new Error("JWT cryptographic signing failure"));
 
-      // If rotation throws before Redis mutation, Redis stays at rotationSeq=1
-      const famBefore = await sessionStore.getFamily(familyId);
-      expect(famBefore?.rotationSeq).toBe(1);
+      await expect(
+        sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma)
+      ).rejects.toThrow("JWT cryptographic signing failure");
+
+      signSpy.mockRestore();
+
+      // Redis state MUST be completely unmutated:
+      // 1. Family sequence is still 1 and activeTokenHash is still original token
+      const fam = await sessionStore.getFamily(familyId);
+      expect(fam?.rotationSeq).toBe(1);
+      expect(fam?.activeTokenHash).toBe(token.tokenHash);
+      expect(fam?.isCompromised).toBe(false);
+
+      // 2. Token lookup still exists for original token
+      const lookup = await sessionStore.getTokenLookup(familyId, token.tokenHash);
+      expect(lookup).not.toBeNull();
+      expect(lookup?.sessionId).toBe(sessionId);
+
+      // 3. Old session still exists and has original tokenHash
+      const session = await sessionStore.getSession(familyId, sessionId);
+      expect(session).not.toBeNull();
+      expect(session?.tokenHash).toBe(token.tokenHash);
     });
 
     it("correctly sets expiresAt to 30 days in the future rather than createdAt", async () => {

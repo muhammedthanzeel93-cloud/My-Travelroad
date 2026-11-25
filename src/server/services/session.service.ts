@@ -87,27 +87,75 @@ export class SessionService {
       );
     }
 
-    // 5. Replay Detection & Grace Window Check
+    // 5. Replay Detection & Bounded Retry Recovery Check
     // If presented token hash does NOT match the currently active token hash in the family:
     if (family.activeTokenHash !== tokenHash) {
       // Check if presented token was previously rotated (tombstone exists)
       const tombstonePayload = await this.sessionStore.getRevokedTokenTombstone(familyId, tokenHash);
       if (tombstonePayload) {
-        const rotatedTime = new Date(tombstonePayload).getTime();
-        const nowTime = Date.now();
-        // If rotated within 15 seconds grace window (e.g. client retry after network disconnect or concurrent in-flight refresh)
-        if (!isNaN(rotatedTime) && nowTime - rotatedTime < 15000) {
-          throw new UnauthorizedError(
-            "Refresh token has already been rotated",
-            ErrorCode.TOKEN_INVALID
-          );
+        try {
+          const parsedTombstone = JSON.parse(tombstonePayload);
+          if (
+            parsedTombstone &&
+            parsedTombstone.rotatedAt &&
+            parsedTombstone.data &&
+            parsedTombstone.iv &&
+            parsedTombstone.tag
+          ) {
+            const rotatedTime = new Date(parsedTombstone.rotatedAt).getTime();
+            const elapsed = Date.now() - rotatedTime;
+            const RECOVERY_WINDOW_MS = 30000; // 30-second bounded recovery window
+
+            if (!isNaN(rotatedTime) && elapsed <= RECOVERY_WINDOW_MS) {
+              // Legitimate client retry or concurrent request that lost the rotation response!
+              // Decrypt replacement credentials using key derived on the fly from presented rawCookie
+              try {
+                const recoveryKey = crypto
+                  .createHash("sha256")
+                  .update("recovery-key:" + rawCookie)
+                  .digest();
+                const decipher = crypto.createDecipheriv(
+                  "aes-256-gcm",
+                  recoveryKey,
+                  Buffer.from(parsedTombstone.iv, "base64")
+                );
+                decipher.setAuthTag(Buffer.from(parsedTombstone.tag, "base64"));
+                let decrypted = decipher.update(parsedTombstone.data, "base64", "utf8");
+                decrypted += decipher.final("utf8");
+
+                const recovered = JSON.parse(decrypted) as RefreshSessionResult;
+                if (recovered && recovered.accessToken && recovered.newRawRefreshToken) {
+                  // Verify that family is not compromised in Redis
+                  const currentFam = await this.sessionStore.getFamily(familyId);
+                  if (currentFam && !currentFam.isCompromised) {
+                    return recovered;
+                  }
+                }
+              } catch {
+                // Decryption failure (e.g. fabricated raw token): fall through to replay handling
+              }
+            }
+          }
+        } catch {
+          // Backward compatibility with raw timestamp tombstones
+          const rotatedTime = new Date(tombstonePayload).getTime();
+          if (!isNaN(rotatedTime) && Date.now() - rotatedTime < 15000) {
+            throw new UnauthorizedError(
+              "Refresh token has already been rotated",
+              ErrorCode.TOKEN_INVALID
+            );
+          }
         }
       }
 
-      // Beyond grace window or unexpected mismatch: confirmed replay attempt!
+      // Beyond recovery window, invalid recovery data, or hostile mismatch: confirmed replay attempt!
       let currentActiveHash = family.activeTokenHash;
       let currentActiveSession = family.activeSessionId;
       let replayConfirmed = false;
+
+      // Resolve accountId for account session index cleanup
+      const activeSessionRecord = await this.sessionStore.getSession(familyId, currentActiveSession);
+      const targetAccountId = activeSessionRecord?.accountId;
 
       for (let attempt = 0; attempt < 3; attempt++) {
         const replayResult = await this.sessionStore.revokeFamilyReplay({
@@ -115,6 +163,7 @@ export class SessionService {
           presentedTokenHash: tokenHash,
           expectedActiveTokenHash: currentActiveHash,
           expectedActiveSessionId: currentActiveSession,
+          accountId: targetAccountId,
         });
 
         if (replayResult === "REPLAY_CONFIRMED") {
@@ -273,6 +322,32 @@ export class SessionService {
       gen: 1,
     });
 
+    const refreshResult: RefreshSessionResult = {
+      accessToken,
+      tokenType: "Bearer",
+      expiresIn: ACCESS_TOKEN_EXPIRATION_SECONDS,
+      newRawRefreshToken: replacement.rawToken,
+    };
+
+    // 9.6 Encrypt replacement credentials into recovery envelope using key derived on the fly from rawCookie
+    // The server NEVER stores raw refresh tokens in plaintext in Redis.
+    const recoveryKey = crypto
+      .createHash("sha256")
+      .update("recovery-key:" + rawCookie)
+      .digest();
+    const recoveryIv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", recoveryKey, recoveryIv);
+    let encryptedData = cipher.update(JSON.stringify(refreshResult), "utf8", "base64");
+    encryptedData += cipher.final("base64");
+    const recoveryTag = cipher.getAuthTag().toString("base64");
+
+    const tombstonePayload = JSON.stringify({
+      rotatedAt: nowIso,
+      iv: recoveryIv.toString("base64"),
+      tag: recoveryTag,
+      data: encryptedData,
+    });
+
     // 10. Execute Deterministic Atomic Rotation Script in Redis
     const rotationResult = await this.sessionStore.rotateSession({
       familyId,
@@ -283,6 +358,7 @@ export class SessionService {
       ipAddress: metadata.ipAddress,
       userAgent: metadata.userAgent,
       timestamp: nowIso,
+      tombstonePayload,
     });
 
     if (!rotationResult.success) {
@@ -317,12 +393,7 @@ export class SessionService {
       // Ignored: failure to update the cross-slot account index does not invalidate the active session
     }
 
-    return {
-      accessToken,
-      tokenType: "Bearer",
-      expiresIn: ACCESS_TOKEN_EXPIRATION_SECONDS,
-      newRawRefreshToken: replacement.rawToken,
-    };
+    return refreshResult;
   }
 
   /**

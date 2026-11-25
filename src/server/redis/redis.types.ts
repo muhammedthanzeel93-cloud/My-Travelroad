@@ -77,6 +77,7 @@ export interface RotateSessionParams {
   userAgent?: string;
   timestamp?: string;
   expiresAt?: string;
+  tombstonePayload?: string;
 }
 
 /**
@@ -84,7 +85,7 @@ export interface RotateSessionParams {
  */
 export type RotationScriptResult =
   | { success: true; newRotationSeq: number }
-  | { success: false; reason: "FAMILY_NOT_FOUND" | "FAMILY_COMPROMISED" | "RACE_OR_REPLAY_DETECTED" | "TOKEN_LOOKUP_NOT_FOUND" | string };
+  | { success: false; reason: "FAMILY_NOT_FOUND" | "FAMILY_COMPROMISED" | "RACE_OR_REPLAY_DETECTED" | "TOKEN_LOOKUP_NOT_FOUND" | string; error?: string };
 
 /**
  * Parameters for atomic replay revocation.

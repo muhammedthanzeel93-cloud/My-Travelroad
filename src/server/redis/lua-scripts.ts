@@ -6,7 +6,7 @@
  */
 
 /**
- * Deterministic Atomic Rotation Script (6 KEYS, 10 ARGV)
+ * Deterministic Atomic Rotation Script (6 KEYS, 11 ARGV)
  *
  * KEYS[1]: family:{familyId}
  * KEYS[2]: token_lookup:{familyId}:{presentedTokenHash}
@@ -25,6 +25,7 @@
  * ARGV[8]: tombstoneTtl (seconds, e.g. 86400)
  * ARGV[9]: expiresAt (ISO 8601 string, e.g. now + 30 days)
  * ARGV[10]: expectedOldSessionId
+ * ARGV[11]: tombstonePayload (Encrypted recovery envelope JSON or timestamp)
  */
 export const ATOMIC_ROTATION_LUA = `
 -- 1. Verify family exists
@@ -38,27 +39,80 @@ if isCompromised == '1' then
     return {'ERROR', 'FAMILY_COMPROMISED'}
 end
 
--- 3. Verify active token hash and active session ID match presented credentials
+-- 3. Verify family fields: familyId, activeTokenHash, activeSessionId, rotationSeq
+local famFamilyId = redis.call('HGET', KEYS[1], 'familyId')
+if not famFamilyId or famFamilyId == '' then
+    return {'ERROR', 'MALFORMED_FAMILY_RECORD'}
+end
+
 local activeTokenHash = redis.call('HGET', KEYS[1], 'activeTokenHash')
-local activeSessionId = redis.call('HGET', KEYS[1], 'activeSessionId')
-if activeTokenHash ~= ARGV[1] then
+if not activeTokenHash or activeTokenHash ~= ARGV[1] then
     return {'ERROR', 'RACE_OR_REPLAY_DETECTED'}
+end
+
+local activeSessionId = redis.call('HGET', KEYS[1], 'activeSessionId')
+if not activeSessionId or activeSessionId == '' then
+    return {'ERROR', 'MALFORMED_FAMILY_RECORD'}
 end
 if ARGV[10] ~= '' and activeSessionId ~= ARGV[10] then
     return {'ERROR', 'SESSION_MISMATCH'}
 end
 
--- 4. Verify token lookup key exists
+local currentSeqStr = redis.call('HGET', KEYS[1], 'rotationSeq')
+local currentSeq = tonumber(currentSeqStr)
+if not currentSeq or currentSeq < 1 then
+    return {'ERROR', 'INVALID_ROTATION_SEQUENCE'}
+end
+
+-- 4. Verify token lookup key exists and parse JSON payload
 if redis.call('EXISTS', KEYS[2]) == 0 then
     return {'ERROR', 'TOKEN_LOOKUP_NOT_FOUND'}
 end
 
--- 5. Verify old session record exists and matches expected token hash
+local lookupRaw = redis.call('GET', KEYS[2])
+if not lookupRaw or lookupRaw == '' then
+    return {'ERROR', 'TOKEN_LOOKUP_CORRUPTED'}
+end
+
+local lookupFamilyId = string.match(lookupRaw, '"familyId"%s*:%s*"([^"]+)"')
+local lookupSessionId = string.match(lookupRaw, '"sessionId"%s*:%s*"([^"]+)"')
+local lookupAccountId = string.match(lookupRaw, '"accountId"%s*:%s*"([^"]+)"')
+
+if not lookupFamilyId or lookupFamilyId ~= famFamilyId then
+    return {'ERROR', 'LOOKUP_FAMILY_MISMATCH'}
+end
+if not lookupSessionId or lookupSessionId ~= activeSessionId then
+    return {'ERROR', 'LOOKUP_SESSION_MISMATCH'}
+end
+if not lookupAccountId or lookupAccountId == '' then
+    return {'ERROR', 'LOOKUP_ACCOUNT_MISSING'}
+end
+
+-- 5. Verify old session record exists and matches identity & presented token hash
 if redis.call('EXISTS', KEYS[3]) == 0 then
     return {'ERROR', 'OLD_SESSION_NOT_FOUND'}
 end
+
+local oldSessId = redis.call('HGET', KEYS[3], 'sessionId')
+if not oldSessId or oldSessId ~= activeSessionId then
+    return {'ERROR', 'OLD_SESSION_ID_MISMATCH'}
+end
+
+local oldSessFamId = redis.call('HGET', KEYS[3], 'familyId')
+if not oldSessFamId or oldSessFamId ~= famFamilyId then
+    return {'ERROR', 'OLD_SESSION_FAMILY_MISMATCH'}
+end
+
+local oldSessAccountId = redis.call('HGET', KEYS[3], 'accountId')
+if not oldSessAccountId or oldSessAccountId ~= lookupAccountId then
+    return {'ERROR', 'OLD_SESSION_ACCOUNT_MISMATCH'}
+end
+
 local oldSessionHash = redis.call('HGET', KEYS[3], 'tokenHash')
-if oldSessionHash and oldSessionHash ~= ARGV[1] then
+if not oldSessionHash or oldSessionHash == '' then
+    return {'ERROR', 'OLD_SESSION_TOKEN_HASH_MISSING'}
+end
+if oldSessionHash ~= ARGV[1] then
     return {'ERROR', 'OLD_SESSION_HASH_MISMATCH'}
 end
 
@@ -67,38 +121,29 @@ if redis.call('EXISTS', KEYS[5]) == 1 or redis.call('EXISTS', KEYS[6]) == 1 then
     return {'ERROR', 'REPLACEMENT_KEY_COLLISION'}
 end
 
--- 7. Extract accountId and familyId from existing state
-local familyId = redis.call('HGET', KEYS[1], 'familyId') or ''
-local accountId = redis.call('HGET', KEYS[3], 'accountId') or ''
-if accountId == '' then
-    local lookupVal = redis.call('GET', KEYS[2])
-    if lookupVal then
-        local match = string.match(lookupVal, '"accountId"%s*:%s*"([^"]+)"')
-        if match then accountId = match end
-    end
-end
-
--- 8. Read and increment rotation sequence
-local currentSeqStr = redis.call('HGET', KEYS[1], 'rotationSeq')
-local currentSeq = tonumber(currentSeqStr) or 1
+-- 7. All validations passed! Safe to proceed with atomic mutations.
 local newSeq = currentSeq + 1
 
--- 9. Atomically delete old credentials
+-- Delete old credentials
 redis.call('DEL', KEYS[2])
 redis.call('DEL', KEYS[3])
 
--- 10. Write revoked token tombstone with rotation timestamp payload
-redis.call('SET', KEYS[4], ARGV[6], 'EX', tonumber(ARGV[8]))
+-- Write revoked token tombstone with payload
+local tombPayload = ARGV[11]
+if not tombPayload or tombPayload == '' then
+    tombPayload = ARGV[6]
+end
+redis.call('SET', KEYS[4], tombPayload, 'EX', tonumber(ARGV[8]))
 
--- 11. Construct new token lookup JSON
-local newLookupJson = '{"familyId":"' .. familyId .. '","sessionId":"' .. ARGV[3] .. '","accountId":"' .. accountId .. '"}'
+-- Write replacement token lookup
+local newLookupJson = '{"familyId":"' .. famFamilyId .. '","sessionId":"' .. ARGV[3] .. '","accountId":"' .. lookupAccountId .. '"}'
 redis.call('SET', KEYS[5], newLookupJson, 'EX', tonumber(ARGV[7]))
 
--- 12. Write replacement session hash with genuine 30-day expiresAt
+-- Write replacement session hash with genuine 30-day expiresAt
 redis.call('HSET', KEYS[6],
     'sessionId', ARGV[3],
-    'familyId', familyId,
-    'accountId', accountId,
+    'familyId', famFamilyId,
+    'accountId', lookupAccountId,
     'tokenHash', ARGV[2],
     'rotationSeq', tostring(newSeq),
     'createdAt', ARGV[6],
@@ -108,7 +153,7 @@ redis.call('HSET', KEYS[6],
 )
 redis.call('EXPIRE', KEYS[6], tonumber(ARGV[7]))
 
--- 13. Update family record
+-- Update family record
 redis.call('HSET', KEYS[1],
     'activeSessionId', ARGV[3],
     'activeTokenHash', ARGV[2],

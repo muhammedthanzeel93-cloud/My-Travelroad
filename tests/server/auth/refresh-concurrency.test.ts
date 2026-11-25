@@ -113,12 +113,23 @@ describe("Refresh Token Concurrency & Race Condition Guarantees", () => {
     const winner = await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
     const winnerSessionId = (await sessionStore.getFamily(familyId))?.activeSessionId;
 
-    // Delayed/stale request attempts to rotate with the old token
+    // Immediate retry with the old token within recovery window recovers the winner's credentials without overwriting session
+    const retry = await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
+    expect(retry.accessToken).toBe(winner.accessToken);
+    expect(retry.newRawRefreshToken).toBe(winner.newRawRefreshToken);
+
+    // After recovery window (>30s), presenting old token triggers replay detection
+    const tombstoneRaw = await redis.get(`revoked_token:{${familyId}}:${token.tokenHash}`);
+    if (tombstoneRaw) {
+      const tombstoneObj = JSON.parse(tombstoneRaw);
+      tombstoneObj.rotatedAt = new Date(Date.now() - 35000).toISOString();
+      await redis.set(`revoked_token:{${familyId}}:${token.tokenHash}`, JSON.stringify(tombstoneObj));
+    }
     await expect(
       sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma)
     ).rejects.toThrow(UnauthorizedError);
 
-    // Verify family still belongs to the winner's session ID or is compromised, but never overwritten by old state
+    // Verify family activeSessionId was never overwritten by the old session ID
     const currentFam = await sessionStore.getFamily(familyId);
     expect(currentFam?.activeSessionId).not.toBe(sessionId);
   });

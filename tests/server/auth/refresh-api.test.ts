@@ -178,15 +178,20 @@ describe("Authentication Session Endpoints (Login, Refresh, Logout)", () => {
       expect(rotatedCookieVal).not.toBe(initialCookieVal);
       expect(rotatedCookieVal).toMatch(new RegExp(`^${REFRESH_COOKIE_NAME}=rt_`));
 
-      // 3. Client retry within grace window: fails safely with 401 TOKEN_INVALID without compromising family
+      // 3. Client retry within 30-second recovery window: recovers replacement credentials with 200 OK without compromising family
       const retryRes = await request(app)
         .post("/api/v1/auth/refresh")
         .set("X-Requested-With", "XMLHttpRequest")
         .set("Cookie", [initialCookieVal]);
 
-      expect(retryRes.status).toBe(401);
-      expect(retryRes.body.success).toBe(false);
-      expect(retryRes.body.error.code).toBe("TOKEN_INVALID");
+      expect(retryRes.status).toBe(200);
+      expect(retryRes.body.success).toBe(true);
+      expect(retryRes.body.data.accessToken).toBe(refreshRes.body.data.accessToken);
+
+      // Verify replacement cookie dispatched on retry matches the rotated cookie
+      const retryCookies = retryRes.headers["set-cookie"];
+      const retryCookieStr = Array.isArray(retryCookies) ? retryCookies[0] : retryCookies;
+      expect(retryCookieStr.split(";")[0]).toBe(rotatedCookieVal);
 
       // Verify rotated token is STILL VALID after client retry!
       const validRefresh = await request(app)
@@ -196,13 +201,23 @@ describe("Authentication Session Endpoints (Login, Refresh, Logout)", () => {
 
       expect(validRefresh.status).toBe(200);
 
-      // 4. Hostile replay attack after grace window: present initial cookie again after aging tombstone
+      // 4. Hostile replay attack after recovery window (> 30s): present initial cookie again after aging tombstone
       const { parseRefreshToken } = await import("../../../src/server/auth/refresh-token");
       const { familyId, tokenHash } = parseRefreshToken(initialCookieVal.replace(`${REFRESH_COOKIE_NAME}=`, ""));
-      await redis.set(
-        `revoked_token:{${familyId}}:${tokenHash}`,
-        new Date(Date.now() - 20000).toISOString()
-      );
+      const tombstoneRaw = await redis.get(`revoked_token:{${familyId}}:${tokenHash}`);
+      if (tombstoneRaw) {
+        const tombstoneObj = JSON.parse(tombstoneRaw);
+        tombstoneObj.rotatedAt = new Date(Date.now() - 35000).toISOString();
+        await redis.set(
+          `revoked_token:{${familyId}}:${tokenHash}`,
+          JSON.stringify(tombstoneObj)
+        );
+      } else {
+        await redis.set(
+          `revoked_token:{${familyId}}:${tokenHash}`,
+          new Date(Date.now() - 35000).toISOString()
+        );
+      }
 
       const replayRes = await request(app)
         .post("/api/v1/auth/refresh")
