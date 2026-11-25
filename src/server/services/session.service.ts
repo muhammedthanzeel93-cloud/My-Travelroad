@@ -87,10 +87,24 @@ export class SessionService {
       );
     }
 
-    // 5. Replay Detection & Family-Level Revocation
+    // 5. Replay Detection & Grace Window Check
     // If presented token hash does NOT match the currently active token hash in the family:
     if (family.activeTokenHash !== tokenHash) {
-      // Execute atomic replay revocation with state revalidation and retry-to-convergence
+      // Check if presented token was previously rotated (tombstone exists)
+      const tombstonePayload = await this.sessionStore.getRevokedTokenTombstone(familyId, tokenHash);
+      if (tombstonePayload) {
+        const rotatedTime = new Date(tombstonePayload).getTime();
+        const nowTime = Date.now();
+        // If rotated within 15 seconds grace window (e.g. client retry after network disconnect or concurrent in-flight refresh)
+        if (!isNaN(rotatedTime) && nowTime - rotatedTime < 15000) {
+          throw new UnauthorizedError(
+            "Refresh token has already been rotated",
+            ErrorCode.TOKEN_INVALID
+          );
+        }
+      }
+
+      // Beyond grace window or unexpected mismatch: confirmed replay attempt!
       let currentActiveHash = family.activeTokenHash;
       let currentActiveSession = family.activeSessionId;
       let replayConfirmed = false;
@@ -247,6 +261,18 @@ export class SessionService {
     const oldSessionId = family.activeSessionId;
     const nowIso = new Date().toISOString();
 
+    // 9.5 Pre-sign short-lived HS256 JWT access token before Redis mutation to guarantee
+    // that a signing failure will not leave an orphaned, rotated session in Redis
+    const accessToken = await signAccessToken({
+      sub: account.id,
+      email: account.email,
+      role: account.role as UserRole,
+      emailVerified: account.emailVerified,
+      type: account.type as AccountType,
+      status: account.status as AccountStatus,
+      gen: 1,
+    });
+
     // 10. Execute Deterministic Atomic Rotation Script in Redis
     const rotationResult = await this.sessionStore.rotateSession({
       familyId,
@@ -279,23 +305,17 @@ export class SessionService {
     }
 
     // 11. Decoupled update to account-level session index
-    await this.sessionStore.updateAccountSessionIndex(
-      accountId,
-      familyId,
-      oldSessionId,
-      newSessionId
-    );
-
-    // 12. Issue short-lived HS256 JWT access token
-    const accessToken = await signAccessToken({
-      sub: account.id,
-      email: account.email,
-      role: account.role as UserRole,
-      emailVerified: account.emailVerified,
-      type: account.type as AccountType,
-      status: account.status as AccountStatus,
-      gen: 1,
-    });
+    // Best-effort decoupled index maintenance: Redis rotation is already committed
+    try {
+      await this.sessionStore.updateAccountSessionIndex(
+        accountId,
+        familyId,
+        oldSessionId,
+        newSessionId
+      );
+    } catch {
+      // Ignored: failure to update the cross-slot account index does not invalidate the active session
+    }
 
     return {
       accessToken,
@@ -306,35 +326,74 @@ export class SessionService {
   }
 
   /**
-   * Logs out the current device session and clears associated Redis records.
+   * Logs out the current device session with strict validation.
+   * Old, fabricated, or unrelated tokens cannot revoke an active session.
+   * Infrastructure failures (Redis down) throw ServiceUnavailableError.
    *
    * @param rawCookie Value from req.cookies.refreshToken
-   * @param accountId Optional account UUID if resolved from Bearer token
+   * @param callerAccountId Optional account UUID if resolved from Bearer token
    * @returns Success confirmation message
    */
   public async logoutSession(
     rawCookie: string | undefined,
-    accountId?: string
+    callerAccountId?: string
   ): Promise<{ message: string }> {
     if (!rawCookie || typeof rawCookie !== "string" || rawCookie.trim().length === 0) {
       return { message: "Successfully logged out and session revoked." };
     }
 
+    let parsed;
     try {
-      const { familyId, tokenHash } = parseRefreshToken(rawCookie);
-      const family = await this.sessionStore.getFamily(familyId);
-
-      if (family) {
-        await this.sessionStore.logoutSession({
-          familyId,
-          expectedActiveSessionId: family.activeSessionId,
-          expectedActiveTokenHash: family.activeTokenHash,
-          accountId,
-        });
-      }
+      parsed = parseRefreshToken(rawCookie);
     } catch {
-      // Logout is idempotent and must succeed safely even if token is already expired or malformed
+      // Malformed cookie is an expected idempotent client outcome
+      return { message: "Successfully logged out and session revoked." };
     }
+
+    const { familyId, tokenHash } = parsed;
+
+    // 1. Resolve token lookup record from Redis
+    const lookup = await this.sessionStore.getTokenLookup(familyId, tokenHash);
+
+    if (!lookup) {
+      // Lookup not found: token might be already revoked, expired, or non-existent
+      const family = await this.sessionStore.getFamily(familyId);
+      if (!family) {
+        // Family does not exist (already logged out or expired): idempotent success
+        return { message: "Successfully logged out and session revoked." };
+      }
+
+      // Family exists, but presented token hash is not in lookup!
+      // This is a stale, rotated, or fabricated token.
+      // It MUST NOT revoke the active family/session!
+      return { message: "Successfully logged out and session revoked." };
+    }
+
+    // 2. Lookup exists: verify account ownership if caller identity was provided
+    if (callerAccountId && lookup.accountId !== callerAccountId) {
+      // Token belongs to another account! Must NOT revoke!
+      return { message: "Successfully logged out and session revoked." };
+    }
+
+    // 3. Verify family state and active credentials
+    const family = await this.sessionStore.getFamily(familyId);
+    if (!family) {
+      return { message: "Successfully logged out and session revoked." };
+    }
+
+    // Assert that presented token matches the active token in the family
+    if (family.activeTokenHash !== tokenHash || family.activeSessionId !== lookup.sessionId) {
+      // Token is stale or mismatched! Must NOT revoke the active session!
+      return { message: "Successfully logged out and session revoked." };
+    }
+
+    // 4. Invoke atomic Lua logout with verified expected credentials
+    await this.sessionStore.logoutSession({
+      familyId,
+      expectedActiveSessionId: lookup.sessionId,
+      expectedActiveTokenHash: tokenHash,
+      accountId: lookup.accountId,
+    });
 
     return { message: "Successfully logged out and session revoked." };
   }

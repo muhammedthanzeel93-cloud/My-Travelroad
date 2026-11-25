@@ -6,7 +6,7 @@
  */
 
 /**
- * Deterministic Atomic Rotation Script (6 KEYS, 8 ARGV)
+ * Deterministic Atomic Rotation Script (6 KEYS, 10 ARGV)
  *
  * KEYS[1]: family:{familyId}
  * KEYS[2]: token_lookup:{familyId}:{presentedTokenHash}
@@ -20,9 +20,11 @@
  * ARGV[3]: newSessionId
  * ARGV[4]: ipAddress
  * ARGV[5]: userAgent
- * ARGV[6]: timestamp (ISO 8601)
+ * ARGV[6]: timestamp (createdAt ISO 8601 string)
  * ARGV[7]: ttl (seconds, e.g. 2592000)
  * ARGV[8]: tombstoneTtl (seconds, e.g. 86400)
+ * ARGV[9]: expiresAt (ISO 8601 string, e.g. now + 30 days)
+ * ARGV[10]: expectedOldSessionId
  */
 export const ATOMIC_ROTATION_LUA = `
 -- 1. Verify family exists
@@ -36,10 +38,14 @@ if isCompromised == '1' then
     return {'ERROR', 'FAMILY_COMPROMISED'}
 end
 
--- 3. Verify active token hash matches presented token hash
+-- 3. Verify active token hash and active session ID match presented credentials
 local activeTokenHash = redis.call('HGET', KEYS[1], 'activeTokenHash')
+local activeSessionId = redis.call('HGET', KEYS[1], 'activeSessionId')
 if activeTokenHash ~= ARGV[1] then
     return {'ERROR', 'RACE_OR_REPLAY_DETECTED'}
+end
+if ARGV[10] ~= '' and activeSessionId ~= ARGV[10] then
+    return {'ERROR', 'SESSION_MISMATCH'}
 end
 
 -- 4. Verify token lookup key exists
@@ -47,11 +53,24 @@ if redis.call('EXISTS', KEYS[2]) == 0 then
     return {'ERROR', 'TOKEN_LOOKUP_NOT_FOUND'}
 end
 
--- 5. Extract accountId and familyId from existing state
+-- 5. Verify old session record exists and matches expected token hash
+if redis.call('EXISTS', KEYS[3]) == 0 then
+    return {'ERROR', 'OLD_SESSION_NOT_FOUND'}
+end
+local oldSessionHash = redis.call('HGET', KEYS[3], 'tokenHash')
+if oldSessionHash and oldSessionHash ~= ARGV[1] then
+    return {'ERROR', 'OLD_SESSION_HASH_MISMATCH'}
+end
+
+-- 6. Verify collision avoidance on replacement keys
+if redis.call('EXISTS', KEYS[5]) == 1 or redis.call('EXISTS', KEYS[6]) == 1 then
+    return {'ERROR', 'REPLACEMENT_KEY_COLLISION'}
+end
+
+-- 7. Extract accountId and familyId from existing state
 local familyId = redis.call('HGET', KEYS[1], 'familyId') or ''
 local accountId = redis.call('HGET', KEYS[3], 'accountId') or ''
 if accountId == '' then
-    -- Fallback: parse from lookup if session hash is missing
     local lookupVal = redis.call('GET', KEYS[2])
     if lookupVal then
         local match = string.match(lookupVal, '"accountId"%s*:%s*"([^"]+)"')
@@ -59,23 +78,23 @@ if accountId == '' then
     end
 end
 
--- 6. Read and increment rotation sequence
+-- 8. Read and increment rotation sequence
 local currentSeqStr = redis.call('HGET', KEYS[1], 'rotationSeq')
 local currentSeq = tonumber(currentSeqStr) or 1
 local newSeq = currentSeq + 1
 
--- 7. Atomically delete old credentials
+-- 9. Atomically delete old credentials
 redis.call('DEL', KEYS[2])
 redis.call('DEL', KEYS[3])
 
--- 8. Write revoked token tombstone
-redis.call('SET', KEYS[4], familyId, 'EX', tonumber(ARGV[8]))
+-- 10. Write revoked token tombstone with rotation timestamp payload
+redis.call('SET', KEYS[4], ARGV[6], 'EX', tonumber(ARGV[8]))
 
--- 9. Construct new token lookup JSON
+-- 11. Construct new token lookup JSON
 local newLookupJson = '{"familyId":"' .. familyId .. '","sessionId":"' .. ARGV[3] .. '","accountId":"' .. accountId .. '"}'
 redis.call('SET', KEYS[5], newLookupJson, 'EX', tonumber(ARGV[7]))
 
--- 10. Write replacement session hash
+-- 12. Write replacement session hash with genuine 30-day expiresAt
 redis.call('HSET', KEYS[6],
     'sessionId', ARGV[3],
     'familyId', familyId,
@@ -83,13 +102,13 @@ redis.call('HSET', KEYS[6],
     'tokenHash', ARGV[2],
     'rotationSeq', tostring(newSeq),
     'createdAt', ARGV[6],
-    'expiresAt', ARGV[6],
+    'expiresAt', ARGV[9],
     'ipAddress', ARGV[4],
     'userAgent', ARGV[5]
 )
 redis.call('EXPIRE', KEYS[6], tonumber(ARGV[7]))
 
--- 11. Update family record
+-- 13. Update family record
 redis.call('HSET', KEYS[1],
     'activeSessionId', ARGV[3],
     'activeTokenHash', ARGV[2],
@@ -166,7 +185,12 @@ if activeTokenHash ~= ARGV[1] or activeSessionId ~= ARGV[2] then
     return 'SESSION_MISMATCH'
 end
 
--- 3. Atomically delete family, session, and token lookup keys
+-- 3. Verify session and token lookup exist before deletion
+if redis.call('EXISTS', KEYS[2]) == 0 or redis.call('EXISTS', KEYS[3]) == 0 then
+    return 'SESSION_CORRUPTED'
+end
+
+-- 4. Atomically delete family, session, and token lookup keys
 redis.call('DEL', KEYS[1])
 redis.call('DEL', KEYS[2])
 redis.call('DEL', KEYS[3])

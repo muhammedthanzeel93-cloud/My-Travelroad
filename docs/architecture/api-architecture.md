@@ -331,7 +331,7 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
      - `activeSessionId`: Current valid session ID.
      - `activeTokenHash`: Current valid token SHA-256 hash.
      - `rotationSeq`: Current sequence integer.
-     - `tokenGeneration`: Integer matching the durable account generation in PostgreSQL at creation or rotation.
+     - `tokenGeneration`: Compatibility generation integer (default 1). Operative database generation tracking is deferred to Stage A+.
      - `isCompromised`: Boolean flag (true if replay detected).
    - **Resolvable Account Sessions Index**: `account_sessions:{accountId}` (Redis Set)
      - Stores resolvable members formatted as `"{familyId}:{sessionId}"` (e.g., `"550e8400-e29b-41d4-a716-446655440001:550e8400-e29b-41d4-a716-446655440002"`).
@@ -349,11 +349,13 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
      3. Pre-identifies the session and family state via single-key read on `family:{familyId}`:
         - *If Missing*: Fails immediately with `401 Unauthorized` (`code: 'TOKEN_INVALID_OR_EXPIRED'`).
         - *If Compromised (`isCompromised == '1'`)*: Fails immediately with `401 Unauthorized` (`code: 'TOKEN_REPLAY_DETECTED'`).
-        - **Durable Generation & Account Status Validation**: The application queries PostgreSQL (`SELECT token_generation, status FROM accounts WHERE id = :accountId`):
-          - *If Account Not Active*: Fails with `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'` or `'ACCOUNT_DEACTIVATED'`).
-          - *If Generation Mismatch (`family.tokenGeneration !== account.token_generation`)*: Fails immediately with `401 Unauthorized` (`code: 'SESSION_REVOKED'`). Both access tokens and refresh families strictly require exact equality (`===`) with `account.token_generation`; any generation mismatch—whether smaller or greater—is immediately rejected fail-closed. This closes all races between concurrent refresh requests and durable account-wide revocation (password reset or future Stage A+ logout-all); a refresh request racing with revocation cannot use stale or mismatched account state to mint replacement credentials.
+        - **Authoritative Database Lifecycle & Password-Change Validation**: The application queries PostgreSQL (`SELECT status FROM accounts WHERE id = :accountId` and `SELECT password_changed_at FROM account_security_credentials WHERE account_id = :accountId`):
+          - *If Account Not Active*: If status is `suspended`, `deactivated`, or `archived`, rotation is denied fail-closed with `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'` or `'ACCOUNT_DEACTIVATED'`), and the family is immediately revoked in Redis.
+          - *If Password Changed*: If `passwordChangedAt` in PostgreSQL is newer than session creation (`session.createdAt <= passwordChangedAt`), rotation is denied with `401 Unauthorized` (`code: 'SESSION_REVOKED'`), and the family is revoked in Redis. Durable generation-based revocation (`account.token_generation`) and outbox jobs are explicitly deferred to the future Stage A+ database migration.
         - *If Token Hash Mismatch (`family.activeTokenHash != presentedTokenHash`)*:
-          The application triggers the **Atomic Replay Revocation Script** passing all 4 same-slot keys and expected state arguments explicitly:
+          The application checks whether the presented token was recently rotated by querying `revoked_token:{familyId}:{presentedTokenHash}`:
+          - *If Rotated Within Grace Window (<= 15 seconds)*: To protect legitimate clients against transient network timeouts, packet drops, or concurrent in-flight retries where the response cookie was lost in transit, presenting a recently rotated token fails safely with `401 Unauthorized` (`code: 'TOKEN_INVALID'`) **without triggering family compromise**. The active session on the client's device and other devices remains uncompromised.
+          - *If Beyond Grace Window or Unknown Stale Token*: The application triggers the **Atomic Replay Revocation Script** passing all 4 same-slot keys and expected state arguments explicitly:
           - `KEYS[1]`: `family:{familyId}`
           - `KEYS[2]`: `revoked_token:{familyId}:{presentedTokenHash}`
           - `KEYS[3]`: `token_lookup:{familyId}:{family.activeTokenHash}`
@@ -405,7 +407,7 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
         - Outside the family Lua transaction, the application tier executes decoupled, idempotent updates on `account_sessions:{accountId}`:
           `SREM account_sessions:{accountId} "{familyId}:{oldSessionId}"`
           `SADD account_sessions:{accountId} "{familyId}:{newSessionId}"`
-     7. **Cookie Dispatch & Token Issuance**: The API sets the new `refreshToken` cookie containing `replacementRawToken` and returns a fresh 15-minute access token carrying the durable generation claim `"gen": account.token_generation`.
+     7. **Pre-Signing, Cookie Dispatch & Token Issuance**: The API pre-signs the fresh 15-minute access token (with compatibility claim `"gen": 1`) prior to invoking Redis rotation to eliminate orphaned rotation state on signing failure. Upon successful Redis rotation, the API sets the new `refreshToken` cookie containing `replacementRawToken` and returns the access token.
 
 4. **Replay Revocation Scoping & Rationale**:
    - **Family-Level Revocation Boundary**: When a replay is detected, the revocation is **strictly scoped to the compromised token family** (`family:{familyId}`).
@@ -421,13 +423,15 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
 
 6. **Account-Wide Revocation & Lifecycle Cascade**:
    - **Single Device Logout (`POST /api/v1/auth/logout`)**:
-     - The application resolves `activeTokenHash` and `activeSessionId` from `family:{familyId}`.
+     - Strict Token Validation: Parses presented `refreshToken` cookie, computes SHA-256 hash, and resolves `token_lookup:{familyId}:{tokenHash}`.
+     - Asserts that the presented token matches active credentials in `family:{familyId}` (`activeTokenHash == presentedTokenHash` and `activeSessionId == lookup.sessionId`). If the presented token is stale, forged, or belongs to another account, it is safely rejected without revoking the active session.
      - Executes the atomic single-device logout script passing all 3 same-slot keys:
        - `KEYS[1]`: `family:{familyId}`
        - `KEYS[2]`: `session:{familyId}:{activeSessionId}`
        - `KEYS[3]`: `token_lookup:{familyId}:{activeTokenHash}`
        - `ARGV[1]`: `expectedActiveTokenHash`
        - `ARGV[2]`: `expectedActiveSessionId`
+     - Atomically purges family and session keys and removes member from `account_sessions:{accountId}`. Clears cookie (`maxAge: 0`). Infrastructure failures (Redis unreachable) fail closed with HTTP 503 `SERVICE_UNAVAILABLE`.
      - Inside Lua: revalidates `family.activeTokenHash == ARGV[1]` and `family.activeSessionId == ARGV[2]`. Deletes `KEYS[1]`, `KEYS[2]`, and `KEYS[3]`.
      - Application tier executes decoupled removal: `SREM account_sessions:{accountId} "{familyId}:{activeSessionId}"`.
      - The browser cookie is cleared (`Max-Age=0`).

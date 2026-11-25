@@ -11,6 +11,7 @@ import { registerRequestSchema } from "../auth/register.schema";
 import { loginRequestSchema } from "../auth/login.schema";
 import { registerTouristAccount, RegistrationResult } from "../services/registration.service";
 import { authenticateLogin, LoginResult } from "../services/login.service";
+import { verifyAccessToken } from "../auth/jwt";
 import { SessionService } from "../services/session.service";
 import { RedisSessionStore } from "../redis/session.store";
 import {
@@ -207,8 +208,21 @@ export function createAuthRouter(options: AuthRouterOptions = {}): Router {
           }
         }
 
+        // Optional Bearer token account resolution
+        let bearerAccountId: string | undefined;
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.startsWith("Bearer ")) {
+          try {
+            const token = authHeader.slice(7).trim();
+            const payload = await verifyAccessToken(token);
+            bearerAccountId = payload.sub;
+          } catch {
+            // Ignored: invalid Bearer token does not block logout with valid cookie
+          }
+        }
+
         // Delegate revocation to session service
-        await sessionService.logoutSession(rawCookie);
+        await sessionService.logoutSession(rawCookie, bearerAccountId);
 
         // Always clear the cookie with maxAge: 0
         res.cookie(

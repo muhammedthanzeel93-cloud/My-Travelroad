@@ -11,6 +11,7 @@ import { RedisSessionStore } from "../../../src/server/redis/session.store";
 import { hashPassword } from "../../../src/server/auth/password";
 import { REFRESH_COOKIE_NAME, REFRESH_COOKIE_PATH } from "../../../src/server/auth/cookie";
 import { loginRateLimiter } from "../../../src/server/middleware/rate-limiter";
+import { ServiceUnavailableError } from "../../../src/server/errors/app-error";
 
 describe("Authentication Session Endpoints (Login, Refresh, Logout)", () => {
   let redis: any;
@@ -177,7 +178,32 @@ describe("Authentication Session Endpoints (Login, Refresh, Logout)", () => {
       expect(rotatedCookieVal).not.toBe(initialCookieVal);
       expect(rotatedCookieVal).toMatch(new RegExp(`^${REFRESH_COOKIE_NAME}=rt_`));
 
-      // 3. Replay attack: present the initial cookie again -> Must trigger 401 TOKEN_REPLAY_DETECTED!
+      // 3. Client retry within grace window: fails safely with 401 TOKEN_INVALID without compromising family
+      const retryRes = await request(app)
+        .post("/api/v1/auth/refresh")
+        .set("X-Requested-With", "XMLHttpRequest")
+        .set("Cookie", [initialCookieVal]);
+
+      expect(retryRes.status).toBe(401);
+      expect(retryRes.body.success).toBe(false);
+      expect(retryRes.body.error.code).toBe("TOKEN_INVALID");
+
+      // Verify rotated token is STILL VALID after client retry!
+      const validRefresh = await request(app)
+        .post("/api/v1/auth/refresh")
+        .set("X-Requested-With", "XMLHttpRequest")
+        .set("Cookie", [rotatedCookieVal]);
+
+      expect(validRefresh.status).toBe(200);
+
+      // 4. Hostile replay attack after grace window: present initial cookie again after aging tombstone
+      const { parseRefreshToken } = await import("../../../src/server/auth/refresh-token");
+      const { familyId, tokenHash } = parseRefreshToken(initialCookieVal.replace(`${REFRESH_COOKIE_NAME}=`, ""));
+      await redis.set(
+        `revoked_token:{${familyId}}:${tokenHash}`,
+        new Date(Date.now() - 20000).toISOString()
+      );
+
       const replayRes = await request(app)
         .post("/api/v1/auth/refresh")
         .set("X-Requested-With", "XMLHttpRequest")
@@ -246,6 +272,36 @@ describe("Authentication Session Endpoints (Login, Refresh, Logout)", () => {
       const res2 = await request(app).post("/api/v1/auth/logout");
       expect(res2.status).toBe(200);
       expect(res2.body.success).toBe(true);
+    });
+
+    it("returns 503 SERVICE_UNAVAILABLE when Redis fails during logout", async () => {
+      vi.spyOn(sessionStore, "getTokenLookup").mockRejectedValueOnce(
+        new ServiceUnavailableError("Session persistence service temporarily unavailable")
+      );
+
+      const res = await request(app)
+        .post("/api/v1/auth/logout")
+        .set("X-Requested-With", "XMLHttpRequest")
+        .set("Cookie", [`${REFRESH_COOKIE_NAME}=rt_550e8400-e29b-41d4-a716-446655440001_${'a'.repeat(64)}`]);
+
+      expect(res.status).toBe(503);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error.code).toBe("SERVICE_UNAVAILABLE");
+    });
+
+    it("returns 503 SERVICE_UNAVAILABLE when Redis fails during refresh", async () => {
+      vi.spyOn(sessionStore, "getFamily").mockRejectedValueOnce(
+        new ServiceUnavailableError("Session persistence service temporarily unavailable")
+      );
+
+      const res = await request(app)
+        .post("/api/v1/auth/refresh")
+        .set("X-Requested-With", "XMLHttpRequest")
+        .set("Cookie", [`${REFRESH_COOKIE_NAME}=rt_550e8400-e29b-41d4-a716-446655440001_${'a'.repeat(64)}`]);
+
+      expect(res.status).toBe(503);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error.code).toBe("SERVICE_UNAVAILABLE");
     });
   });
 });

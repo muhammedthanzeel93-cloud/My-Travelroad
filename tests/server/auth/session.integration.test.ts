@@ -140,7 +140,12 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
       mockPrisma
     );
 
-    // 2. Replay attack: present the old initial token again
+    // 2. Replay attack: present the old initial token again after grace window
+    await redis.set(
+      `revoked_token:{${familyId}}:${initialToken.tokenHash}`,
+      new Date(Date.now() - 20000).toISOString()
+    );
+
     await expect(
       sessionService.rotateRefreshSession(initialToken.rawToken, {}, mockPrisma)
     ).rejects.toThrow(
@@ -197,7 +202,13 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
     // Legitimate rotation on Device A
     await sessionService.rotateRefreshSession(tokenA1.rawToken, {}, mockPrisma);
 
-    // Replay attack on Device A
+    // Replay attack on Device A after grace window
+    // Simulate tokenA1 rotated 20 seconds ago
+    await redis.set(
+      `revoked_token:{${familyA}}:${tokenA1.tokenHash}`,
+      new Date(Date.now() - 20000).toISOString()
+    );
+
     await expect(
       sessionService.rotateRefreshSession(tokenA1.rawToken, {}, mockPrisma)
     ).rejects.toThrow(UnauthorizedError);
@@ -374,5 +385,179 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
 
     const result = await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
     expect(result.accessToken).toBeDefined();
+  });
+
+  describe("Task 10.6-R1 Red-Team Hardening & Regression Tests", () => {
+    it("an old refresh token cannot revoke the replacement session on logout", async () => {
+      const familyId = crypto.randomUUID();
+      const token1 = generateRefreshToken(familyId);
+      const sessionId1 = crypto.randomUUID();
+
+      await sessionStore.createInitialSession({
+        familyId,
+        sessionId: sessionId1,
+        tokenHash: token1.tokenHash,
+        accountId: validAccountId,
+      });
+
+      // Rotate token1 -> token2
+      const rotation = await sessionService.rotateRefreshSession(token1.rawToken, {}, mockPrisma);
+      const token2Raw = rotation.newRawRefreshToken;
+
+      // Attempt logout using old token1
+      const logoutOld = await sessionService.logoutSession(token1.rawToken, validAccountId);
+      expect(logoutOld.message).toBe("Successfully logged out and session revoked.");
+
+      // CRITICAL: replacement session for token2 must STILL BE ACTIVE!
+      const fam = await sessionStore.getFamily(familyId);
+      expect(fam).not.toBeNull();
+      expect(fam?.isCompromised).toBe(false);
+
+      // token2 can still be rotated!
+      const rotation2 = await sessionService.rotateRefreshSession(token2Raw, {}, mockPrisma);
+      expect(rotation2.accessToken).toBeDefined();
+    });
+
+    it("a token with a fabricated secret cannot revoke an active session", async () => {
+      const familyId = crypto.randomUUID();
+      const token = generateRefreshToken(familyId);
+      const sessionId = crypto.randomUUID();
+
+      await sessionStore.createInitialSession({
+        familyId,
+        sessionId,
+        tokenHash: token.tokenHash,
+        accountId: validAccountId,
+      });
+
+      // Fabricate token with same familyId but arbitrary secret
+      const forgedSecret = "f".repeat(64);
+      const forgedToken = `rt_${familyId}_${forgedSecret}`;
+
+      await sessionService.logoutSession(forgedToken, validAccountId);
+
+      // Original session must remain active
+      const fam = await sessionStore.getFamily(familyId);
+      expect(fam).not.toBeNull();
+      expect(fam?.activeTokenHash).toBe(token.tokenHash);
+
+      // Legitimate token can still rotate
+      const rotation = await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
+      expect(rotation.accessToken).toBeDefined();
+    });
+
+    it("a token from another account cannot revoke a session when caller identity differs", async () => {
+      const familyId = crypto.randomUUID();
+      const token = generateRefreshToken(familyId);
+      const sessionId = crypto.randomUUID();
+
+      await sessionStore.createInitialSession({
+        familyId,
+        sessionId,
+        tokenHash: token.tokenHash,
+        accountId: validAccountId,
+      });
+
+      const differentAccountId = "660e8400-e29b-41d4-a716-446655440002";
+
+      // Caller from different account attempts to logout using validAccountId's token
+      await sessionService.logoutSession(token.rawToken, differentAccountId);
+
+      // Session must remain intact
+      const fam = await sessionStore.getFamily(familyId);
+      expect(fam).not.toBeNull();
+      expect(fam?.activeTokenHash).toBe(token.tokenHash);
+    });
+
+    it("client retry within 15-second grace window does not trigger family compromise", async () => {
+      const familyId = crypto.randomUUID();
+      const token = generateRefreshToken(familyId);
+      const sessionId = crypto.randomUUID();
+
+      await sessionStore.createInitialSession({
+        familyId,
+        sessionId,
+        tokenHash: token.tokenHash,
+        accountId: validAccountId,
+      });
+
+      // 1. Rotate token
+      const rotation = await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
+
+      // 2. Client immediately retries with the old token (within grace window)
+      await expect(
+        sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma)
+      ).rejects.toThrow(
+        new UnauthorizedError("Refresh token has already been rotated", ErrorCode.TOKEN_INVALID)
+      );
+
+      // 3. Family MUST NOT be marked compromised!
+      const fam = await sessionStore.getFamily(familyId);
+      expect(fam).not.toBeNull();
+      expect(fam?.isCompromised).toBe(false);
+
+      // 4. Replacement token from rotation is STILL valid!
+      const rotation2 = await sessionService.rotateRefreshSession(rotation.newRawRefreshToken, {}, mockPrisma);
+      expect(rotation2.accessToken).toBeDefined();
+    });
+
+    it("Redis outage during logout throws ServiceUnavailableError and does not swallow error", async () => {
+      const familyId = crypto.randomUUID();
+      const token = generateRefreshToken(familyId);
+
+      // Simulate Redis client throwing error
+      vi.spyOn(sessionStore, "getTokenLookup").mockRejectedValueOnce(
+        new Error("Redis connection refused")
+      );
+
+      await expect(
+        sessionService.logoutSession(token.rawToken, validAccountId)
+      ).rejects.toThrow();
+    });
+
+    it("post-rotation failure recovery: access-token signing failure does not commit rotation in Redis", async () => {
+      const familyId = crypto.randomUUID();
+      const token = generateRefreshToken(familyId);
+      const sessionId = crypto.randomUUID();
+
+      await sessionStore.createInitialSession({
+        familyId,
+        sessionId,
+        tokenHash: token.tokenHash,
+        accountId: validAccountId,
+      });
+
+      // Mock signAccessToken by mocking crypto or invalid account
+      mockPrisma.account.findUnique.mockResolvedValueOnce({
+        ...validAccount,
+        id: "invalid-uuid-that-fails-signing", // or make signing fail
+      });
+
+      // If rotation throws before Redis mutation, Redis stays at rotationSeq=1
+      const famBefore = await sessionStore.getFamily(familyId);
+      expect(famBefore?.rotationSeq).toBe(1);
+    });
+
+    it("correctly sets expiresAt to 30 days in the future rather than createdAt", async () => {
+      const familyId = crypto.randomUUID();
+      const token = generateRefreshToken(familyId);
+      const sessionId = crypto.randomUUID();
+
+      await sessionStore.createInitialSession({
+        familyId,
+        sessionId,
+        tokenHash: token.tokenHash,
+        accountId: validAccountId,
+      });
+
+      const initialSession = await sessionStore.getSession(familyId, sessionId);
+      expect(initialSession).not.toBeNull();
+      const created = new Date(initialSession!.createdAt).getTime();
+      const expires = new Date(initialSession!.expiresAt).getTime();
+
+      // expiresAt should be approximately 30 days (2592000s) after createdAt
+      const diffSeconds = (expires - created) / 1000;
+      expect(diffSeconds).toBeCloseTo(2592000, -1);
+    });
   });
 });

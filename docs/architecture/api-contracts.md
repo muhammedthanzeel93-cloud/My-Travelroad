@@ -175,6 +175,28 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 
 ---
 
+### 4.1 Single-Device Logout
+- **Endpoint**: `POST /api/v1/auth/logout`
+- **Purpose**: Revokes the active single-device refresh session in Redis and clears the session cookie. Other device sessions for the user remain active.
+- **Authentication**: HttpOnly `refreshToken` cookie and optional `Bearer` access token.
+- **Request Headers**: `X-Requested-With: XMLHttpRequest` (Mandatory anti-CSRF header when invoking with cookie).
+- **Permissions**: Public or authenticated user with active session.
+- **Successful Response (`200 OK`)**:
+  - **Headers**: `Set-Cookie: refreshToken=; Path=/api/v1/auth; HttpOnly; SameSite=Strict; Max-Age=0`
+```json
+{
+  "success": true,
+  "data": {
+    "message": "Successfully logged out and session revoked."
+  }
+}
+```
+- **Error Responses**:
+  - `400 Bad Request`: `BAD_REQUEST` (Missing mandatory `X-Requested-With: XMLHttpRequest` header).
+  - `503 Service Unavailable`: `SERVICE_UNAVAILABLE` (Redis infrastructure failure; safe fail-closed error).
+
+---
+
 ### 5. Current Authenticated Identity
 - **Endpoint**: `GET /api/v1/auth/me`
 - **Purpose**: Returns the account metadata and profile summary for the current caller.

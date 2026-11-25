@@ -76,6 +76,7 @@ export interface RotateSessionParams {
   ipAddress?: string;
   userAgent?: string;
   timestamp?: string;
+  expiresAt?: string;
 }
 
 /**
@@ -93,6 +94,7 @@ export interface ReplayRevocationParams {
   presentedTokenHash: string;
   expectedActiveTokenHash: string;
   expectedActiveSessionId: string;
+  accountId?: string;
 }
 
 /**
@@ -120,4 +122,5 @@ export interface LogoutParams {
 export type LogoutScriptResult =
   | "LOGOUT_SUCCESS"
   | "ALREADY_LOGGED_OUT"
-  | "SESSION_MISMATCH";
+  | "SESSION_MISMATCH"
+  | "SESSION_CORRUPTED";

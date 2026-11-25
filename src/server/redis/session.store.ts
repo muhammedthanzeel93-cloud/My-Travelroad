@@ -233,6 +233,19 @@ export class RedisSessionStore {
   }
 
   /**
+   * Retrieves the stored payload (e.g. rotation timestamp) from the revoked token tombstone index.
+   */
+  public async getRevokedTokenTombstone(familyId: string, tokenHash: string): Promise<string | null> {
+    await this.ensureConnection();
+
+    try {
+      return await this.client.get(this.revokedTokenKey(familyId, tokenHash));
+    } catch (err) {
+      this.handleRedisError(err);
+    }
+  }
+
+  /**
    * Executes the atomic rotation Lua script on same-slot keys.
    */
   public async rotateSession(params: RotateSessionParams): Promise<RotationScriptResult> {
@@ -247,6 +260,7 @@ export class RedisSessionStore {
       ipAddress,
       userAgent,
       timestamp,
+      expiresAt: customExpiresAt,
     } = params;
 
     const keys = [
@@ -258,15 +272,22 @@ export class RedisSessionStore {
       this.sessionKey(familyId, newSessionId),
     ];
 
+    const nowIso = timestamp ?? new Date().toISOString();
+    const expiresAt =
+      customExpiresAt ??
+      new Date(Date.now() + SESSION_TTL_SECONDS * 1000).toISOString();
+
     const args = [
       presentedTokenHash,
       replacementTokenHash,
       newSessionId,
       ipAddress ?? "",
       userAgent ?? "",
-      timestamp ?? new Date().toISOString(),
+      nowIso,
       SESSION_TTL_SECONDS.toString(),
       TOMBSTONE_TTL_SECONDS.toString(),
+      expiresAt,
+      oldSessionId ?? "",
     ];
 
     try {
@@ -349,6 +370,17 @@ export class RedisSessionStore {
         ...keys,
         ...args
       )) as ReplayRevocationResult;
+
+      if (result === "REPLAY_CONFIRMED" && params.accountId) {
+        try {
+          await this.client.srem(
+            this.accountSessionsKey(params.accountId),
+            `${familyId}:${expectedActiveSessionId}`
+          );
+        } catch {
+          // Best effort decoupled index maintenance
+        }
+      }
 
       return result;
     } catch (err) {
