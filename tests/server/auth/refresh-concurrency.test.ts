@@ -12,6 +12,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import crypto from "node:crypto";
 import RedisMock from "ioredis-mock";
+import { setupRedisMock } from "../helpers/redis-mock.helper";
 import { RedisSessionStore } from "../../../src/server/redis/session.store";
 import { SessionService } from "../../../src/server/services/session.service";
 import { generateRefreshToken } from "../../../src/server/auth/refresh-token";
@@ -38,6 +39,7 @@ describe("Refresh Token Concurrency & Race Condition Guarantees", () => {
 
   beforeEach(() => {
     redis = new RedisMock();
+    setupRedisMock(redis);
     sessionStore = new RedisSessionStore(redis);
     sessionService = new SessionService(sessionStore);
 
@@ -111,27 +113,17 @@ describe("Refresh Token Concurrency & Race Condition Guarantees", () => {
 
     // Execute first rotation to completion
     const winner = await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
-    const winnerSessionId = (await sessionStore.getFamily(familyId))?.activeSessionId;
+    expect(winner.accessToken).toBeDefined();
 
-    // Immediate retry with the old token within recovery window recovers the winner's credentials without overwriting session
-    const retry = await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
-    expect(retry.accessToken).toBe(winner.accessToken);
-    expect(retry.newRawRefreshToken).toBe(winner.newRawRefreshToken);
-
-    // After recovery window (>30s), presenting old token triggers replay detection
-    const tombstoneRaw = await redis.get(`revoked_token:{${familyId}}:${token.tokenHash}`);
-    if (tombstoneRaw) {
-      const tombstoneObj = JSON.parse(tombstoneRaw);
-      tombstoneObj.rotatedAt = new Date(Date.now() - 35000).toISOString();
-      await redis.set(`revoked_token:{${familyId}}:${token.tokenHash}`, JSON.stringify(tombstoneObj));
-    }
+    // Subsequent presentation of the spent old token triggers immediate replay detection
     await expect(
       sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma)
     ).rejects.toThrow(UnauthorizedError);
 
-    // Verify family activeSessionId was never overwritten by the old session ID
+    // Verify family activeSessionId was never reverted or overwritten by the old session ID
     const currentFam = await sessionStore.getFamily(familyId);
     expect(currentFam?.activeSessionId).not.toBe(sessionId);
+    expect(currentFam?.isCompromised).toBe(true);
   });
 
   it("handles logout racing with refresh: refresh fails after logout commits", async () => {

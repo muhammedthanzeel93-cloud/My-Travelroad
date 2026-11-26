@@ -201,23 +201,8 @@ describe("Live Native Redis Integration Test Suite", () => {
     const rotation = await sessionService.rotateRefreshSession(token1.rawToken, {}, mockPrisma);
     expect(rotation.accessToken).toBeDefined();
 
-    // Simulate replay after recovery window by setting tombstone timestamp 35s in the past
-    const tombstoneRaw = await realRedis.get(sessionStore.revokedTokenKey(familyId, token1.tokenHash));
-    if (tombstoneRaw) {
-      const tombstoneObj = JSON.parse(tombstoneRaw);
-      tombstoneObj.rotatedAt = new Date(Date.now() - 35000).toISOString();
-      await realRedis.set(
-        sessionStore.revokedTokenKey(familyId, token1.tokenHash),
-        JSON.stringify(tombstoneObj)
-      );
-    } else {
-      await realRedis.set(
-        sessionStore.revokedTokenKey(familyId, token1.tokenHash),
-        new Date(Date.now() - 35000).toISOString()
-      );
-    }
-
-    // Present old token1 again
+    // Present old spent token1 again: under strict single-winner rotation, this is immediately
+    // detected as replay because token1 is now in revoked_token tombstones
     await expect(
       sessionService.rotateRefreshSession(token1.rawToken, {}, mockPrisma)
     ).rejects.toThrow(
@@ -374,8 +359,8 @@ describe("Live Native Redis Integration Test Suite", () => {
     expect(logoutRes.status).toBe("fulfilled");
   });
 
-  // 11. Post-rotation failure recovery
-  it("11. client retry within 30-second recovery window recovers replacement credentials without compromising family", async () => {
+  // 11. Rotated token replay immediate revocation
+  it("11. presenting rotated token immediately triggers TOKEN_REPLAY_DETECTED and revokes family in real Redis", async () => {
     const familyId = crypto.randomUUID();
     const token = generateRefreshToken(familyId);
     const sessionId = crypto.randomUUID();
@@ -389,21 +374,32 @@ describe("Live Native Redis Integration Test Suite", () => {
 
     // First rotation succeeds
     const rot = await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
+    expect(rot.accessToken).toBeDefined();
+    expect(rot.newRawRefreshToken).toBeDefined();
 
-    // Immediate retry with the same old token (simulating lost response / network retry)
-    const retryRot = await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
+    // Replay presentation with spent token: strict single-winner policy classifies this as replay
+    await expect(
+      sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma)
+    ).rejects.toThrow(
+      new UnauthorizedError(
+        "Refresh token replay detected. Session family has been revoked.",
+        ErrorCode.TOKEN_REPLAY_DETECTED
+      )
+    );
 
-    // Cryptographic recovery envelope returns exact same credentials
-    expect(retryRot.accessToken).toBe(rot.accessToken);
-    expect(retryRot.newRawRefreshToken).toBe(rot.newRawRefreshToken);
-
-    // Inspect real Redis: family is NOT compromised!
+    // Inspect real Redis: family is permanently marked compromised
     const fam = await sessionStore.getFamily(familyId);
-    expect(fam?.isCompromised).toBe(false);
+    expect(fam?.isCompromised).toBe(true);
 
-    // Replacement token is still valid
-    const rot2 = await sessionService.rotateRefreshSession(rot.newRawRefreshToken, {}, mockPrisma);
-    expect(rot2.accessToken).toBeDefined();
+    // Replacement token is also revoked because the entire family is compromised
+    await expect(
+      sessionService.rotateRefreshSession(rot.newRawRefreshToken, {}, mockPrisma)
+    ).rejects.toThrow(
+      new UnauthorizedError(
+        "Refresh token family has been revoked due to replay detection",
+        ErrorCode.TOKEN_REPLAY_DETECTED
+      )
+    );
   });
 
   // 12. Account-index consistency
@@ -448,8 +444,8 @@ describe("Live Native Redis Integration Test Suite", () => {
     expect(members).not.toContain(`${family1}:${session1}`);
   });
 
-  // 13. Concurrent retry requests recover identical credentials without race conditions
-  it("13. concurrent retry requests receive identical replacement credentials from recovery envelope in real Redis", async () => {
+  // 13. Concurrent refresh requests: strict single-winner rotation
+  it("13. concurrent refresh requests result in exactly one winner while losing request fails without replacement credentials", async () => {
     const familyId = crypto.randomUUID();
     const token = generateRefreshToken(familyId);
     const sessionId = crypto.randomUUID();
@@ -461,85 +457,207 @@ describe("Live Native Redis Integration Test Suite", () => {
       accountId: testAccountId,
     });
 
-    // First rotation
-    const rot = await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
-
-    // Fire 3 concurrent retries with the old token
-    const retries = await Promise.all([
-      sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma),
+    // Fire 2 concurrent refresh requests presenting the exact same refresh token
+    const results = await Promise.allSettled([
       sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma),
       sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma),
     ]);
 
-    for (const r of retries) {
-      expect(r.accessToken).toBe(rot.accessToken);
-      expect(r.newRawRefreshToken).toBe(rot.newRawRefreshToken);
-    }
+    const fulfilled = results.filter((r) => r.status === "fulfilled") as PromiseFulfilledResult<any>[];
+    const rejected = results.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
 
-    const fam = await sessionStore.getFamily(familyId);
-    expect(fam?.isCompromised).toBe(false);
-    expect(fam?.rotationSeq).toBe(2);
+    // Exactly one winner succeeds
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+
+    // Winner receives brand new access token and refresh token
+    expect(fulfilled[0].value.accessToken).toBeDefined();
+    expect(fulfilled[0].value.newRawRefreshToken).toBeDefined();
+
+    // Loser receives 401 UnauthorizedError (either TOKEN_INVALID or TOKEN_REPLAY_DETECTED)
+    expect(rejected[0].reason).toBeInstanceOf(UnauthorizedError);
+    expect([ErrorCode.TOKEN_INVALID, ErrorCode.TOKEN_REPLAY_DETECTED]).toContain(rejected[0].reason.code);
   });
 
-  // 14. Strict Lua validation rejects malformed state without mutating keys
-  it("14. strict Lua state validation rejects malformed family record, corrupted lookup, and missing old session hash without altering Redis state", async () => {
+  // 14. Strict Lua validation testing 16 distinct invalid inputs against ATOMIC_ROTATION_LUA
+  it("14. strict Lua state validation rejects 16 distinct invalid inputs without altering Redis state", async () => {
     const familyId = crypto.randomUUID();
     const token = generateRefreshToken(familyId);
     const sessionId = crypto.randomUUID();
 
-    await sessionStore.createInitialSession({
+    const setupSession = async () => {
+      await realRedis.flushall();
+      await sessionStore.createInitialSession({
+        familyId,
+        sessionId,
+        tokenHash: token.tokenHash,
+        accountId: testAccountId,
+      });
+    };
+
+    const runRotation = async () => {
+      return sessionStore.rotateSession({
+        familyId,
+        presentedTokenHash: token.tokenHash,
+        oldSessionId: sessionId,
+        newSessionId: crypto.randomUUID(),
+        replacementTokenHash: crypto.randomBytes(32).toString("hex"),
+        ipAddress: "127.0.0.1",
+        userAgent: "Test/1.0",
+        timestamp: new Date().toISOString(),
+      });
+    };
+
+    const assertUntouched = async () => {
+      const fam = await sessionStore.getFamily(familyId);
+      expect(fam?.rotationSeq).toBe(1);
+      expect(fam?.activeTokenHash).toBe(token.tokenHash);
+      expect(fam?.activeSessionId).toBe(sessionId);
+      expect(fam?.isCompromised).toBe(false);
+    };
+
+    // 14.1 Corrupted JSON lookup
+    await setupSession();
+    await realRedis.set(sessionStore.tokenLookupKey(familyId, token.tokenHash), "{bad-json:");
+    let res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("TOKEN_LOOKUP_CORRUPTED");
+
+    // 14.2 Non-table JSON lookup
+    await setupSession();
+    await realRedis.set(sessionStore.tokenLookupKey(familyId, token.tokenHash), JSON.stringify("scalar-string"));
+    res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("TOKEN_LOOKUP_CORRUPTED");
+    await assertUntouched();
+
+    // 14.3 Lookup family mismatch
+    await setupSession();
+    await realRedis.set(sessionStore.tokenLookupKey(familyId, token.tokenHash), JSON.stringify({
+      familyId: "wrong-family-uuid",
+      sessionId,
+      accountId: testAccountId,
+    }));
+    res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("LOOKUP_FAMILY_MISMATCH");
+    await assertUntouched();
+
+    // 14.4 Lookup session mismatch
+    await setupSession();
+    await realRedis.set(sessionStore.tokenLookupKey(familyId, token.tokenHash), JSON.stringify({
+      familyId,
+      sessionId: "wrong-session-uuid",
+      accountId: testAccountId,
+    }));
+    res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("LOOKUP_SESSION_MISMATCH");
+    await assertUntouched();
+
+    // 14.5 Lookup account missing
+    await setupSession();
+    await realRedis.set(sessionStore.tokenLookupKey(familyId, token.tokenHash), JSON.stringify({
       familyId,
       sessionId,
-      tokenHash: token.tokenHash,
-      accountId: testAccountId,
-    });
+    }));
+    res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("LOOKUP_ACCOUNT_MISSING");
+    await assertUntouched();
 
-    // 14a. Test corrupted lookup key (mismatched family)
-    const lookupKey = sessionStore.tokenLookupKey(familyId, token.tokenHash);
-    await realRedis.set(lookupKey, JSON.stringify({ familyId: "corrupted-uuid", sessionId, accountId: testAccountId }));
+    // 14.6 Old session record missing entirely
+    await setupSession();
+    await realRedis.del(sessionStore.sessionKey(familyId, sessionId));
+    res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("OLD_SESSION_NOT_FOUND");
 
-    // Attempt rotation
-    const badLookupRot = await sessionStore.rotateSession({
+    // 14.7 Old session sessionId mismatch
+    await setupSession();
+    await realRedis.hset(sessionStore.sessionKey(familyId, sessionId), "sessionId", "mismatched-uuid");
+    res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("OLD_SESSION_ID_MISMATCH");
+    await assertUntouched();
+
+    // 14.8 Old session family mismatch
+    await setupSession();
+    await realRedis.hset(sessionStore.sessionKey(familyId, sessionId), "familyId", "mismatched-family");
+    res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("OLD_SESSION_FAMILY_MISMATCH");
+    await assertUntouched();
+
+    // 14.9 Old session account mismatch
+    await setupSession();
+    await realRedis.hset(sessionStore.sessionKey(familyId, sessionId), "accountId", "wrong-account");
+    res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("OLD_SESSION_ACCOUNT_MISMATCH");
+    await assertUntouched();
+
+    // 14.10 Old session tokenHash missing
+    await setupSession();
+    await realRedis.hdel(sessionStore.sessionKey(familyId, sessionId), "tokenHash");
+    res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("OLD_SESSION_TOKEN_HASH_MISSING");
+    await assertUntouched();
+
+    // 14.11 Old session tokenHash mismatch
+    await setupSession();
+    await realRedis.hset(sessionStore.sessionKey(familyId, sessionId), "tokenHash", "wrong-hash");
+    res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("OLD_SESSION_HASH_MISMATCH");
+    await assertUntouched();
+
+    // 14.12 Rotation sequence: empty string
+    await setupSession();
+    await realRedis.hset(sessionStore.familyKey(familyId), "rotationSeq", "");
+    res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("INVALID_ROTATION_SEQUENCE");
+
+    // 14.13 Rotation sequence: non-digit string
+    await setupSession();
+    await realRedis.hset(sessionStore.familyKey(familyId), "rotationSeq", "abc");
+    res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("INVALID_ROTATION_SEQUENCE");
+
+    // 14.14 Rotation sequence: 0
+    await setupSession();
+    await realRedis.hset(sessionStore.familyKey(familyId), "rotationSeq", "0");
+    res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("INVALID_ROTATION_SEQUENCE");
+
+    // 14.15 Rotation sequence: decimal
+    await setupSession();
+    await realRedis.hset(sessionStore.familyKey(familyId), "rotationSeq", "1.5");
+    res = await runRotation();
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("INVALID_ROTATION_SEQUENCE");
+
+    // 14.16 Replacement lookup key collision
+    await setupSession();
+    const collidingNewHash = crypto.randomBytes(32).toString("hex");
+    await realRedis.set(sessionStore.tokenLookupKey(familyId, collidingNewHash), "pre-existing");
+    res = await sessionStore.rotateSession({
       familyId,
       presentedTokenHash: token.tokenHash,
       oldSessionId: sessionId,
       newSessionId: crypto.randomUUID(),
-      replacementTokenHash: crypto.randomBytes(32).toString("hex"),
+      replacementTokenHash: collidingNewHash,
       ipAddress: "127.0.0.1",
       userAgent: "Test/1.0",
       timestamp: new Date().toISOString(),
     });
-
-    expect(badLookupRot.success).toBe(false);
-    expect((badLookupRot as any).reason).toBe("LOOKUP_FAMILY_MISMATCH");
-
-    // Verify family was NOT altered
-    const famAfterBadLookup = await sessionStore.getFamily(familyId);
-    expect(famAfterBadLookup?.rotationSeq).toBe(1);
-    expect(famAfterBadLookup?.activeTokenHash).toBe(token.tokenHash);
-
-    // 14b. Restore lookup, corrupt old session by removing tokenHash
-    await realRedis.set(lookupKey, JSON.stringify({ familyId, sessionId, accountId: testAccountId }));
-    const sessKey = sessionStore.sessionKey(familyId, sessionId);
-    await realRedis.hdel(sessKey, "tokenHash");
-
-    const missingHashRot = await sessionStore.rotateSession({
-      familyId,
-      presentedTokenHash: token.tokenHash,
-      oldSessionId: sessionId,
-      newSessionId: crypto.randomUUID(),
-      replacementTokenHash: crypto.randomBytes(32).toString("hex"),
-      ipAddress: "127.0.0.1",
-      userAgent: "Test/1.0",
-      timestamp: new Date().toISOString(),
-    });
-
-    expect(missingHashRot.success).toBe(false);
-    expect((missingHashRot as any).reason).toBe("OLD_SESSION_TOKEN_HASH_MISSING");
-
-    // Family still sequence 1
-    const famAfterMissingHash = await sessionStore.getFamily(familyId);
-    expect(famAfterMissingHash?.rotationSeq).toBe(1);
+    expect(res.success).toBe(false);
+    expect((res as any).reason).toBe("REPLACEMENT_KEY_COLLISION");
+    await assertUntouched();
   });
 
   // 15. Confirms account session index cleanup after confirmed replay in real Redis
@@ -571,16 +689,7 @@ describe("Live Native Redis Integration Test Suite", () => {
     // Rotate Device 1
     await sessionService.rotateRefreshSession(token1.rawToken, {}, mockPrisma);
 
-    // Age tombstone past recovery window
-    const tombstoneRaw = await realRedis.get(sessionStore.revokedTokenKey(family1, token1.tokenHash));
-    const tombstoneObj = JSON.parse(tombstoneRaw!);
-    tombstoneObj.rotatedAt = new Date(Date.now() - 35000).toISOString();
-    await realRedis.set(
-      sessionStore.revokedTokenKey(family1, token1.tokenHash),
-      JSON.stringify(tombstoneObj)
-    );
-
-    // Present old token on Device 1: triggers replay detection
+    // Present old token on Device 1: immediately triggers replay detection
     await expect(
       sessionService.rotateRefreshSession(token1.rawToken, {}, mockPrisma)
     ).rejects.toThrow(
@@ -595,5 +704,48 @@ describe("Live Native Redis Integration Test Suite", () => {
     expect(members).toHaveLength(1);
     expect(members).toContain(`${family2}:${session2}`);
     expect(members).not.toContain(`${family1}:${session1}`);
+  });
+
+  // 16. Security assertions: no raw tokens or recovery envelopes in Redis
+  it("16. asserts zero plaintext refresh tokens or recovery envelopes stored in real Redis", async () => {
+    const familyId = crypto.randomUUID();
+    const token = generateRefreshToken(familyId);
+    const sessionId = crypto.randomUUID();
+
+    await sessionStore.createInitialSession({
+      familyId,
+      sessionId,
+      tokenHash: token.tokenHash,
+      accountId: testAccountId,
+    });
+
+    // Rotate session
+    await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
+
+    // Inspect tombstone key: must contain ONLY a timestamp ISO string
+    const tombstoneVal = await realRedis.get(sessionStore.revokedTokenKey(familyId, token.tokenHash));
+    expect(tombstoneVal).toBeDefined();
+    // Validate ISO timestamp format: e.g. 2026-11-26T...
+    expect(new Date(tombstoneVal!).toISOString()).toBe(tombstoneVal);
+    // Must NOT be JSON and must NOT contain recovery envelope fields
+    expect(tombstoneVal).not.toContain("encryptedRecovery");
+    expect(tombstoneVal).not.toContain("ciphertext");
+
+    // Scan all keys in Redis and verify rawToken does NOT exist in any key or value
+    const allKeys = await realRedis.keys("*");
+    for (const key of allKeys) {
+      expect(key).not.toContain(token.rawToken);
+      const type = await realRedis.type(key);
+      if (type === "string") {
+        const val = await realRedis.get(key);
+        expect(val).not.toContain(token.rawToken);
+      } else if (type === "hash") {
+        const hash = await realRedis.hgetall(key);
+        for (const [f, v] of Object.entries(hash)) {
+          expect(f).not.toContain(token.rawToken);
+          expect(v).not.toContain(token.rawToken);
+        }
+      }
+    }
   });
 });

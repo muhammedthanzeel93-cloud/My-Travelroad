@@ -288,7 +288,6 @@ export class RedisSessionStore {
       TOMBSTONE_TTL_SECONDS.toString(),
       expiresAt,
       oldSessionId ?? "",
-      params.tombstonePayload ?? "",
     ];
 
     try {
@@ -381,9 +380,9 @@ export class RedisSessionStore {
             `${familyId}:${expectedActiveSessionId}`
           );
         } catch (sremErr) {
-          // Log index cleanup failure for background reconciliation without masking primary family revocation
+          // Log index cleanup failure for operational telemetry without masking primary family revocation
           console.error(
-            `[SessionStore] Failed to prune account session index for account ${params.accountId}:`,
+            `[RedisSessionStore] Failed to prune account session index for account ${params.accountId} (family: ${familyId}, session: ${expectedActiveSessionId}):`,
             sremErr
           );
         }

@@ -353,30 +353,22 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
           - *If Account Not Active*: If status is `suspended`, `deactivated`, or `archived`, rotation is denied fail-closed with `403 Forbidden` (`code: 'ACCOUNT_SUSPENDED'` or `'ACCOUNT_DEACTIVATED'`), and the family is immediately revoked in Redis.
           - *If Password Changed*: If `passwordChangedAt` in PostgreSQL is newer than session creation (`session.createdAt <= passwordChangedAt`), rotation is denied with `401 Unauthorized` (`code: 'SESSION_REVOKED'`), and the family is revoked in Redis. Durable generation-based revocation (`account.token_generation`) and outbox jobs are explicitly deferred to the future Stage A+ database migration.
         - *If Token Hash Mismatch (`family.activeTokenHash != presentedTokenHash`)*:
-          The application checks whether the presented token was recently rotated by querying `revoked_token:{familyId}:{presentedTokenHash}`:
-          - *If Rotated Within Recovery Window (<= 30 seconds)*:
-            To protect legitimate clients against transient network timeouts, dropped HTTP responses, or concurrent in-flight retries where the response cookie was lost in transit, the server implements an authenticated, zero-plaintext-storage recovery envelope:
-            1. During rotation, replacement credentials (`accessToken`, `expiresIn`, `newRawRefreshToken`, `tokenType`) are encrypted via AES-256-GCM.
-            2. The 256-bit encryption key is derived on the fly from the presented `rawCookie` (`crypto.createHash('sha256').update('recovery-key:' + rawCookie).digest()`).
-            3. The ciphertext, IV, authentication tag, and rotation timestamp are stored as JSON in `revoked_token:{familyId}:{presentedTokenHash}`.
-            4. When a legitimate client retries presenting the old token within 30 seconds (`elapsed <= 30000ms`), the server derives the decryption key from the client's cookie, decrypts the envelope, verifies the AES-256-GCM auth tag, and returns the *exact same* replacement credentials (`200 OK`, identical access token and `Set-Cookie`). The client recovers transparently without re-authenticating, without minting conflicting tokens, and without compromising the session family.
-            5. **Zero-Plaintext Storage Guarantee**: Redis never stores the raw refresh token or the encryption key in plaintext. An attacker with a Redis memory dump cannot decrypt recovery envelopes without possessing the client's actual raw token secret.
-          - *If Beyond Recovery Window (> 30 seconds), Forged, or Hostile Replay*:
-            The application triggers the **Atomic Replay Revocation Script** passing all 4 same-slot keys and expected state arguments explicitly:
-            - `KEYS[1]`: `family:{familyId}`
-            - `KEYS[2]`: `revoked_token:{familyId}:{presentedTokenHash}`
-            - `KEYS[3]`: `token_lookup:{familyId}:{family.activeTokenHash}`
-            - `KEYS[4]`: `session:{familyId}:{family.activeSessionId}`
-            - `ARGV[1]`: `expectedActiveTokenHash` (`family.activeTokenHash`)
-            - `ARGV[2]`: `expectedActiveSessionId` (`family.activeSessionId`)
-            - `ARGV[3]`: `tombstoneTtl` (86,400s)
-            - *Script Execution & State Revalidation*:
-              1. Checks if `KEYS[2]` exists in revoked tombstones. If missing, returns `'NOT_A_REPLAY'`.
-              2. Checks if `KEYS[1]` (`family:{familyId}`) exists. If missing, returns `'ALREADY_REVOKED'`.
-              3. **Concurrent Rotation Defense**: Revalidates `family.activeTokenHash == ARGV[1]` and `family.activeSessionId == ARGV[2]`. If a concurrent rotation occurred between the application's pre-read and script execution, the script aborts without mutation and returns `'CONCURRENT_ROTATION_DETECTED'`. The application layer re-reads `family:{familyId}` to get the latest active token hash and session ID, and re-executes the replay revocation script until convergence, guaranteeing that newly active sessions are never left behind.
-              4. If validated: marks `family:{familyId}.isCompromised = 1`, sets a 24-hour TTL on `family:{familyId}`, deletes `KEYS[3]` and `KEYS[4]`, and returns `'REPLAY_CONFIRMED'`.
-              5. **Account Session Index Pruning**: Upon confirmed replay, the application layer resolves the target `accountId` and removes `"{familyId}:{expectedActiveSessionId}"` from `account_sessions:{accountId}`. If index removal fails, the failure is logged for background repair rather than silently claiming consistency.
-              Returns `401 Unauthorized` (`code: 'TOKEN_REPLAY_DETECTED'`).
+          Under the strict single-winner rotation policy, a rotated refresh token is permanently spent. Any re-presentation of an already-rotated token is classified as an active replay attack. The application triggers the **Atomic Replay Revocation Script** passing all 4 same-slot keys and expected state arguments explicitly:
+          - `KEYS[1]`: `family:{familyId}`
+          - `KEYS[2]`: `revoked_token:{familyId}:{presentedTokenHash}`
+          - `KEYS[3]`: `token_lookup:{familyId}:{family.activeTokenHash}`
+          - `KEYS[4]`: `session:{familyId}:{family.activeSessionId}`
+          - `ARGV[1]`: `expectedActiveTokenHash` (`family.activeTokenHash`)
+          - `ARGV[2]`: `expectedActiveSessionId` (`family.activeSessionId`)
+          - `ARGV[3]`: `tombstoneTtl` (86,400s)
+          - *Script Execution & State Revalidation*:
+            1. Checks if `KEYS[2]` exists in revoked tombstones. If missing, returns `'NOT_A_REPLAY'`.
+            2. Checks if `KEYS[1]` (`family:{familyId}`) exists. If missing, returns `'ALREADY_REVOKED'`.
+            3. **Concurrent Rotation Defense**: Revalidates `family.activeTokenHash == ARGV[1]` and `family.activeSessionId == ARGV[2]`. If a concurrent rotation occurred between the application's pre-read and script execution, the script aborts without mutation and returns `'CONCURRENT_ROTATION_DETECTED'`. The application layer re-reads `family:{familyId}` to get the latest active token hash and session ID, and re-executes the replay revocation script until convergence, guaranteeing that newly active sessions are never left behind.
+            4. If validated: marks `family:{familyId}.isCompromised = 1`, sets a 24-hour TTL on `family:{familyId}`, deletes `KEYS[3]` and `KEYS[4]`, and returns `'REPLAY_CONFIRMED'`.
+            5. **Account Session Index Pruning**: Upon confirmed replay, the application layer resolves the target `accountId` and removes `"{familyId}:{expectedActiveSessionId}"` from `account_sessions:{accountId}`. If index removal fails, the failure is logged via structured `console.error` telemetry for operational alerting.
+            Returns `401 Unauthorized` (`code: 'TOKEN_REPLAY_DETECTED'`).
+          - *If Lost-Response Occurs*: If a client experiences network disruption after rotation commits in Redis but before the response cookie is received, the client cannot recover replacement credentials using the spent token. The client must re-authenticate cleanly via `POST /api/v1/auth/login`. Under no circumstances are replacement credentials returned to a spent token.
         - *If Token Hash Matches (`family.activeTokenHash == presentedTokenHash`)*:
           The application pre-generates replacement credentials in Node.js memory:
           - `replacementEntropy = crypto.randomBytes(32).toString('hex')` (256-bit CSPRNG)
@@ -384,8 +376,7 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
           - `replacementTokenHash = crypto.createHash('sha256').update(replacementRawToken).digest('hex')`
           - `newSessionId = crypto.randomUUID()`
           - `oldSessionId = family.activeSessionId`
-          - Encrypts replacement credentials into AES-256-GCM recovery envelope payload (`tombstonePayload`).
-     4. The application executes the **Deterministic Atomic Rotation Script** passing ALL 6 same-slot keys explicitly:
+     4. The application executes the **Deterministic Atomic Rotation Script** passing ALL 6 same-slot keys and 10 ARGV parameters explicitly:
         - `KEYS[1]`: `family:{familyId}`
         - `KEYS[2]`: `token_lookup:{familyId}:{presentedTokenHash}`
         - `KEYS[3]`: `session:{familyId}:{oldSessionId}`
@@ -397,22 +388,21 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
         - `ARGV[3]`: `newSessionId`
         - `ARGV[4]`: `ipAddress`
         - `ARGV[5]`: `userAgent`
-        - `ARGV[6]`: `timestamp`
+        - `ARGV[6]`: `timestamp` (ISO 8601 string)
         - `ARGV[7]`: `ttl` (2,592,000s / 30 days)
         - `ARGV[8]`: `tombstoneTtl` (86,400s / 24 hours)
         - `ARGV[9]`: `expiresAt` (ISO 8601 string)
         - `ARGV[10]`: `expectedOldSessionId`
-        - `ARGV[11]`: `tombstonePayload` (AES-256-GCM encrypted recovery envelope)
      5. **Strict Pre-Mutation Script Execution Logic**:
-        - **Family Validation**: Asserts `family:{familyId}` exists, `isCompromised ~= '1'`, non-empty `familyId`, `activeTokenHash == ARGV[1]`, `activeSessionId == ARGV[10]`, and `rotationSeq >= 1`.
-        - **Token Lookup Validation**: Asserts `KEYS[2]` exists and parses JSON payload, verifying `lookupFamilyId == famFamilyId`, `lookupSessionId == activeSessionId`, and non-empty `lookupAccountId`.
+        - **Family Validation**: Asserts `family:{familyId}` exists, `isCompromised ~= '1'`, non-empty `familyId`, `activeTokenHash == ARGV[1]`, `activeSessionId == ARGV[10]`, and strictly validates `rotationSeq` as a positive integer within JavaScript safe integer bounds (`string.match(currentSeqStr, '^%d+$')` and `1 <= currentSeq <= 9007199254740991`).
+        - **Token Lookup Validation**: Asserts `KEYS[2]` exists and strictly decodes JSON payload using native `pcall(cjson.decode, lookupRaw)` (no string-matching fallback in production logic), verifying `type(lookup) == 'table'`, `lookupFamilyId == famFamilyId`, `lookupSessionId == activeSessionId`, and non-empty `lookupAccountId`.
         - **Old Session Record Validation**: Asserts `KEYS[3]` exists, `sessionId == activeSessionId`, `familyId == famFamilyId`, `accountId == lookupAccountId`, and non-empty `tokenHash == ARGV[1]`.
         - **Collision Avoidance**: Asserts `EXISTS KEYS[5] == 0` and `EXISTS KEYS[6] == 0` (no collision on replacement keys).
         - *Atomicity Guarantee*: If any check fails, script aborts immediately with a specific error code without mutating any key.
         - *Mutation Sequence*: Once all validations pass:
           1. Deletes `KEYS[2]` (`token_lookup:{familyId}:{presentedTokenHash}`).
           2. Deletes `KEYS[3]` (`session:{familyId}:{oldSessionId}`).
-          3. Writes `KEYS[4]` (`revoked_token:{familyId}:{presentedTokenHash}`) = `ARGV[11]` (encrypted recovery envelope) with TTL = `ARGV[8]`.
+          3. Writes `KEYS[4]` (`revoked_token:{familyId}:{presentedTokenHash}`) = `ARGV[6]` (rotation timestamp ISO string) with TTL = `ARGV[8]`.
           4. Writes `KEYS[5]` (`token_lookup:{familyId}:{replacementTokenHash}`) = `{ familyId, sessionId: newSessionId, accountId: lookupAccountId }` with TTL = `ARGV[7]`.
           5. Writes `KEYS[6]` (`session:{familyId}:{newSessionId}`) with session telemetry, `rotationSeq = k + 1`, and TTL = `ARGV[7]`.
           6. Updates `KEYS[1]` (`family:{familyId}`) with `activeSessionId = newSessionId`, `activeTokenHash = replacementTokenHash`, `rotationSeq = k + 1`, and TTL = `ARGV[7]`.
@@ -421,6 +411,7 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
         - Outside the family Lua transaction, the application tier executes decoupled, idempotent updates on `account_sessions:{accountId}`:
           `SREM account_sessions:{accountId} "{familyId}:{oldSessionId}"`
           `SADD account_sessions:{accountId} "{familyId}:{newSessionId}"`
+        - Any failures during index updates are recorded via structured `console.error` telemetry for operational monitoring.
      7. **Pre-Signing, Cookie Dispatch & Token Issuance**: The API pre-signs the fresh 15-minute access token (with compatibility claim `"gen": 1`) prior to invoking Redis rotation to eliminate orphaned rotation state on signing failure. Upon successful Redis rotation, the API sets the new `refreshToken` cookie containing `replacementRawToken` and returns the access token.
 
 4. **Replay Revocation Scoping & Rationale**:

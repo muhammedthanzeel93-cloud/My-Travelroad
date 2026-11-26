@@ -77,7 +77,6 @@ export interface RotateSessionParams {
   userAgent?: string;
   timestamp?: string;
   expiresAt?: string;
-  tombstonePayload?: string;
 }
 
 /**

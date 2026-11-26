@@ -7,6 +7,7 @@ import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import net from "net";
 import { PrismaClient } from "@prisma/client";
 import RedisMock from "ioredis-mock";
+import { setupRedisMock } from "../helpers/redis-mock.helper";
 import { PRISMA_LOG_CONFIG } from "../../../src/lib/db";
 import { registerTouristAccount } from "../../../src/server/services/registration.service";
 import { authenticateLogin } from "../../../src/server/services/login.service";
@@ -118,6 +119,7 @@ describe("PostgreSQL Integration: Refresh Token & Session Management", () => {
     await testPrisma.$connect();
 
     const redis = new RedisMock();
+    setupRedisMock(redis);
     sessionStore = new RedisSessionStore(redis);
     sessionService = new SessionService(sessionStore);
   });

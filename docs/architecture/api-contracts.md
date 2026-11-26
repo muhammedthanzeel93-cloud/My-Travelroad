@@ -169,13 +169,13 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 ```
 - **Error Responses**:
   - `400 Bad Request`: `BAD_REQUEST` (Missing mandatory `X-Requested-With: XMLHttpRequest` header).
-  - `401 Unauthorized`: `TOKEN_INVALID` (Malformed or unrecognized token), `TOKEN_EXPIRED`, or `TOKEN_REPLAY_DETECTED` (Replay of revoked token after the 30-second recovery window; entire family revoked).
+  - `401 Unauthorized`: `TOKEN_INVALID` (Malformed or unrecognized token), `TOKEN_EXPIRED`, or `TOKEN_REPLAY_DETECTED` (Replay of already-rotated or revoked token; entire session family immediately revoked fail-closed).
   - `403 Forbidden`: `ACCOUNT_SUSPENDED` (Account suspended; refresh session revoked).
   - `403 Forbidden`: `ACCOUNT_DEACTIVATED` (Account deactivated).
   - `503 Service Unavailable`: `SERVICE_UNAVAILABLE` (Redis session persistence infrastructure failure; fail-closed).
 
-- **Lost-Response Retry Recovery**:
-  If an in-flight rotation succeeds in Redis but the response is lost in transit (e.g., client timeout, mobile network disconnect), a retry by the client presenting the *same* refresh token within the 30-second recovery window returns `200 OK` with the *exact same* replacement credentials (`accessToken` and `Set-Cookie`) without compromising the session family or minting conflicting tokens. Raw tokens are never stored in plaintext in Redis; recovery envelopes are encrypted with AES-256-GCM using an ephemeral key derived from the presented raw token.
+- **Strict Single-Winner Rotation & Lost-Response Policy**:
+  Refresh token rotation enforces a strict single-winner policy. Once a refresh token is rotated, it is permanently spent and recorded in a revoked token tombstone with its rotation timestamp. Presenting any already-rotated token is classified as an active replay attack and immediately revokes the entire device session family fail-closed (`401 TOKEN_REPLAY_DETECTED`), purges active session credentials from Redis, and prunes the session from the account index. If an in-flight rotation response is dropped or lost due to network disruption, the client must re-authenticate cleanly via `POST /api/v1/auth/login`. Under no circumstances are replacement credentials returned to a spent token.
 
 ---
 

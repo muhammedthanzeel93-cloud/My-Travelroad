@@ -6,6 +6,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import crypto from "node:crypto";
 import RedisMock from "ioredis-mock";
+import { setupRedisMock } from "../helpers/redis-mock.helper";
 import { RedisSessionStore } from "../../../src/server/redis/session.store";
 import { SessionService } from "../../../src/server/services/session.service";
 import { generateRefreshToken } from "../../../src/server/auth/refresh-token";
@@ -34,6 +35,7 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
 
   beforeEach(() => {
     redis = new RedisMock();
+    setupRedisMock(redis);
     sessionStore = new RedisSessionStore(redis);
     sessionService = new SessionService(sessionStore);
 
@@ -141,12 +143,7 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
       mockPrisma
     );
 
-    // 2. Replay attack: present the old initial token again after grace window
-    await redis.set(
-      `revoked_token:{${familyId}}:${initialToken.tokenHash}`,
-      new Date(Date.now() - 20000).toISOString()
-    );
-
+    // 2. Replay attack: present the old initial token again (strictly single-winner, no recovery window)
     await expect(
       sessionService.rotateRefreshSession(initialToken.rawToken, {}, mockPrisma)
     ).rejects.toThrow(
@@ -203,20 +200,7 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
     // Legitimate rotation on Device A
     await sessionService.rotateRefreshSession(tokenA1.rawToken, {}, mockPrisma);
 
-    // Replay attack on Device A after recovery window
-    // Simulate tokenA1 rotated 35 seconds ago (exceeding 30s recovery window)
-    const tombstoneRawA = await redis.get(`revoked_token:{${familyA}}:${tokenA1.tokenHash}`);
-    if (tombstoneRawA) {
-      const tombA = JSON.parse(tombstoneRawA);
-      tombA.rotatedAt = new Date(Date.now() - 35000).toISOString();
-      await redis.set(`revoked_token:{${familyA}}:${tokenA1.tokenHash}`, JSON.stringify(tombA));
-    } else {
-      await redis.set(
-        `revoked_token:{${familyA}}:${tokenA1.tokenHash}`,
-        new Date(Date.now() - 35000).toISOString()
-      );
-    }
-
+    // Replay attack on Device A: presenting rotated token immediately triggers replay
     await expect(
       sessionService.rotateRefreshSession(tokenA1.rawToken, {}, mockPrisma)
     ).rejects.toThrow(UnauthorizedError);
@@ -477,7 +461,7 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
       expect(fam?.activeTokenHash).toBe(token.tokenHash);
     });
 
-    it("client retry within 30-second recovery window recovers replacement credentials without compromising family", async () => {
+    it("client retry with old refresh token immediately triggers replay detection and compromises family fail-closed", async () => {
       const familyId = crypto.randomUUID();
       const token = generateRefreshToken(familyId);
       const sessionId = crypto.randomUUID();
@@ -491,47 +475,9 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
 
       // 1. Rotate token
       const rotation = await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
+      expect(rotation.accessToken).toBeDefined();
 
-      // 2. Client immediately retries with the old token (within 30-second recovery window)
-      const retryResult = await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
-
-      // Recovers the exact same replacement credentials
-      expect(retryResult.accessToken).toBe(rotation.accessToken);
-      expect(retryResult.newRawRefreshToken).toBe(rotation.newRawRefreshToken);
-
-      // 3. Family MUST NOT be marked compromised!
-      const fam = await sessionStore.getFamily(familyId);
-      expect(fam).not.toBeNull();
-      expect(fam?.isCompromised).toBe(false);
-
-      // 4. Replacement token from rotation is STILL valid!
-      const rotation2 = await sessionService.rotateRefreshSession(rotation.newRawRefreshToken, {}, mockPrisma);
-      expect(rotation2.accessToken).toBeDefined();
-    });
-
-    it("client retry after 30-second recovery window triggers replay detection and compromises family", async () => {
-      const familyId = crypto.randomUUID();
-      const token = generateRefreshToken(familyId);
-      const sessionId = crypto.randomUUID();
-
-      await sessionStore.createInitialSession({
-        familyId,
-        sessionId,
-        tokenHash: token.tokenHash,
-        accountId: validAccountId,
-      });
-
-      // 1. Rotate token
-      await sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma);
-
-      // 2. Simulate tombstone expired beyond 30-second recovery window (35 seconds ago)
-      const tombstoneRaw = await redis.get(`revoked_token:{${familyId}}:${token.tokenHash}`);
-      expect(tombstoneRaw).not.toBeNull();
-      const tombstoneObj = JSON.parse(tombstoneRaw!);
-      tombstoneObj.rotatedAt = new Date(Date.now() - 35000).toISOString();
-      await redis.set(`revoked_token:{${familyId}}:${token.tokenHash}`, JSON.stringify(tombstoneObj));
-
-      // 3. Present old token again: replay detection triggers fail-closed
+      // 2. Client retries with the old token: strict single-winner policy classifies this as replay
       await expect(
         sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma)
       ).rejects.toThrow(
@@ -541,10 +487,12 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
         )
       );
 
-      // 4. Family MUST be compromised and session pruned from account index
+      // 3. Family MUST be marked compromised
       const fam = await sessionStore.getFamily(familyId);
+      expect(fam).not.toBeNull();
       expect(fam?.isCompromised).toBe(true);
 
+      // 4. Active session pruned from account index
       const acctSessions = await redis.smembers(`account_sessions:${validAccountId}`);
       expect(acctSessions).not.toContain(`${familyId}:${sessionId}`);
     });
@@ -577,13 +525,7 @@ describe("SessionService & RedisSessionStore Integration Tests", () => {
       // Rotate Device 1
       await sessionService.rotateRefreshSession(token1.rawToken, {}, mockPrisma);
 
-      // Age tombstone past 30-second recovery window
-      const tombstoneRaw = await redis.get(`revoked_token:{${family1}}:${token1.tokenHash}`);
-      const tombstoneObj = JSON.parse(tombstoneRaw!);
-      tombstoneObj.rotatedAt = new Date(Date.now() - 35000).toISOString();
-      await redis.set(`revoked_token:{${family1}}:${token1.tokenHash}`, JSON.stringify(tombstoneObj));
-
-      // Trigger replay on Device 1
+      // Trigger replay on Device 1 by presenting spent token1
       await expect(
         sessionService.rotateRefreshSession(token1.rawToken, {}, mockPrisma)
       ).rejects.toThrow(UnauthorizedError);

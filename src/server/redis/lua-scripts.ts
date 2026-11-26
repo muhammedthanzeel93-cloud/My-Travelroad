@@ -6,7 +6,7 @@
  */
 
 /**
- * Deterministic Atomic Rotation Script (6 KEYS, 11 ARGV)
+ * Deterministic Atomic Rotation Script (6 KEYS, 10 ARGV)
  *
  * KEYS[1]: family:{familyId}
  * KEYS[2]: token_lookup:{familyId}:{presentedTokenHash}
@@ -25,7 +25,6 @@
  * ARGV[8]: tombstoneTtl (seconds, e.g. 86400)
  * ARGV[9]: expiresAt (ISO 8601 string, e.g. now + 30 days)
  * ARGV[10]: expectedOldSessionId
- * ARGV[11]: tombstonePayload (Encrypted recovery envelope JSON or timestamp)
  */
 export const ATOMIC_ROTATION_LUA = `
 -- 1. Verify family exists
@@ -39,7 +38,7 @@ if isCompromised == '1' then
     return {'ERROR', 'FAMILY_COMPROMISED'}
 end
 
--- 3. Verify family fields: familyId, activeTokenHash, activeSessionId, rotationSeq
+-- 3. Verify family fields: familyId, activeTokenHash, activeSessionId
 local famFamilyId = redis.call('HGET', KEYS[1], 'familyId')
 if not famFamilyId or famFamilyId == '' then
     return {'ERROR', 'MALFORMED_FAMILY_RECORD'}
@@ -58,13 +57,20 @@ if ARGV[10] ~= '' and activeSessionId ~= ARGV[10] then
     return {'ERROR', 'SESSION_MISMATCH'}
 end
 
+-- 4. Verify rotation sequence: must be a strict positive integer within safe range [1, 9007199254740991]
 local currentSeqStr = redis.call('HGET', KEYS[1], 'rotationSeq')
+if not currentSeqStr or currentSeqStr == '' then
+    return {'ERROR', 'INVALID_ROTATION_SEQUENCE'}
+end
+if not string.match(currentSeqStr, '^%d+$') then
+    return {'ERROR', 'INVALID_ROTATION_SEQUENCE'}
+end
 local currentSeq = tonumber(currentSeqStr)
-if not currentSeq or currentSeq < 1 then
+if not currentSeq or currentSeq < 1 or currentSeq > 9007199254740991 then
     return {'ERROR', 'INVALID_ROTATION_SEQUENCE'}
 end
 
--- 4. Verify token lookup key exists and parse JSON payload
+-- 5. Verify token lookup key exists and strictly parse with cjson.decode
 if redis.call('EXISTS', KEYS[2]) == 0 then
     return {'ERROR', 'TOKEN_LOOKUP_NOT_FOUND'}
 end
@@ -74,21 +80,26 @@ if not lookupRaw or lookupRaw == '' then
     return {'ERROR', 'TOKEN_LOOKUP_CORRUPTED'}
 end
 
-local lookupFamilyId = string.match(lookupRaw, '"familyId"%s*:%s*"([^"]+)"')
-local lookupSessionId = string.match(lookupRaw, '"sessionId"%s*:%s*"([^"]+)"')
-local lookupAccountId = string.match(lookupRaw, '"accountId"%s*:%s*"([^"]+)"')
+local ok, lookup = pcall(cjson.decode, lookupRaw)
+if not ok or type(lookup) ~= 'table' then
+    return {'ERROR', 'TOKEN_LOOKUP_CORRUPTED'}
+end
 
-if not lookupFamilyId or lookupFamilyId ~= famFamilyId then
+local lookupFamilyId = lookup['familyId']
+local lookupSessionId = lookup['sessionId']
+local lookupAccountId = lookup['accountId']
+
+if not lookupFamilyId or type(lookupFamilyId) ~= 'string' or lookupFamilyId ~= famFamilyId then
     return {'ERROR', 'LOOKUP_FAMILY_MISMATCH'}
 end
-if not lookupSessionId or lookupSessionId ~= activeSessionId then
+if not lookupSessionId or type(lookupSessionId) ~= 'string' or lookupSessionId == '' or lookupSessionId ~= activeSessionId then
     return {'ERROR', 'LOOKUP_SESSION_MISMATCH'}
 end
-if not lookupAccountId or lookupAccountId == '' then
+if not lookupAccountId or type(lookupAccountId) ~= 'string' or lookupAccountId == '' then
     return {'ERROR', 'LOOKUP_ACCOUNT_MISSING'}
 end
 
--- 5. Verify old session record exists and matches identity & presented token hash
+-- 6. Verify old session record exists and matches identity & presented token hash
 if redis.call('EXISTS', KEYS[3]) == 0 then
     return {'ERROR', 'OLD_SESSION_NOT_FOUND'}
 end
@@ -116,24 +127,20 @@ if oldSessionHash ~= ARGV[1] then
     return {'ERROR', 'OLD_SESSION_HASH_MISMATCH'}
 end
 
--- 6. Verify collision avoidance on replacement keys
+-- 7. Verify collision avoidance on replacement keys
 if redis.call('EXISTS', KEYS[5]) == 1 or redis.call('EXISTS', KEYS[6]) == 1 then
     return {'ERROR', 'REPLACEMENT_KEY_COLLISION'}
 end
 
--- 7. All validations passed! Safe to proceed with atomic mutations.
+-- 8. All validations passed! Safe to proceed with atomic mutations.
 local newSeq = currentSeq + 1
 
 -- Delete old credentials
 redis.call('DEL', KEYS[2])
 redis.call('DEL', KEYS[3])
 
--- Write revoked token tombstone with payload
-local tombPayload = ARGV[11]
-if not tombPayload or tombPayload == '' then
-    tombPayload = ARGV[6]
-end
-redis.call('SET', KEYS[4], tombPayload, 'EX', tonumber(ARGV[8]))
+-- Write revoked token tombstone with rotation timestamp ISO string
+redis.call('SET', KEYS[4], ARGV[6], 'EX', tonumber(ARGV[8]))
 
 -- Write replacement token lookup
 local newLookupJson = '{"familyId":"' .. famFamilyId .. '","sessionId":"' .. ARGV[3] .. '","accountId":"' .. lookupAccountId .. '"}'
