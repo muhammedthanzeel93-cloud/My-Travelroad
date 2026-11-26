@@ -31,6 +31,39 @@ import {
 import { ServiceUnavailableError } from "../errors/app-error";
 import { ErrorCode } from "../errors/error-codes";
 
+/**
+ * Asserts that a Redis pipeline executed successfully and that no individual command returned an error.
+ * Returns an array of successful command results, or throws an Error if any command failed.
+ */
+export function assertPipelineSuccess(
+  results: [Error | null, unknown][] | null | undefined,
+  operation: string
+): unknown[] {
+  if (!results || !Array.isArray(results)) {
+    throw new Error(`Pipeline execution failed in ${operation}: no results returned`);
+  }
+
+  const errors: Error[] = [];
+  for (let i = 0; i < results.length; i++) {
+    const [err] = results[i];
+    if (err) {
+      errors.push(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  if (errors.length > 0) {
+    const errorMessages = errors.map((e) => e.message).join("; ");
+    const primaryError = errors[0];
+    const combinedError = new Error(
+      `Pipeline command failure in ${operation} (${errors.length} error(s)): ${errorMessages}`
+    );
+    (combinedError as any).cause = primaryError;
+    throw combinedError;
+  }
+
+  return results.map(([_, res]) => res);
+}
+
 export class RedisSessionStore {
   private client: RedisInstance;
 
@@ -86,6 +119,8 @@ export class RedisSessionStore {
 
   /**
    * Persists an initial session and family lineage upon successful user login.
+   * Enforces fail-closed semantics: all required Redis records must succeed,
+   * otherwise rolls back partially written records and fails closed.
    */
   public async createInitialSession(params: CreateSessionParams): Promise<void> {
     await this.ensureConnection();
@@ -94,12 +129,14 @@ export class RedisSessionStore {
     const now = params.createdAt ?? new Date().toISOString();
     const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000).toISOString();
 
-    try {
-      const famKey = this.familyKey(familyId);
-      const sessKey = this.sessionKey(familyId, sessionId);
-      const lookupKey = this.tokenLookupKey(familyId, tokenHash);
-      const acctKey = this.accountSessionsKey(accountId);
+    const famKey = this.familyKey(familyId);
+    const sessKey = this.sessionKey(familyId, sessionId);
+    const lookupKey = this.tokenLookupKey(familyId, tokenHash);
+    const acctKey = this.accountSessionsKey(accountId);
 
+    let sessionCreated = false;
+
+    try {
       // 1. Multi-key pipeline for same-slot keys
       const pipeline = this.client.pipeline();
 
@@ -136,7 +173,8 @@ export class RedisSessionStore {
       });
       pipeline.set(lookupKey, lookupJson, "EX", SESSION_TTL_SECONDS);
 
-      await pipeline.exec();
+      const results = await pipeline.exec();
+      assertPipelineSuccess(results, "createInitialSession");
 
       // 2. Decoupled update to account-level session index
       try {
@@ -155,7 +193,34 @@ export class RedisSessionStore {
         );
         throw saddErr;
       }
+
+      sessionCreated = true;
     } catch (err) {
+      // If session was not fully and successfully created, clean up any partial writes
+      if (!sessionCreated) {
+        try {
+          const cleanupPipeline = this.client.pipeline();
+          cleanupPipeline.del(famKey);
+          cleanupPipeline.del(sessKey);
+          cleanupPipeline.del(lookupKey);
+          cleanupPipeline.srem(acctKey, `${familyId}:${sessionId}`);
+          const cleanupResults = await cleanupPipeline.exec();
+          assertPipelineSuccess(cleanupResults, "cleanupPartialInitialSession");
+        } catch (cleanupErr) {
+          console.error(
+            JSON.stringify({
+              timestamp: new Date().toISOString(),
+              event: "SESSION_CLEANUP_FAILURE",
+              operation: "cleanupPartialInitialSession",
+              accountId,
+              familyId,
+              sessionId,
+              error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+            })
+          );
+        }
+      }
+
       this.handleRedisError(err);
     }
   }
@@ -353,7 +418,8 @@ export class RedisSessionStore {
         pipeline.sadd(key, `${familyId}:${newSessionId}`);
       }
 
-      await pipeline.exec();
+      const results = await pipeline.exec();
+      assertPipelineSuccess(results, "updateAccountSessionIndex");
     } catch (err) {
       this.handleRedisError(err);
     }
@@ -487,7 +553,8 @@ export class RedisSessionStore {
         pipeline.del(this.tokenLookupKey(familyId, activeTokenHash));
       }
 
-      await pipeline.exec();
+      const results = await pipeline.exec();
+      assertPipelineSuccess(results, "revokeFamilyDirect");
 
       if (accountId && activeSessionId) {
         try {
