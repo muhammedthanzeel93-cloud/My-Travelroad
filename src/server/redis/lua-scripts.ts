@@ -57,16 +57,21 @@ if ARGV[10] ~= '' and activeSessionId ~= ARGV[10] then
     return {'ERROR', 'SESSION_MISMATCH'}
 end
 
--- 4. Verify rotation sequence: must be a strict positive integer within safe range [1, 9007199254740991]
+-- 4. Verify rotation sequence: must be a strict positive integer within safe range [1, 9007199254740990]
+-- Because currentSeq will be incremented (currentSeq + 1), currentSeq cannot exceed Number.MAX_SAFE_INTEGER - 1 (9007199254740990).
+-- This guarantees that the resulting newSeq never exceeds Number.MAX_SAFE_INTEGER (9007199254740991).
 local currentSeqStr = redis.call('HGET', KEYS[1], 'rotationSeq')
 if not currentSeqStr or currentSeqStr == '' then
     return {'ERROR', 'INVALID_ROTATION_SEQUENCE'}
 end
-if not string.match(currentSeqStr, '^%d+$') then
+if not string.match(currentSeqStr, '^[1-9]%d*$') then
+    return {'ERROR', 'INVALID_ROTATION_SEQUENCE'}
+end
+if string.len(currentSeqStr) > 16 then
     return {'ERROR', 'INVALID_ROTATION_SEQUENCE'}
 end
 local currentSeq = tonumber(currentSeqStr)
-if not currentSeq or currentSeq < 1 or currentSeq > 9007199254740991 then
+if not currentSeq or currentSeq < 1 or currentSeq > 9007199254740990 then
     return {'ERROR', 'INVALID_ROTATION_SEQUENCE'}
 end
 
@@ -152,7 +157,7 @@ redis.call('HSET', KEYS[6],
     'familyId', famFamilyId,
     'accountId', lookupAccountId,
     'tokenHash', ARGV[2],
-    'rotationSeq', tostring(newSeq),
+    'rotationSeq', string.format('%.0f', newSeq),
     'createdAt', ARGV[6],
     'expiresAt', ARGV[9],
     'ipAddress', ARGV[4],
@@ -164,11 +169,11 @@ redis.call('EXPIRE', KEYS[6], tonumber(ARGV[7]))
 redis.call('HSET', KEYS[1],
     'activeSessionId', ARGV[3],
     'activeTokenHash', ARGV[2],
-    'rotationSeq', tostring(newSeq)
+    'rotationSeq', string.format('%.0f', newSeq)
 )
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[7]))
 
-return {'OK', tostring(newSeq)}
+return {'OK', string.format('%.0f', newSeq)}
 `;
 
 /**

@@ -315,8 +315,16 @@ export class SessionService {
       );
     } catch (err) {
       console.error(
-        `[SessionService] Failed to update account session index for account ${accountId} (family: ${familyId}, oldSession: ${oldSessionId}, newSession: ${newSessionId}):`,
-        err
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          event: "ACCOUNT_SESSION_INDEX_FAILURE",
+          operation: "updateAccountSessionIndex",
+          accountId,
+          familyId,
+          oldSessionId,
+          newSessionId,
+          error: err instanceof Error ? err.message : String(err),
+        })
       );
     }
 

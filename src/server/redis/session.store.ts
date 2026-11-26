@@ -139,7 +139,22 @@ export class RedisSessionStore {
       await pipeline.exec();
 
       // 2. Decoupled update to account-level session index
-      await this.client.sadd(acctKey, `${familyId}:${sessionId}`);
+      try {
+        await this.client.sadd(acctKey, `${familyId}:${sessionId}`);
+      } catch (saddErr) {
+        console.error(
+          JSON.stringify({
+            timestamp: new Date().toISOString(),
+            event: "ACCOUNT_SESSION_INDEX_FAILURE",
+            operation: "addAccountSessionIndexOnInitialSession",
+            accountId,
+            familyId,
+            sessionId,
+            error: saddErr instanceof Error ? saddErr.message : String(saddErr),
+          })
+        );
+        throw saddErr;
+      }
     } catch (err) {
       this.handleRedisError(err);
     }
@@ -382,8 +397,15 @@ export class RedisSessionStore {
         } catch (sremErr) {
           // Log index cleanup failure for operational telemetry without masking primary family revocation
           console.error(
-            `[RedisSessionStore] Failed to prune account session index for account ${params.accountId} (family: ${familyId}, session: ${expectedActiveSessionId}):`,
-            sremErr
+            JSON.stringify({
+              timestamp: new Date().toISOString(),
+              event: "ACCOUNT_SESSION_INDEX_FAILURE",
+              operation: "pruneAccountSessionIndexOnReplay",
+              accountId: params.accountId,
+              familyId,
+              sessionId: expectedActiveSessionId,
+              error: sremErr instanceof Error ? sremErr.message : String(sremErr),
+            })
           );
         }
       }
@@ -419,7 +441,21 @@ export class RedisSessionStore {
       )) as LogoutScriptResult;
 
       if (accountId) {
-        await this.client.srem(this.accountSessionsKey(accountId), `${familyId}:${expectedActiveSessionId}`);
+        try {
+          await this.client.srem(this.accountSessionsKey(accountId), `${familyId}:${expectedActiveSessionId}`);
+        } catch (sremErr) {
+          console.error(
+            JSON.stringify({
+              timestamp: new Date().toISOString(),
+              event: "ACCOUNT_SESSION_INDEX_FAILURE",
+              operation: "pruneAccountSessionIndexOnLogout",
+              accountId,
+              familyId,
+              sessionId: expectedActiveSessionId,
+              error: sremErr instanceof Error ? sremErr.message : String(sremErr),
+            })
+          );
+        }
       }
 
       return result;
@@ -454,7 +490,21 @@ export class RedisSessionStore {
       await pipeline.exec();
 
       if (accountId && activeSessionId) {
-        await this.client.srem(this.accountSessionsKey(accountId), `${familyId}:${activeSessionId}`);
+        try {
+          await this.client.srem(this.accountSessionsKey(accountId), `${familyId}:${activeSessionId}`);
+        } catch (sremErr) {
+          console.error(
+            JSON.stringify({
+              timestamp: new Date().toISOString(),
+              event: "ACCOUNT_SESSION_INDEX_FAILURE",
+              operation: "pruneAccountSessionIndexOnDirectRevocation",
+              accountId,
+              familyId,
+              sessionId: activeSessionId,
+              error: sremErr instanceof Error ? sremErr.message : String(sremErr),
+            })
+          );
+        }
       }
     } catch (err) {
       this.handleRedisError(err);

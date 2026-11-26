@@ -394,7 +394,7 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
         - `ARGV[9]`: `expiresAt` (ISO 8601 string)
         - `ARGV[10]`: `expectedOldSessionId`
      5. **Strict Pre-Mutation Script Execution Logic**:
-        - **Family Validation**: Asserts `family:{familyId}` exists, `isCompromised ~= '1'`, non-empty `familyId`, `activeTokenHash == ARGV[1]`, `activeSessionId == ARGV[10]`, and strictly validates `rotationSeq` as a positive integer within JavaScript safe integer bounds (`string.match(currentSeqStr, '^%d+$')` and `1 <= currentSeq <= 9007199254740991`).
+        - **Family Validation**: Asserts `family:{familyId}` exists, `isCompromised ~= '1'`, non-empty `familyId`, `activeTokenHash == ARGV[1]`, `activeSessionId == ARGV[10]`, and strictly validates `rotationSeq` as a positive integer within JavaScript safe integer bounds (`string.match(currentSeqStr, '^[1-9]%d*$')`, `string.len(currentSeqStr) <= 16`, and `1 <= currentSeq <= 9007199254740990` (`Number.MAX_SAFE_INTEGER - 1`)). Values of `9007199254740991` or higher, empty strings, zero, negative numbers, decimals, exponentials, and non-numeric strings are rejected with `INVALID_ROTATION_SEQUENCE` without state mutation.
         - **Token Lookup Validation**: Asserts `KEYS[2]` exists and strictly decodes JSON payload using native `pcall(cjson.decode, lookupRaw)` (no string-matching fallback in production logic), verifying `type(lookup) == 'table'`, `lookupFamilyId == famFamilyId`, `lookupSessionId == activeSessionId`, and non-empty `lookupAccountId`.
         - **Old Session Record Validation**: Asserts `KEYS[3]` exists, `sessionId == activeSessionId`, `familyId == famFamilyId`, `accountId == lookupAccountId`, and non-empty `tokenHash == ARGV[1]`.
         - **Collision Avoidance**: Asserts `EXISTS KEYS[5] == 0` and `EXISTS KEYS[6] == 0` (no collision on replacement keys).
@@ -404,14 +404,15 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
           2. Deletes `KEYS[3]` (`session:{familyId}:{oldSessionId}`).
           3. Writes `KEYS[4]` (`revoked_token:{familyId}:{presentedTokenHash}`) = `ARGV[6]` (rotation timestamp ISO string) with TTL = `ARGV[8]`.
           4. Writes `KEYS[5]` (`token_lookup:{familyId}:{replacementTokenHash}`) = `{ familyId, sessionId: newSessionId, accountId: lookupAccountId }` with TTL = `ARGV[7]`.
-          5. Writes `KEYS[6]` (`session:{familyId}:{newSessionId}`) with session telemetry, `rotationSeq = k + 1`, and TTL = `ARGV[7]`.
-          6. Updates `KEYS[1]` (`family:{familyId}`) with `activeSessionId = newSessionId`, `activeTokenHash = replacementTokenHash`, `rotationSeq = k + 1`, and TTL = `ARGV[7]`.
-          7. Returns `['OK', tostring(k + 1)]`.
-     6. **Decoupled Account-Level Index Maintenance**:
+          5. Writes `KEYS[6]` (`session:{familyId}:{newSessionId}`) with session telemetry, `rotationSeq = string.format('%.0f', newSeq)`, and TTL = `ARGV[7]`. (In Lua 5.1, `string.format('%.0f', newSeq)` guarantees integer output and avoids scientific notation conversion).
+          6. Updates `KEYS[1]` (`family:{familyId}`) with `activeSessionId = newSessionId`, `activeTokenHash = replacementTokenHash`, `rotationSeq = string.format('%.0f', newSeq)`, and TTL = `ARGV[7]`.
+          7. Returns `['OK', string.format('%.0f', newSeq)]`.
+     6. **Decoupled Account-Level Index Maintenance & Structured Telemetry**:
         - Outside the family Lua transaction, the application tier executes decoupled, idempotent updates on `account_sessions:{accountId}`:
           `SREM account_sessions:{accountId} "{familyId}:{oldSessionId}"`
           `SADD account_sessions:{accountId} "{familyId}:{newSessionId}"`
-        - Any failures during index updates are recorded via structured `console.error` telemetry for operational monitoring.
+        - In Stage A, `account_sessions` serves as an administrative lookup index decoupled from same-slot atomic family operations (background reconciliation workers do not exist in Stage A).
+        - All operations modifying or pruning `account_sessions` (`updateAccountSessionIndex`, `pruneAccountSessionIndexOnReplay`, `pruneAccountSessionIndexOnLogout`, `pruneAccountSessionIndexOnDirectRevocation`, `addAccountSessionIndexOnInitialSession`) emit structured JSON logging on failure containing timestamp, operation name, account ID, family ID, session ID, and error details, with zero credential leakage.
      7. **Pre-Signing, Cookie Dispatch & Token Issuance**: The API pre-signs the fresh 15-minute access token (with compatibility claim `"gen": 1`) prior to invoking Redis rotation to eliminate orphaned rotation state on signing failure. Upon successful Redis rotation, the API sets the new `refreshToken` cookie containing `replacementRawToken` and returns the access token.
 
 4. **Replay Revocation Scoping & Rationale**:
@@ -422,9 +423,21 @@ The production deployment utilizes Redis (or Valkey) as the primary session and 
      - Administrative account suspension or deactivation (`Account.status = 'suspended' | 'deactivated'`).
      - *Future Stage A+ Endpoint*: Multi-device user logout (`POST /api/v1/auth/logout-all`) is a planned Stage A+ capability requiring the Stage A+ durable generation and outbox schema migration. In Stage A, `POST /api/v1/auth/logout` revokes strictly the caller's current session.
 
-5. **Concurrency Race Condition Prevention**:
-   - Because `KEYS[2]` (`token_lookup:{familyId}:{presentedTokenHash}`) is deleted atomically on the very first instruction of the Lua script and `family.activeTokenHash` is updated, **it is impossible for concurrent requests presenting the same token to rotate twice**.
-   - Any concurrent request arriving even 1 millisecond later will find `activeTokenHash` changed and `token_lookup` absent, failing safely with immediate rejection.
+5. **Concurrency Race Condition Prevention & Single-Winner Policy**:
+   - **In-Flight Concurrent Rotation Race (Lua Level)**:
+     - When two or more concurrent requests simultaneously present the exact same valid active token, both may read the un-rotated family state during the preliminary read phase.
+     - However, execution of `ATOMIC_ROTATION_LUA` is serialized by Redis. The first request to execute finds `KEYS[2]` (`token_lookup`) present, `family.activeTokenHash == presentedTokenHash`, and completes atomic rotation (`200 OK`, issues fresh credentials, increments `rotationSeq`).
+     - The second request enters `ATOMIC_ROTATION_LUA` after the winner's mutations have committed. It discovers that `KEYS[2]` has been deleted and `family.activeTokenHash` no longer matches the presented token. The Lua script aborts without mutation and returns `'RACE_OR_REPLAY_DETECTED'`.
+     - The application tier maps `'RACE_OR_REPLAY_DETECTED'` to an HTTP 401 `TOKEN_INVALID` unauthorized response (`"Concurrent token rotation or replay detected"`).
+     - **Crucial Invariant**: The concurrent losing request receives **zero replacement credentials**. Most importantly, the losing request does **NOT** compromise the family; the winner's newly rotated session and family remain active and valid.
+   - **Post-Rotation Spent-Token Replay (Application Level)**:
+     - When a request arrives after rotation has committed in Redis presenting an old, previously rotated token, the pre-read detects that `family.activeTokenHash != presentedTokenHash`.
+     - The server queries `revoked_token:{familyId}:{presentedTokenHash}`. If a tombstone exists, this is classified as a confirmed replay attack.
+     - The server invokes `revokeFamilyReplay`, marks `family:{familyId}.isCompromised = 1`, sets a 24-hour TTL, purges active session credentials, prunes `account_sessions:{accountId}`, and returns HTTP 401 `TOKEN_REPLAY_DETECTED`.
+   - **Single Bearer Token Invariant & Lost-Response Rationale**:
+     - The server cannot distinguish a legitimate client network retry from an attacker possessing a stolen token when both present the identical bearer token.
+     - Therefore, once rotation commits in Redis, presenting the spent token always revokes the family fail-closed.
+     - No recovery envelopes or replacement credentials are ever returned to a spent token. If a legitimate client loses a rotation response due to network disruption, the client must re-authenticate cleanly via `POST /api/v1/auth/login`.
 
 6. **Account-Wide Revocation & Lifecycle Cascade**:
    - **Single Device Logout (`POST /api/v1/auth/logout`)**:

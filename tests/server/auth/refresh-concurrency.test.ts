@@ -91,12 +91,30 @@ describe("Refresh Token Concurrency & Race Condition Guarantees", () => {
     const fam = await sessionStore.getFamily(familyId);
     expect(fam?.rotationSeq).toBe(2);
 
-    // The losing request must have been rejected with an UnauthorizedError
+    // The losing request must have been rejected with an UnauthorizedError (TOKEN_INVALID) without credentials
     expect(rejected[0].reason).toBeInstanceOf(UnauthorizedError);
+    expect(rejected[0].reason.code).toBe("TOKEN_INVALID");
+    expect(rejected[0].reason.message).toContain("Concurrent token rotation or replay detected");
+
+    // The winner's family is NOT compromised by the concurrency race
+    expect(fam?.isCompromised).toBe(false);
 
     // The winner's replacement token is the ONLY valid token in Redis
-    const winnerTokenHash = winner.newRawRefreshToken.split("_")[2];
     expect(fam?.activeTokenHash).toBe(crypto.createHash("sha256").update(winner.newRawRefreshToken).digest("hex"));
+
+    // A later presentation of the spent token triggers confirmed replay revocation
+    await expect(
+      sessionService.rotateRefreshSession(token.rawToken, {}, mockPrisma)
+    ).rejects.toThrow(
+      new UnauthorizedError(
+        "Refresh token replay detected. Session family has been revoked.",
+        "TOKEN_REPLAY_DETECTED" as any
+      )
+    );
+
+    // Now the family is permanently marked compromised
+    const compromisedFam = await sessionStore.getFamily(familyId);
+    expect(compromisedFam?.isCompromised).toBe(true);
   });
 
   it("ensures losing request in a rotation race cannot overwrite the winner's session state", async () => {

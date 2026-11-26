@@ -169,13 +169,19 @@ All endpoints adhere to the `/api/v1` base URI and standard JSON response envelo
 ```
 - **Error Responses**:
   - `400 Bad Request`: `BAD_REQUEST` (Missing mandatory `X-Requested-With: XMLHttpRequest` header).
-  - `401 Unauthorized`: `TOKEN_INVALID` (Malformed or unrecognized token), `TOKEN_EXPIRED`, or `TOKEN_REPLAY_DETECTED` (Replay of already-rotated or revoked token; entire session family immediately revoked fail-closed).
+  - `401 Unauthorized`:
+    - `TOKEN_INVALID`: Malformed or unrecognized token, or an in-flight concurrent rotation race where another request won and rotated the session in Redis (`"Concurrent token rotation or replay detected"`). The concurrent loser receives no credentials; the winner's newly rotated session is preserved and the family is NOT compromised.
+    - `TOKEN_EXPIRED`: Refresh token lookup has expired.
+    - `TOKEN_REPLAY_DETECTED`: Replay of a previously rotated (spent) token. Replay detection immediately revokes the entire device session family fail-closed, marks `family.isCompromised = 1`, purges active session credentials from Redis, and prunes the session from the account index.
   - `403 Forbidden`: `ACCOUNT_SUSPENDED` (Account suspended; refresh session revoked).
   - `403 Forbidden`: `ACCOUNT_DEACTIVATED` (Account deactivated).
   - `503 Service Unavailable`: `SERVICE_UNAVAILABLE` (Redis session persistence infrastructure failure; fail-closed).
 
-- **Strict Single-Winner Rotation & Lost-Response Policy**:
-  Refresh token rotation enforces a strict single-winner policy. Once a refresh token is rotated, it is permanently spent and recorded in a revoked token tombstone with its rotation timestamp. Presenting any already-rotated token is classified as an active replay attack and immediately revokes the entire device session family fail-closed (`401 TOKEN_REPLAY_DETECTED`), purges active session credentials from Redis, and prunes the session from the account index. If an in-flight rotation response is dropped or lost due to network disruption, the client must re-authenticate cleanly via `POST /api/v1/auth/login`. Under no circumstances are replacement credentials returned to a spent token.
+- **Strict Single-Winner Rotation, Concurrency Policy & Lost-Response Rationale**:
+  Refresh token rotation enforces a strict single-winner policy:
+  1. **In-Flight Concurrent Rotation Race (Lua Level)**: When two concurrent requests simultaneously present the same valid active token, exactly one request commits rotation atomically in Redis (`200 OK`, new credentials, `rotationSeq = k + 1`). The concurrent losing request encounters `RACE_OR_REPLAY_DETECTED` in Lua and receives `401 Unauthorized` (`code: 'TOKEN_INVALID'`, message: `"Concurrent token rotation or replay detected"`) without receiving replacement credentials. Crucially, the losing request does NOT trigger family compromise; the winner's newly rotated session and family remain valid.
+  2. **Post-Rotation Spent-Token Replay (Application Level)**: When a request arrives after rotation has committed in Redis presenting a spent token, the presented token hash does not match `family.activeTokenHash` and is found in `revoked_token`. This triggers `revokeFamilyReplay`, marks the family compromised (`isCompromised = 1`), purges active session credentials, sets a 24-hour TTL, prunes `account_sessions:{accountId}`, and returns `401 Unauthorized` (`code: 'TOKEN_REPLAY_DETECTED'`).
+  3. **Single Bearer Token Invariant**: The server cannot distinguish a legitimate client network retry from an attacker possessing a stolen token when both present the same bearer token; once rotation commits, presenting the spent token always revokes the family fail-closed. No replacement credentials or recovery envelopes are ever returned to a spent token. If a legitimate client loses a rotation response due to network drop, it must re-authenticate cleanly via `POST /api/v1/auth/login`.
 
 ---
 
