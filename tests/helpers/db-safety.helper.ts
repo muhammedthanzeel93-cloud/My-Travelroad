@@ -14,6 +14,63 @@ export interface DatabaseSafetyContext {
   testDatabaseUrl?: string;
   allowDestructiveDbTests?: string;
   nodeEnv?: string;
+  allowedHosts?: string[];
+  testAllowedDbHosts?: string;
+}
+
+/**
+ * Approved local loopback hostnames and IP addresses.
+ * Explicitly permits localhost, 127.0.0.1, and IPv6 loopback (::1).
+ */
+export const APPROVED_LOCAL_HOSTS: ReadonlySet<string> = new Set([
+  "localhost",
+  "127.0.0.1",
+  "::1",
+]);
+
+/**
+ * Approved Docker / test container hostnames commonly used in local containerized workflows and CI.
+ */
+export const APPROVED_CONTAINER_HOSTS: ReadonlySet<string> = new Set([
+  "host.docker.internal",
+  "gateway.docker.internal",
+  "postgres",
+  "database",
+  "db",
+  "test-db",
+  "local-db",
+]);
+
+/**
+ * Normalizes host strings for consistent comparison:
+ * Trims whitespace, converts to lowercase, and strips outer square brackets (e.g. "[::1]" -> "::1").
+ */
+export function normalizeHost(rawHost: string): string {
+  if (!rawHost || typeof rawHost !== "string") {
+    return "";
+  }
+  return rawHost.trim().toLowerCase().replace(/^\[|\]$/g, "");
+}
+
+/**
+ * Checks whether a given host is in the approved local or container allowlist,
+ * or in an explicitly provided custom allowlist.
+ */
+export function isApprovedTestHost(
+  host: string,
+  customAllowedHosts?: Iterable<string>
+): boolean {
+  const normalized = normalizeHost(host);
+  if (!normalized) return false;
+  if (APPROVED_LOCAL_HOSTS.has(normalized)) return true;
+  if (APPROVED_CONTAINER_HOSTS.has(normalized)) return true;
+  if (customAllowedHosts) {
+    const list = Array.from(customAllowedHosts);
+    for (const allowed of list) {
+      if (normalizeHost(allowed) === normalized) return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -30,7 +87,7 @@ export function parseDatabaseConfig(urlStr: string | undefined): DatabaseConfig 
   try {
     const parsed = new URL(urlStr);
     return {
-      host: parsed.hostname || "127.0.0.1",
+      host: parsed.hostname ? parsed.hostname.replace(/^\[|\]$/g, "") : "127.0.0.1",
       port: parsed.port ? parseInt(parsed.port, 10) : 5432,
       database: parsed.pathname.replace(/^\//, ""),
     };
@@ -60,6 +117,10 @@ export function assertTestDatabaseSafety(
     "testDatabaseUrl" in context
       ? context.testDatabaseUrl
       : process.env.TEST_DATABASE_URL;
+  const customHostsFromEnv =
+    "testAllowedDbHosts" in context
+      ? context.testAllowedDbHosts
+      : process.env.TEST_ALLOWED_DB_HOSTS;
 
   // 1. Explicit opt-in requirement
   if (allowDestructive !== "true") {
@@ -97,16 +158,39 @@ export function assertTestDatabaseSafety(
     );
   }
 
-  // 6. Reject production or remote cloud host targets
-  const lowerHost = host.toLowerCase();
+  // 6. Reject production or remote cloud host targets (Defense-in-Depth)
+  const normalizedHost = normalizeHost(host);
   if (
-    lowerHost.includes("prod") ||
-    lowerHost.includes("production") ||
-    lowerHost.includes("amazonaws.com") ||
-    lowerHost.includes("supabase.co")
+    normalizedHost.includes("prod") ||
+    normalizedHost.includes("production") ||
+    normalizedHost.includes("amazonaws.com") ||
+    normalizedHost.includes("supabase.co")
   ) {
     throw new Error(
       `SAFETY CHECK FAILED: Host '${host}' appears to be a production or remote cloud server. Integration tests must run against an isolated local or test container instance.`
+    );
+  }
+
+  // 7. Strict Host Allowlist Enforcement (Local loopback or approved test container)
+  const customAllowed = new Set<string>();
+  if (context.allowedHosts && Array.isArray(context.allowedHosts)) {
+    for (const h of context.allowedHosts) {
+      if (typeof h === "string" && h.trim().length > 0) {
+        customAllowed.add(normalizeHost(h));
+      }
+    }
+  }
+  if (customHostsFromEnv && typeof customHostsFromEnv === "string") {
+    for (const h of customHostsFromEnv.split(",")) {
+      if (h.trim().length > 0) {
+        customAllowed.add(normalizeHost(h));
+      }
+    }
+  }
+
+  if (!isApprovedTestHost(normalizedHost, customAllowed)) {
+    throw new Error(
+      `SAFETY CHECK FAILED: Host '${host}' is not an approved test database host. Destructive integration tests are restricted to approved local loopback hosts (${Array.from(APPROVED_LOCAL_HOSTS).join(", ")}) or approved container hosts (${Array.from(APPROVED_CONTAINER_HOSTS).join(", ")}). To permit a custom test container host, configure TEST_ALLOWED_DB_HOSTS.`
     );
   }
 }
