@@ -22,8 +22,9 @@ export function createCorsMiddleware(allowedOrigins: string[] = ["http://localho
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Request-Id"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Request-Id", "X-Requested-With"],
     exposedHeaders: ["X-Request-Id"],
+    maxAge: 3600,
   };
 
   return cors(corsOptions);

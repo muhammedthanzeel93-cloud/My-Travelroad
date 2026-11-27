@@ -24,6 +24,7 @@ import {
   loginRateLimiter,
   getClientIp,
   csrfProtectionMiddleware,
+  createAuthenticateMiddleware,
 } from "../middleware";
 import { BadRequestError } from "../errors/app-error";
 import { env } from "../../config/env";
@@ -235,6 +236,85 @@ export function createAuthRouter(options: AuthRouterOptions = {}): Router {
           success: true,
           data: {
             message: "Successfully logged out and session revoked.",
+          },
+        };
+
+        res.status(200).json(response);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  /**
+   * GET /me
+   * Returns account metadata and profile summary for the current authenticated caller.
+   * Reference: docs/architecture/api-contracts.md Section 5
+   */
+  router.get(
+    "/me",
+    createAuthenticateMiddleware(dbClient),
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const accountId = req.auth!.accountId;
+        const account = await dbClient.account.findUnique({
+          where: { id: accountId },
+          select: {
+            id: true,
+            email: true,
+            role: true,
+            status: true,
+            emailVerified: true,
+            createdAt: true,
+            touristProfile: {
+              select: {
+                id: true,
+                displayName: true,
+                handle: true,
+                avatarUrl: true,
+              },
+            },
+          },
+        });
+
+        if (!account) {
+          throw new BadRequestError("Account not found");
+        }
+
+        const response: ApiSuccessResponse<{
+          account: {
+            id: string;
+            email: string;
+            role: string;
+            status: string;
+            emailVerified: boolean;
+            createdAt: string;
+          };
+          profile: {
+            id: string;
+            displayName: string;
+            handle: string;
+            avatarUrl: string | null;
+          } | null;
+        }> = {
+          success: true,
+          data: {
+            account: {
+              id: account.id,
+              email: account.email,
+              role: account.role,
+              status: account.status,
+              emailVerified: account.emailVerified,
+              createdAt: account.createdAt.toISOString(),
+            },
+            profile: account.touristProfile
+              ? {
+                  id: account.touristProfile.id,
+                  displayName: account.touristProfile.displayName,
+                  handle: account.touristProfile.handle,
+                  avatarUrl: account.touristProfile.avatarUrl,
+                }
+              : null,
           },
         };
 
