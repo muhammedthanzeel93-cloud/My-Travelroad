@@ -1,5 +1,5 @@
 /**
- * My Travelroad — End-to-End Authentication & Security Verification Suite (Task 10.7)
+ * My Travelroad — End-to-End Authentication & Security Verification Suite (Task 10.7-R1)
  * Executes against live PostgreSQL 16 and live Native Redis 5.0.14 instances.
  * Tests the complete authentication and session management lifecycle via the Express app:
  * - Registration -> Login -> Identity Inspection (GET /me) -> Refresh -> Logout
@@ -7,7 +7,9 @@
  * - Authoritative PostgreSQL Lifecycle & Password Change Invalidation
  * - Live Redis Atomic Token Rotation, Concurrency Races & Replay Detection
  * - Multi-Device Session Isolation & Single-Device Logout
- * - Anti-CSRF, CORS Preflight, and Role-Based Authorization
+ * - Anti-CSRF, CORS Preflight, and Complete 5-Role Authorization Matrix
+ * - Missing-Account Error Handling (401 AUTHENTICATION_REQUIRED)
+ * - Surgical Redis Cleanup Verification (Zero Orphaned Keys or Account Sessions)
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
@@ -27,6 +29,10 @@ import { requireRole, requireEmailVerified } from "../../../src/server/middlewar
 import { createAuthenticateMiddleware } from "../../../src/server/middleware/authenticate";
 import { errorHandler } from "../../../src/server/middleware/error-handler";
 import { loginRateLimiter, registrationRateLimiter } from "../../../src/server/middleware/rate-limiter";
+import {
+  parseDatabaseConfig,
+  assertTestDatabaseSafety,
+} from "../../helpers/db-safety.helper";
 
 let testPrisma: PrismaClient;
 let realRedis: Redis;
@@ -34,41 +40,35 @@ let sessionStore: RedisSessionStore;
 let app: ReturnType<typeof createApp>;
 let testRoleApp: Express;
 
-function parseDatabaseConfig(urlStr: string | undefined): { host: string; port: number; database: string } {
-  if (!urlStr) {
-    throw new Error(
-      "Database URL missing. Please set TEST_DATABASE_URL or DATABASE_URL in environment."
-    );
-  }
-  try {
-    const parsed = new URL(urlStr);
-    return {
-      host: parsed.hostname || "127.0.0.1",
-      port: parsed.port ? parseInt(parsed.port, 10) : 5432,
-      database: parsed.pathname.replace(/^\//, ""),
-    };
-  } catch {
-    throw new Error("Invalid database URL format.");
-  }
-}
+/**
+ * Surgically deletes test-created Redis family keys and account-session inverted indexes.
+ * Prevents leaving orphaned entries without performing broad, dangerous global flushes.
+ */
+async function cleanupTestRedisData(
+  redisClient: Redis,
+  familyIds: Iterable<string>,
+  accountIds: Iterable<string>
+): Promise<void> {
+  const pipeline = redisClient.pipeline();
 
-function assertTestDatabaseSafety(databaseName: string, host: string): void {
-  if (process.env.ALLOW_DESTRUCTIVE_DB_TESTS !== "true") {
-    throw new Error(
-      "TEST DATABASE SAFETY ERROR: Destructive database integration tests require ALLOW_DESTRUCTIVE_DB_TESTS=true."
-    );
+  // 1. Remove family-specific keys strictly scoped to test familyId UUIDs
+  const familyList = Array.from(familyIds);
+  for (const familyId of familyList) {
+    if (!familyId) continue;
+    const keys = await redisClient.keys(`*{${familyId}}*`);
+    for (const key of keys) {
+      pipeline.del(key);
+    }
   }
-  if (process.env.NODE_ENV === "production") {
-    throw new Error("SAFETY CHECK FAILED: Refusing to run tests in production.");
+
+  // 2. Remove test-created account session indexes
+  const accountList = Array.from(accountIds);
+  for (const accountId of accountList) {
+    if (!accountId) continue;
+    pipeline.del(`account_sessions:${accountId}`);
   }
-  const lowerName = databaseName.toLowerCase();
-  if (lowerName.includes("prod") || lowerName.includes("production")) {
-    throw new Error(`SAFETY CHECK FAILED: '${databaseName}' appears to be production.`);
-  }
-  const lowerHost = host.toLowerCase();
-  if (lowerHost.includes("prod") || lowerHost.includes("production")) {
-    throw new Error(`SAFETY CHECK FAILED: '${host}' appears to be production.`);
-  }
+
+  await pipeline.exec();
 }
 
 async function isPortReachable(port: number, host: string, timeoutMs = 1000): Promise<boolean> {
@@ -92,16 +92,22 @@ async function isPortReachable(port: number, host: string, timeoutMs = 1000): Pr
   });
 }
 
-describe("End-to-End Authentication & Security Verification Suite (Task 10.7)", () => {
+describe("End-to-End Authentication & Security Verification Suite (Task 10.7-R1)", () => {
   const createdAccountIds = new Set<string>();
   const createdEmails = new Set<string>();
   const createdFamilyIds = new Set<string>();
 
   beforeAll(async () => {
-    // 1. Validate and connect to PostgreSQL
-    const databaseUrl = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
-    const dbConfig = parseDatabaseConfig(databaseUrl);
-    assertTestDatabaseSafety(dbConfig.database, dbConfig.host);
+    // 1. Validate and connect to PostgreSQL strictly requiring TEST_DATABASE_URL
+    const testDatabaseUrl = process.env.TEST_DATABASE_URL;
+    if (!testDatabaseUrl || typeof testDatabaseUrl !== "string" || testDatabaseUrl.trim().length === 0) {
+      throw new Error(
+        "TEST DATABASE SAFETY ERROR: TEST_DATABASE_URL must be explicitly set for destructive integration tests. Falling back to DATABASE_URL is strictly forbidden."
+      );
+    }
+
+    const dbConfig = parseDatabaseConfig(testDatabaseUrl);
+    assertTestDatabaseSafety(dbConfig.database, dbConfig.host, { testDatabaseUrl });
 
     const isDbReachable = await isPortReachable(dbConfig.port, dbConfig.host, 1500);
     if (!isDbReachable) {
@@ -109,12 +115,12 @@ describe("End-to-End Authentication & Security Verification Suite (Task 10.7)", 
     }
 
     testPrisma = new PrismaClient({
-      datasources: { db: { url: databaseUrl } },
+      datasources: { db: { url: testDatabaseUrl } },
       log: PRISMA_LOG_CONFIG,
     });
     await testPrisma.$connect();
 
-    // Verify DB identity
+    // Verify DB identity matches test database name
     const identityResult = await testPrisma.$queryRaw<Array<{ current_database: string }>>`
       SELECT current_database();
     `;
@@ -145,18 +151,62 @@ describe("End-to-End Authentication & Security Verification Suite (Task 10.7)", 
       corsOrigins: ["http://localhost:3000", "https://mytravelroad.com"],
     });
 
-    // 4. Create dedicated role testing app
+    // 4. Create dedicated role testing app covering all 5 discrete caller tiers
     testRoleApp = express();
     testRoleApp.use(express.json());
     const authMiddleware = createAuthenticateMiddleware(testPrisma);
+
+    // Tier 1: Traveler-only endpoint
     testRoleApp.get(
-      "/api/v1/test/curator-only",
+      "/api/v1/test/role/traveler",
+      authMiddleware,
+      requireRole("traveler"),
+      (_req, res) => {
+        res.status(200).json({ success: true, message: "Traveler access granted" });
+      }
+    );
+
+    // Tier 2: Contributor draft endpoint (contributor, curator, super_admin)
+    testRoleApp.get(
+      "/api/v1/test/role/contributor",
+      authMiddleware,
+      requireRole("contributor", "curator", "super_admin"),
+      (_req, res) => {
+        res.status(200).json({ success: true, message: "Contributor access granted" });
+      }
+    );
+
+    // Tier 3: Curator verification endpoint (curator, super_admin)
+    testRoleApp.get(
+      "/api/v1/test/role/curator",
       authMiddleware,
       requireRole("curator", "super_admin"),
       (_req, res) => {
         res.status(200).json({ success: true, message: "Curator access granted" });
       }
     );
+
+    // Tier 4: Moderator queue endpoint (moderator, super_admin)
+    testRoleApp.get(
+      "/api/v1/test/role/moderator",
+      authMiddleware,
+      requireRole("moderator", "super_admin"),
+      (_req, res) => {
+        res.status(200).json({ success: true, message: "Moderator access granted" });
+      }
+    );
+
+    // Tier 5: Super Admin only endpoint
+    testRoleApp.get(
+      "/api/v1/test/role/super-admin",
+      authMiddleware,
+      requireRole("super_admin"),
+      (_req, res) => {
+        res.status(200).json({ success: true, message: "Super admin access granted" });
+      }
+    );
+
+    // Email verification requirement check
     testRoleApp.post(
       "/api/v1/test/verified-only-mutation",
       authMiddleware,
@@ -165,6 +215,7 @@ describe("End-to-End Authentication & Security Verification Suite (Task 10.7)", 
         res.status(200).json({ success: true, message: "Mutation permitted" });
       }
     );
+
     testRoleApp.use(errorHandler);
   });
 
@@ -172,7 +223,7 @@ describe("End-to-End Authentication & Security Verification Suite (Task 10.7)", 
     // Final DB cleanup
     const ids = Array.from(createdAccountIds).filter(Boolean);
     const emails = Array.from(createdEmails).filter(Boolean);
-    if (ids.length > 0 || emails.length > 0) {
+    if (testPrisma && (ids.length > 0 || emails.length > 0)) {
       await testPrisma.account.deleteMany({
         where: {
           OR: [
@@ -184,14 +235,11 @@ describe("End-to-End Authentication & Security Verification Suite (Task 10.7)", 
     }
     await testPrisma?.$disconnect();
 
-    // Final Redis cleanup
-    for (const familyId of Array.from(createdFamilyIds)) {
-      const keys = await realRedis.keys(`*{${familyId}}*`);
-      if (keys.length > 0) {
-        await realRedis.del(...keys);
-      }
+    // Final targeted Redis cleanup
+    if (realRedis) {
+      await cleanupTestRedisData(realRedis, createdFamilyIds, createdAccountIds);
+      await realRedis.quit();
     }
-    await realRedis?.quit();
   });
 
   beforeEach(() => {
@@ -204,7 +252,7 @@ describe("End-to-End Authentication & Security Verification Suite (Task 10.7)", 
     // Clean up created accounts after each test to keep DB isolated
     const ids = Array.from(createdAccountIds).filter(Boolean);
     const emails = Array.from(createdEmails).filter(Boolean);
-    if (ids.length > 0 || emails.length > 0) {
+    if (testPrisma && (ids.length > 0 || emails.length > 0)) {
       await testPrisma.account.deleteMany({
         where: {
           OR: [
@@ -216,14 +264,12 @@ describe("End-to-End Authentication & Security Verification Suite (Task 10.7)", 
       createdAccountIds.clear();
       createdEmails.clear();
     }
-    // Clean up created Redis families
-    for (const familyId of Array.from(createdFamilyIds)) {
-      const keys = await realRedis.keys(`*{${familyId}}*`);
-      if (keys.length > 0) {
-        await realRedis.del(...keys);
-      }
+
+    // Targeted Redis cleanup for tracked test families and accounts
+    if (realRedis) {
+      await cleanupTestRedisData(realRedis, createdFamilyIds, ids);
+      createdFamilyIds.clear();
     }
-    createdFamilyIds.clear();
   });
 
   // Helper to extract cookie value
@@ -275,7 +321,6 @@ describe("End-to-End Authentication & Security Verification Suite (Task 10.7)", 
     expect(registerRes.body.data.account.status).toBe("pending_verification");
     expect(registerRes.body.data.profile.displayName).toBe("Amina Rahman");
     expect(registerRes.body.data.profile.handle).toBe(handle);
-    // Assert registration does not leak passwords or issue tokens/cookies
     expect((registerRes.body.data as any).passwordHash).toBeUndefined();
     expect((registerRes.body.data as any).accessToken).toBeUndefined();
     expect(registerRes.headers["set-cookie"]).toBeUndefined();
@@ -294,13 +339,11 @@ describe("End-to-End Authentication & Security Verification Suite (Task 10.7)", 
     expect(loginRes.body.data.tokenType).toBe("Bearer");
     expect(loginRes.body.data.expiresIn).toBe(900);
     expect(loginRes.body.data.account.id).toBe(accountId);
-    // Raw refresh token must NOT leak in JSON body
     expect(loginRes.body.data.rawRefreshToken).toBeUndefined();
 
     const accessToken1 = loginRes.body.data.accessToken;
     expect(typeof accessToken1).toBe("string");
 
-    // Cookie must be set with correct security flags
     const cookieHeader = loginRes.headers["set-cookie"];
     expect(cookieHeader).toBeDefined();
     const rawRefreshToken1 = extractCookie(loginRes, REFRESH_COOKIE_NAME);
@@ -311,7 +354,6 @@ describe("End-to-End Authentication & Security Verification Suite (Task 10.7)", 
     expect(familyId).toBeTruthy();
     createdFamilyIds.add(familyId);
 
-    // Verify cookie attributes
     const rawCookieStr = Array.isArray(cookieHeader) ? cookieHeader[0] : String(cookieHeader);
     expect(rawCookieStr.toLowerCase()).toContain("httponly");
     expect(rawCookieStr.toLowerCase()).toContain("samesite=strict");
@@ -874,72 +916,237 @@ describe("End-to-End Authentication & Security Verification Suite (Task 10.7)", 
   });
 
   // =========================================================================
-  // SCENARIO 11: Role-Based Access Control & Email Verification
+  // SCENARIO 11: Complete 5-Role Authorization Matrix Coverage (Discrete Roles)
   // =========================================================================
-  it("Scenario 11: Role authorization matrix (discrete non-inheriting roles) and email verification", async () => {
-    const uniqueSuffix = crypto.randomBytes(4).toString("hex");
-    const travelerAccount = await testPrisma.account.create({
+  it("Scenario 11: Full 5-role authorization matrix coverage with live database-backed accounts", async () => {
+    // 1. Create real database-backed accounts for all 5 discrete roles
+    const suffix = crypto.randomBytes(4).toString("hex");
+
+    const [travelerAcct, contributorAcct, curatorAcct, moderatorAcct, superAdminAcct] =
+      await Promise.all([
+        testPrisma.account.create({
+          data: {
+            email: `traveler_${suffix}@example.com`,
+            role: "traveler",
+            status: "active",
+            type: "individual",
+            emailVerified: true,
+          },
+        }),
+        testPrisma.account.create({
+          data: {
+            email: `contributor_${suffix}@example.com`,
+            role: "contributor",
+            status: "active",
+            type: "individual",
+            emailVerified: true,
+          },
+        }),
+        testPrisma.account.create({
+          data: {
+            email: `curator_${suffix}@example.com`,
+            role: "curator",
+            status: "active",
+            type: "individual",
+            emailVerified: true,
+          },
+        }),
+        testPrisma.account.create({
+          data: {
+            email: `moderator_${suffix}@example.com`,
+            role: "moderator",
+            status: "active",
+            type: "individual",
+            emailVerified: true,
+          },
+        }),
+        testPrisma.account.create({
+          data: {
+            email: `superadmin_${suffix}@example.com`,
+            role: "super_admin",
+            status: "active",
+            type: "individual",
+            emailVerified: true,
+          },
+        }),
+      ]);
+
+    // Track for cleanup
+    createdAccountIds.add(travelerAcct.id);
+    createdAccountIds.add(contributorAcct.id);
+    createdAccountIds.add(curatorAcct.id);
+    createdAccountIds.add(moderatorAcct.id);
+    createdAccountIds.add(superAdminAcct.id);
+
+    // 2. Sign tokens for each real account
+    const [travelerTok, contributorTok, curatorTok, moderatorTok, superAdminTok] =
+      await Promise.all([
+        signAccessToken({
+          sub: travelerAcct.id,
+          email: travelerAcct.email,
+          role: "traveler",
+          status: "active",
+          type: "individual",
+          emailVerified: true,
+          gen: 1,
+        }),
+        signAccessToken({
+          sub: contributorAcct.id,
+          email: contributorAcct.email,
+          role: "contributor",
+          status: "active",
+          type: "individual",
+          emailVerified: true,
+          gen: 1,
+        }),
+        signAccessToken({
+          sub: curatorAcct.id,
+          email: curatorAcct.email,
+          role: "curator",
+          status: "active",
+          type: "individual",
+          emailVerified: true,
+          gen: 1,
+        }),
+        signAccessToken({
+          sub: moderatorAcct.id,
+          email: moderatorAcct.email,
+          role: "moderator",
+          status: "active",
+          type: "individual",
+          emailVerified: true,
+          gen: 1,
+        }),
+        signAccessToken({
+          sub: superAdminAcct.id,
+          email: superAdminAcct.email,
+          role: "super_admin",
+          status: "active",
+          type: "individual",
+          emailVerified: true,
+          gen: 1,
+        }),
+      ]);
+
+    // 3. Test Traveler:
+    // Permitted: traveler endpoint
+    // Denied: contributor, curator, moderator, super-admin endpoints
+    const r1 = await request(testRoleApp).get("/api/v1/test/role/traveler").set("Authorization", `Bearer ${travelerTok}`);
+    expect(r1.status).toBe(200);
+    const r2 = await request(testRoleApp).get("/api/v1/test/role/contributor").set("Authorization", `Bearer ${travelerTok}`);
+    expect(r2.status).toBe(403);
+    const r3 = await request(testRoleApp).get("/api/v1/test/role/curator").set("Authorization", `Bearer ${travelerTok}`);
+    expect(r3.status).toBe(403);
+    const r4 = await request(testRoleApp).get("/api/v1/test/role/moderator").set("Authorization", `Bearer ${travelerTok}`);
+    expect(r4.status).toBe(403);
+    const r5 = await request(testRoleApp).get("/api/v1/test/role/super-admin").set("Authorization", `Bearer ${travelerTok}`);
+    expect(r5.status).toBe(403);
+
+    // 4. Test Contributor:
+    // Permitted: contributor endpoint
+    // Denied: traveler, curator, moderator, super-admin endpoints
+    const c1 = await request(testRoleApp).get("/api/v1/test/role/traveler").set("Authorization", `Bearer ${contributorTok}`);
+    expect(c1.status).toBe(403);
+    const c2 = await request(testRoleApp).get("/api/v1/test/role/contributor").set("Authorization", `Bearer ${contributorTok}`);
+    expect(c2.status).toBe(200);
+    const c3 = await request(testRoleApp).get("/api/v1/test/role/curator").set("Authorization", `Bearer ${contributorTok}`);
+    expect(c3.status).toBe(403);
+    const c4 = await request(testRoleApp).get("/api/v1/test/role/moderator").set("Authorization", `Bearer ${contributorTok}`);
+    expect(c4.status).toBe(403);
+    const c5 = await request(testRoleApp).get("/api/v1/test/role/super-admin").set("Authorization", `Bearer ${contributorTok}`);
+    expect(c5.status).toBe(403);
+
+    // 5. Test Curator:
+    // Permitted: contributor endpoint, curator endpoint
+    // Denied: traveler, moderator, super-admin endpoints
+    const cu1 = await request(testRoleApp).get("/api/v1/test/role/traveler").set("Authorization", `Bearer ${curatorTok}`);
+    expect(cu1.status).toBe(403);
+    const cu2 = await request(testRoleApp).get("/api/v1/test/role/contributor").set("Authorization", `Bearer ${curatorTok}`);
+    expect(cu2.status).toBe(200);
+    const cu3 = await request(testRoleApp).get("/api/v1/test/role/curator").set("Authorization", `Bearer ${curatorTok}`);
+    expect(cu3.status).toBe(200);
+    const cu4 = await request(testRoleApp).get("/api/v1/test/role/moderator").set("Authorization", `Bearer ${curatorTok}`);
+    expect(cu4.status).toBe(403);
+    const cu5 = await request(testRoleApp).get("/api/v1/test/role/super-admin").set("Authorization", `Bearer ${curatorTok}`);
+    expect(cu5.status).toBe(403);
+
+    // 6. Test Moderator:
+    // Permitted: moderator endpoint
+    // Denied: traveler, contributor, curator, super-admin endpoints
+    const m1 = await request(testRoleApp).get("/api/v1/test/role/traveler").set("Authorization", `Bearer ${moderatorTok}`);
+    expect(m1.status).toBe(403);
+    const m2 = await request(testRoleApp).get("/api/v1/test/role/contributor").set("Authorization", `Bearer ${moderatorTok}`);
+    expect(m2.status).toBe(403);
+    const m3 = await request(testRoleApp).get("/api/v1/test/role/curator").set("Authorization", `Bearer ${moderatorTok}`);
+    expect(m3.status).toBe(403);
+    const m4 = await request(testRoleApp).get("/api/v1/test/role/moderator").set("Authorization", `Bearer ${moderatorTok}`);
+    expect(m4.status).toBe(200);
+    const m5 = await request(testRoleApp).get("/api/v1/test/role/super-admin").set("Authorization", `Bearer ${moderatorTok}`);
+    expect(m5.status).toBe(403);
+
+    // 7. Test Super Admin:
+    // Permitted: contributor, curator, moderator, super-admin endpoints
+    // Denied: traveler endpoint (discrete roles: zero implicit inheritance!)
+    const sa1 = await request(testRoleApp).get("/api/v1/test/role/traveler").set("Authorization", `Bearer ${superAdminTok}`);
+    expect(sa1.status).toBe(403);
+    const sa2 = await request(testRoleApp).get("/api/v1/test/role/contributor").set("Authorization", `Bearer ${superAdminTok}`);
+    expect(sa2.status).toBe(200);
+    const sa3 = await request(testRoleApp).get("/api/v1/test/role/curator").set("Authorization", `Bearer ${superAdminTok}`);
+    expect(sa3.status).toBe(200);
+    const sa4 = await request(testRoleApp).get("/api/v1/test/role/moderator").set("Authorization", `Bearer ${superAdminTok}`);
+    expect(sa4.status).toBe(200);
+    const sa5 = await request(testRoleApp).get("/api/v1/test/role/super-admin").set("Authorization", `Bearer ${superAdminTok}`);
+    expect(sa5.status).toBe(200);
+
+    // 8. Test Email Verification Enforcement on Mutating Endpoint
+    const unverifiedAcct = await testPrisma.account.create({
       data: {
-        email: `traveler_${uniqueSuffix}@example.com`,
-        role: "traveler",
+        email: `unverified_${suffix}@example.com`,
+        role: "contributor",
         status: "active",
         type: "individual",
         emailVerified: false,
       },
     });
-    createdAccountIds.add(travelerAccount.id);
+    createdAccountIds.add(unverifiedAcct.id);
 
-    const realTravelerToken = await signAccessToken({
-      sub: travelerAccount.id,
-      email: travelerAccount.email,
-      role: "traveler",
+    const unverifiedTok = await signAccessToken({
+      sub: unverifiedAcct.id,
+      email: unverifiedAcct.email,
+      role: "contributor",
       status: "active",
       type: "individual",
       emailVerified: false,
       gen: 1,
     });
 
-    // Attempt curator-only endpoint -> 403 FORBIDDEN_ACCESS
-    const curatorRes = await request(testRoleApp)
-      .get("/api/v1/test/curator-only")
-      .set("Authorization", `Bearer ${realTravelerToken}`);
-    expect(curatorRes.status).toBe(403);
-    expect(curatorRes.body.error.code).toBe(ErrorCode.FORBIDDEN_ACCESS);
-
-    // Attempt mutation requiring verified email -> 403 EMAIL_VERIFICATION_REQUIRED
-    const mutationRes = await request(testRoleApp)
+    const unverifiedRes = await request(testRoleApp)
       .post("/api/v1/test/verified-only-mutation")
-      .set("Authorization", `Bearer ${realTravelerToken}`);
-    expect(mutationRes.status).toBe(403);
-    expect(mutationRes.body.error.code).toBe(ErrorCode.EMAIL_VERIFICATION_REQUIRED);
+      .set("Authorization", `Bearer ${unverifiedTok}`);
+    expect(unverifiedRes.status).toBe(403);
+    expect(unverifiedRes.body.error.code).toBe(ErrorCode.EMAIL_VERIFICATION_REQUIRED);
 
-    // Now promote account to curator and set emailVerified = true in PostgreSQL
+    // Update to verified -> 200 OK
     await testPrisma.account.update({
-      where: { id: travelerAccount.id },
-      data: { role: "curator", emailVerified: true },
+      where: { id: unverifiedAcct.id },
+      data: { emailVerified: true },
     });
 
-    const curatorToken = await signAccessToken({
-      sub: travelerAccount.id,
-      email: travelerAccount.email,
-      role: "curator",
+    const verifiedTok = await signAccessToken({
+      sub: unverifiedAcct.id,
+      email: unverifiedAcct.email,
+      role: "contributor",
       status: "active",
       type: "individual",
       emailVerified: true,
       gen: 1,
     });
 
-    const curatorSuccess = await request(testRoleApp)
-      .get("/api/v1/test/curator-only")
-      .set("Authorization", `Bearer ${curatorToken}`);
-    expect(curatorSuccess.status).toBe(200);
-    expect(curatorSuccess.body.message).toBe("Curator access granted");
-
-    const mutationSuccess = await request(testRoleApp)
+    const verifiedRes = await request(testRoleApp)
       .post("/api/v1/test/verified-only-mutation")
-      .set("Authorization", `Bearer ${curatorToken}`);
-    expect(mutationSuccess.status).toBe(200);
-    expect(mutationSuccess.body.message).toBe("Mutation permitted");
+      .set("Authorization", `Bearer ${verifiedTok}`);
+    expect(verifiedRes.status).toBe(200);
+    expect(verifiedRes.body.message).toBe("Mutation permitted");
   });
 
   // =========================================================================
@@ -978,5 +1185,99 @@ describe("End-to-End Authentication & Security Verification Suite (Task 10.7)", 
 
     expect(res.status).toBe(413);
     expect(res.body.error.message).toContain("maximum allowed size: 100kb");
+  });
+
+  // =========================================================================
+  // SCENARIO 14: Missing/Deleted Account on GET /me (HTTP 401 AUTHENTICATION_REQUIRED)
+  // =========================================================================
+  it("Scenario 14: GET /api/v1/auth/me missing/deleted account returns 401 AUTHENTICATION_REQUIRED", async () => {
+    const uniqueSuffix = crypto.randomBytes(4).toString("hex");
+    const email = `deleted_${uniqueSuffix}@example.com`;
+    const password = "StrongPassword123!";
+
+    const reg = await request(app)
+      .post("/api/v1/auth/register")
+      .send({
+        email,
+        password,
+        displayName: "Deleted User",
+        handle: `deleted_${uniqueSuffix}`,
+      });
+    expect(reg.status).toBe(201);
+    const accountId = reg.body.data.account.id;
+
+    // Login to obtain active access token
+    const loginRes = await request(app)
+      .post("/api/v1/auth/login")
+      .send({ email, password });
+    expect(loginRes.status).toBe(200);
+    const accessToken = loginRes.body.data.accessToken;
+
+    // Delete account from PostgreSQL directly
+    await testPrisma.account.delete({
+      where: { id: accountId },
+    });
+
+    // Call GET /api/v1/auth/me with access token
+    const meRes = await request(app)
+      .get("/api/v1/auth/me")
+      .set("Authorization", `Bearer ${accessToken}`);
+
+    expect(meRes.status).toBe(401);
+    expect(meRes.body.success).toBe(false);
+    expect(meRes.body.error.code).toBe(ErrorCode.AUTHENTICATION_REQUIRED);
+    expect(meRes.body.error.message).toContain("Account not found or no longer active");
+  });
+
+  // =========================================================================
+  // SCENARIO 15: Redis Test Cleanup Verification
+  // =========================================================================
+  it("Scenario 15: Redis test cleanup leaves zero orphaned family keys and zero orphaned account-session entries", async () => {
+    const uniqueSuffix = crypto.randomBytes(4).toString("hex");
+    const email = `cleanup_${uniqueSuffix}@example.com`;
+    const password = "StrongPassword123!";
+
+    const reg = await request(app)
+      .post("/api/v1/auth/register")
+      .send({
+        email,
+        password,
+        displayName: "Cleanup Verification",
+        handle: `cleanup_${uniqueSuffix}`,
+      });
+    expect(reg.status).toBe(201);
+    const accountId = reg.body.data.account.id;
+    createdAccountIds.add(accountId);
+    createdEmails.add(email);
+
+    // Login to create active family, session, token_lookup, and account_sessions in Redis
+    const loginRes = await request(app)
+      .post("/api/v1/auth/login")
+      .send({ email, password });
+    expect(loginRes.status).toBe(200);
+
+    const rawRefreshToken = extractCookie(loginRes, REFRESH_COOKIE_NAME)!;
+    const familyId = extractFamilyId(rawRefreshToken);
+    expect(familyId).toBeTruthy();
+
+    // Verify keys exist in Redis before cleanup
+    const familyKeyExists = await realRedis.exists(`family:{${familyId}}`);
+    const accountSessionsExists = await realRedis.exists(`account_sessions:${accountId}`);
+    expect(familyKeyExists).toBe(1);
+    expect(accountSessionsExists).toBe(1);
+
+    const sessionKeysBefore = await realRedis.keys(`*{${familyId}}*`);
+    expect(sessionKeysBefore.length).toBeGreaterThanOrEqual(3);
+
+    // Run targeted cleanup
+    await cleanupTestRedisData(realRedis, [familyId], [accountId]);
+
+    // Verify zero orphaned family keys remain in Redis
+    const sessionKeysAfter = await realRedis.keys(`*{${familyId}}*`);
+    expect(sessionKeysAfter.length).toBe(0);
+
+    // Verify zero orphaned account_sessions entries remain in Redis
+    const accountSessionsAfter = await realRedis.exists(`account_sessions:${accountId}`);
+    expect(accountSessionsAfter).toBe(0);
   });
 });

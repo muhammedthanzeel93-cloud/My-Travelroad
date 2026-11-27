@@ -26,7 +26,8 @@ import {
   csrfProtectionMiddleware,
   createAuthenticateMiddleware,
 } from "../middleware";
-import { BadRequestError } from "../errors/app-error";
+import { BadRequestError, UnauthorizedError } from "../errors/app-error";
+import { ErrorCode } from "../errors/error-codes";
 import { env } from "../../config/env";
 import { ApiSuccessResponse } from "../types/response.types";
 
@@ -278,7 +279,10 @@ export function createAuthRouter(options: AuthRouterOptions = {}): Router {
         });
 
         if (!account) {
-          throw new BadRequestError("Account not found");
+          throw new UnauthorizedError(
+            "Account not found or no longer active",
+            ErrorCode.AUTHENTICATION_REQUIRED
+          );
         }
 
         const response: ApiSuccessResponse<{
