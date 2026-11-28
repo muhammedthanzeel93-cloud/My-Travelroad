@@ -91,13 +91,32 @@ export class DestinationService {
         )
       `;
     } catch (err) {
+      let errorCategory = "UNKNOWN_DATABASE_ERROR";
+      if (err instanceof Prisma.PrismaClientKnownRequestError) {
+        const isStandardCode = /^P\d{4}$/.test(err.code);
+        errorCategory = isStandardCode
+          ? `PRISMA_KNOWN_REQUEST_ERROR_${err.code}`
+          : "PRISMA_KNOWN_REQUEST_ERROR";
+      } else if (err instanceof Prisma.PrismaClientUnknownRequestError) {
+        errorCategory = "PRISMA_UNKNOWN_REQUEST_ERROR";
+      } else if (err instanceof Prisma.PrismaClientRustPanicError) {
+        errorCategory = "PRISMA_RUST_PANIC_ERROR";
+      } else if (err instanceof Prisma.PrismaClientInitializationError) {
+        errorCategory = "PRISMA_INITIALIZATION_ERROR";
+      } else if (err instanceof Prisma.PrismaClientValidationError) {
+        errorCategory = "PRISMA_VALIDATION_ERROR";
+      } else if (err instanceof Error) {
+        errorCategory = "GENERIC_DATABASE_ERROR";
+      }
+
       logger.error(
         {
-          err,
+          errorCode: "AUDIT_LOG_PERSISTENCE_FAILED",
           actorAccountId: params.actor.accountId,
           action: params.action,
           entityType: params.entityType,
           entityId: params.entityId,
+          errorCategory,
         },
         "Audit log recording failed"
       );

@@ -22,12 +22,13 @@ import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import net from "node:net";
 import crypto from "node:crypto";
 import request from "supertest";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, Prisma } from "@prisma/client";
 import Redis from "ioredis";
 import { createApp } from "../../../src/server/app";
 import { RedisSessionStore } from "../../../src/server/redis/session.store";
 import { PRISMA_LOG_CONFIG } from "../../../src/lib/db";
 import { signAccessToken } from "../../../src/server/auth/jwt";
+import { logger } from "../../../src/config/logger";
 import {
   parseDatabaseConfig,
   assertTestDatabaseSafety,
@@ -895,29 +896,67 @@ describe("Destination Management Integration Test Suite (Task 11)", () => {
       spy.mockRestore();
     });
 
-    it("should fail closed and return generic AUDIT_LOG_FAILURE message without leaking internal database exception details", async () => {
-      const spy = vi
-        .spyOn(DestinationService.prototype as any, "recordAuditLog")
-        .mockImplementationOnce(async () => {
-          throw new AppError(
-            500,
-            ErrorCode.AUDIT_LOG_FAILURE,
-            "Failed to record mandatory audit log"
-          );
+    it("should sanitize audit failure diagnostics and never leak raw SQL, parameters, stack traces, or credentials to logger", async () => {
+      const loggerSpy = vi.spyOn(logger, "error");
+
+      // Mock testPrisma.auditLog.create to reject with a simulated Prisma error containing sensitive SQL & parameters
+      const simulatedPrismaError = new Prisma.PrismaClientKnownRequestError(
+        "Invalid `tx.auditLog.create()` invocation:\n" +
+          "INSERT INTO audit_logs (actor_account_id, token, coordinates) VALUES ('secret_actor_id', 'secret_token_123', 'POINT(77.2333 9.4667)');\n" +
+          "PostgreSQL error: relation 'audit_logs' does not exist at character 13",
+        {
+          code: "P2002",
+          clientVersion: "5.14.0",
+        }
+      );
+
+      const origTransaction = testPrisma.$transaction.bind(testPrisma);
+      const txSpy = vi.spyOn(testPrisma, "$transaction").mockImplementation(async (callback: any) => {
+        return origTransaction(async (tx: any) => {
+          vi.spyOn(tx.auditLog, "create").mockRejectedValueOnce(simulatedPrismaError);
+          return callback(tx);
         });
+      });
 
       const res = await request(app)
         .get(`/api/v1/admin/destinations/${restrictedDestId}`)
         .set("Authorization", `Bearer ${curator.token}`)
         .expect(500);
 
+      // 1. Client receives generic error without coordinates or DB exceptions
       expect(res.body.error.code).toBe("AUDIT_LOG_FAILURE");
       expect(res.body.error.message).toBe("Failed to record mandatory audit log");
-      expect(res.body.error.message).not.toContain("PostgreSQL");
-      expect(res.body.error.message).not.toContain("syntax error");
       expect(res.body.data).toBeUndefined();
 
-      spy.mockRestore();
+      // 2. Logger spy captured controlled diagnostic structure
+      expect(loggerSpy).toHaveBeenCalled();
+      const matchedCall = loggerSpy.mock.calls.find(
+        (call) => (call[0] as Record<string, any>)?.errorCode === "AUDIT_LOG_PERSISTENCE_FAILED"
+      );
+      expect(matchedCall).toBeDefined();
+
+      const [rawPayload, loggedMsg] = matchedCall!;
+      const loggedPayload = rawPayload as Record<string, any>;
+      expect(loggedMsg).toBe("Audit log recording failed");
+      expect(loggedPayload.errorCode).toBe("AUDIT_LOG_PERSISTENCE_FAILED");
+      expect(loggedPayload.actorAccountId).toBe(curator.id);
+      expect(loggedPayload.action).toBe("destination.privileged_location_read");
+      expect(loggedPayload.entityType).toBe("destination");
+      expect(loggedPayload.entityId).toBe(restrictedDestId);
+      expect(loggedPayload.errorCategory).toBe("PRISMA_KNOWN_REQUEST_ERROR_P2002");
+
+      // 3. String representation must NOT contain raw SQL, parameters, error messages, stack traces, or coordinates
+      const serializedLog = JSON.stringify(loggedPayload);
+      expect(loggedPayload).not.toHaveProperty("err");
+      expect(loggedPayload).not.toHaveProperty("stack");
+      expect(loggedPayload).not.toHaveProperty("message");
+      expect(serializedLog).not.toContain("INSERT INTO");
+      expect(serializedLog).not.toContain("secret_token_123");
+      expect(serializedLog).not.toContain("POINT(77.2333 9.4667)");
+      expect(serializedLog).not.toContain("relation 'audit_logs' does not exist");
+
+      txSpy.mockRestore();
+      loggerSpy.mockRestore();
     });
 
     it("should reject traveler access to admin destination detail with 403 Forbidden", async () => {
@@ -1095,6 +1134,49 @@ describe("Destination Management Integration Test Suite (Task 11)", () => {
           expect(next).not.toHaveProperty("formattedAddress");
         }
       }
+    });
+
+    it("should rollback database transaction when audit log insertion fails during destination update", async () => {
+      // Record initial destination state
+      const initialDest = await testPrisma.destination.findUnique({
+        where: { id: updateDestId },
+      });
+      const originalDesc = initialDest?.shortDescription;
+
+      // Mock audit log creation to fail with a simulated Prisma error
+      const simulatedPrismaError = new Prisma.PrismaClientKnownRequestError(
+        "Simulated audit failure during transaction with secret SQL parameters",
+        {
+          code: "P2002",
+          clientVersion: "5.14.0",
+        }
+      );
+      const origTransaction = testPrisma.$transaction.bind(testPrisma);
+      const txSpy = vi.spyOn(testPrisma, "$transaction").mockImplementation(async (callback: any) => {
+        return origTransaction(async (tx: any) => {
+          vi.spyOn(tx.auditLog, "create").mockRejectedValueOnce(simulatedPrismaError);
+          return callback(tx);
+        });
+      });
+
+      const res = await request(app)
+        .patch(`/api/v1/admin/destinations/${updateDestId}`)
+        .set("Authorization", `Bearer ${curator.token}`)
+        .send({
+          shortDescription: "This description update must be rolled back on audit failure.",
+        })
+        .expect(500);
+
+      expect(res.body.error.code).toBe("AUDIT_LOG_FAILURE");
+      expect(res.body.error.message).toBe("Failed to record mandatory audit log");
+
+      // Verify transaction rollback: destination record in DB must retain its original description!
+      const afterDest = await testPrisma.destination.findUnique({
+        where: { id: updateDestId },
+      });
+      expect(afterDest?.shortDescription).toBe(originalDesc);
+
+      txSpy.mockRestore();
     });
   });
 
