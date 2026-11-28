@@ -36,15 +36,25 @@ export const nearestTransitHubSchema = z
   .strict();
 
 /**
- * Destination location input schema.
+ * Authoritative restriction reasons permitted in the database check constraint ck_locations_restriction_reason.
  */
-export const destinationLocationInputSchema = z
+export const RESTRICTION_REASONS = [
+  "wildlife_protection",
+  "tribal_settlement",
+  "defense_boundary",
+  "hazardous_terrain",
+  "private_property",
+] as const;
+
+export type RestrictionReason = (typeof RESTRICTION_REASONS)[number];
+
+export const baseDestinationLocationSchema = z
   .object({
     coordinates: coordinateTupleSchema,
     altitudeMeters: z.number().min(-500).max(9000).optional().nullable(),
     accuracyMeters: z.number().positive().max(1000).optional().nullable(),
     isRestricted: z.boolean().default(false),
-    restrictionReason: z.string().max(100).optional().nullable(),
+    restrictionReason: z.enum(RESTRICTION_REASONS).optional().nullable(),
     publicApproximateCentroid: coordinateTupleSchema.optional().nullable(),
     publicApproximateDisplayName: z.string().max(150).optional().nullable(),
     formattedAddress: z.string().min(5).max(500),
@@ -57,6 +67,25 @@ export const destinationLocationInputSchema = z
     nearestTransitHub: nearestTransitHubSchema.optional().nullable(),
   })
   .strict();
+
+/**
+ * Destination location input schema with strict restriction validation.
+ */
+export const destinationLocationInputSchema = baseDestinationLocationSchema.superRefine(
+  (data, ctx) => {
+    if (data.isRestricted) {
+      if (!data.publicApproximateDisplayName || data.publicApproximateDisplayName.trim().length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Restricted destinations must specify a publicApproximateDisplayName",
+          path: ["publicApproximateDisplayName"],
+        });
+      }
+    }
+  }
+);
+
+export const updateDestinationLocationSchema = baseDestinationLocationSchema.partial();
 
 /**
  * Opening hours day schedule schema.
@@ -84,7 +113,47 @@ export const dayScheduleSchema = z
       .optional()
       .nullable(),
   })
-  .strict();
+  .strict()
+  .superRefine((data, ctx) => {
+    if (data.isClosed) {
+      if (data.openTime != null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Closed days must not specify an openTime",
+          path: ["openTime"],
+        });
+      }
+      if (data.closeTime != null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Closed days must not specify a closeTime",
+          path: ["closeTime"],
+        });
+      }
+    } else {
+      if (!data.openTime) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Open days must specify an openTime in HH:mm format",
+          path: ["openTime"],
+        });
+      }
+      if (!data.closeTime) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Open days must specify a closeTime in HH:mm format",
+          path: ["closeTime"],
+        });
+      }
+      if (data.openTime && data.closeTime && data.openTime === data.closeTime) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "openTime and closeTime cannot be identical (zero duration)",
+          path: ["closeTime"],
+        });
+      }
+    }
+  });
 
 /**
  * Admission fee structure schema.
@@ -102,7 +171,38 @@ export const feeStructureSchema = z
     ticketBookingUrl: z.string().url().max(500).optional().nullable(),
     specialPermitRequired: z.boolean().optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((data, ctx) => {
+    const feeValues = [
+      data.adultFee,
+      data.childFee,
+      data.foreignNationalFee,
+      data.stillCameraFee,
+      data.videoCameraFee,
+      data.vehicleParkingFee,
+    ].filter((v): v is number => typeof v === "number");
+
+    if (data.isFree) {
+      const positiveFees = feeValues.filter((v) => v > 0);
+      if (positiveFees.length > 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Free entry destinations must not specify positive admission fees",
+          path: ["isFree"],
+        });
+      }
+    } else {
+      const positiveFees = feeValues.filter((v) => v > 0);
+      if (positiveFees.length === 0 && !data.ticketBookingUrl && !data.specialPermitRequired) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            "Paid entry destinations must specify at least one positive fee amount, booking URL, or special permit requirement",
+          path: ["isFree"],
+        });
+      }
+    }
+  });
 
 /**
  * Destination opening hours schema.
@@ -110,13 +210,46 @@ export const feeStructureSchema = z
 export const destinationOpeningHoursSchema = z
   .object({
     type: z.enum(["always_open", "seasonal", "scheduled", "temporarily_closed"]),
-    weeklySchedule: z.array(dayScheduleSchema).optional().nullable(),
+    weeklySchedule: z
+      .array(dayScheduleSchema)
+      .max(7, "Weekly schedule cannot exceed 7 days")
+      .optional()
+      .nullable(),
     seasonalNotes: z.string().max(500).optional().nullable(),
     entryFeePolicy: z.enum(["free", "paid", "partially_paid", "restricted_permit"]),
     feeStructure: feeStructureSchema.optional().nullable(),
     advisoryNote: z.string().max(500).optional().nullable(),
   })
-  .strict();
+  .strict()
+  .superRefine((data, ctx) => {
+    if (data.weeklySchedule && data.weeklySchedule.length > 0) {
+      const daySet = new Set(data.weeklySchedule.map((d) => d.dayOfWeek));
+      if (daySet.size !== data.weeklySchedule.length) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Weekly schedule must not contain duplicate days of the week",
+          path: ["weeklySchedule"],
+        });
+      }
+    }
+
+    if (data.feeStructure) {
+      if (data.entryFeePolicy === "free" && !data.feeStructure.isFree) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "entryFeePolicy 'free' conflicts with feeStructure.isFree = false",
+          path: ["entryFeePolicy"],
+        });
+      }
+      if (data.entryFeePolicy === "paid" && data.feeStructure.isFree) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "entryFeePolicy 'paid' conflicts with feeStructure.isFree = true",
+          path: ["entryFeePolicy"],
+        });
+      }
+    }
+  });
 
 /**
  * Schema for POST /api/v1/admin/destinations (Create Destination Draft)
@@ -159,7 +292,7 @@ export const updateDestinationSchema = z
     primaryCategoryId: z.string().uuid().optional(),
     secondaryCategoryIds: z.array(z.string().uuid()).optional(),
     featuredRank: z.number().int().min(1).max(9999).optional().nullable(),
-    location: destinationLocationInputSchema.partial().optional(),
+    location: updateDestinationLocationSchema.optional(),
   })
   .strict();
 

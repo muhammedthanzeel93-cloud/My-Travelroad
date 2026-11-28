@@ -752,6 +752,47 @@ describe("Destination Management Integration Test Suite (Task 11)", () => {
       expect(res.body.data.publicLocalityName).toBe("Protected Settlement Area");
     });
 
+    it("should mask formattedAddress and exclude coordinates on public detail GET /api/v1/destinations/:slug", async () => {
+      // Tier 0: Unrestricted -> returns exact address
+      const res0 = await request(app)
+        .get(`/api/v1/destinations/${tier0Slug}`)
+        .expect(200);
+      expect(res0.body.data.locationSummary.isRestricted).toBe(false);
+      expect(res0.body.data.locationSummary.formattedAddress).toBe("Kovalam, Thiruvananthapuram");
+
+      // Tier 1: Restricted with centroid -> returns synthetic masked regional address, never raw address
+      const res1 = await request(app)
+        .get(`/api/v1/destinations/${tier1Slug}`)
+        .expect(200);
+      expect(res1.body.data.locationSummary.isRestricted).toBe(true);
+      expect(res1.body.data.locationSummary.formattedAddress).not.toContain("Deep Reserve");
+      expect(res1.body.data.locationSummary.formattedAddress).toBe("Ranni Forest Buffer Zone, pathanamthitta, Kerala, IN");
+      expect((res1.body.data.locationSummary as any).coordinates).toBeUndefined();
+
+      // Tier 2: Restricted without centroid -> returns synthetic masked regional address, never raw address
+      const res2 = await request(app)
+        .get(`/api/v1/destinations/${tier2Slug}`)
+        .expect(200);
+      expect(res2.body.data.locationSummary.isRestricted).toBe(true);
+      expect(res2.body.data.locationSummary.formattedAddress).not.toContain("Protected Area");
+      expect(res2.body.data.locationSummary.formattedAddress).toBe("Protected Settlement Area, kannur, Kerala, IN");
+      expect((res2.body.data.locationSummary as any).coordinates).toBeUndefined();
+    });
+
+    it("should suppress nearestTransitHub to null on public location for restricted destinations", async () => {
+      // Tier 1
+      const res1 = await request(app)
+        .get(`/api/v1/destinations/${tier1Slug}/location`)
+        .expect(200);
+      expect(res1.body.data.nearestTransitHub).toBeNull();
+
+      // Tier 2
+      const res2 = await request(app)
+        .get(`/api/v1/destinations/${tier2Slug}/location`)
+        .expect(200);
+      expect(res2.body.data.nearestTransitHub).toBeNull();
+    });
+
     it("should expose sub-resources: location, media, opening-hours", async () => {
       const locRes = await request(app)
         .get(`/api/v1/destinations/${tier0Slug}/location`)
@@ -849,6 +890,31 @@ describe("Destination Management Integration Test Suite (Task 11)", () => {
 
       expect(res.body.error.code).toBe("AUDIT_LOG_FAILURE");
       // Verify raw coordinates were never returned
+      expect(res.body.data).toBeUndefined();
+
+      spy.mockRestore();
+    });
+
+    it("should fail closed and return generic AUDIT_LOG_FAILURE message without leaking internal database exception details", async () => {
+      const spy = vi
+        .spyOn(DestinationService.prototype as any, "recordAuditLog")
+        .mockImplementationOnce(async () => {
+          throw new AppError(
+            500,
+            ErrorCode.AUDIT_LOG_FAILURE,
+            "Failed to record mandatory audit log"
+          );
+        });
+
+      const res = await request(app)
+        .get(`/api/v1/admin/destinations/${restrictedDestId}`)
+        .set("Authorization", `Bearer ${curator.token}`)
+        .expect(500);
+
+      expect(res.body.error.code).toBe("AUDIT_LOG_FAILURE");
+      expect(res.body.error.message).toBe("Failed to record mandatory audit log");
+      expect(res.body.error.message).not.toContain("PostgreSQL");
+      expect(res.body.error.message).not.toContain("syntax error");
       expect(res.body.data).toBeUndefined();
 
       spy.mockRestore();
@@ -982,6 +1048,53 @@ describe("Destination Management Integration Test Suite (Task 11)", () => {
         .expect(422);
 
       expect(res.body.error.code).toBe("VALIDATION_FAILED");
+    });
+
+    it("should serialize concurrent PATCH updates using row-level locking without telemetry privacy leaks", async () => {
+      // Execute 4 concurrent PATCH updates
+      const updatePromises = [1, 2, 3, 4].map((i) =>
+        request(app)
+          .patch(`/api/v1/admin/destinations/${updateDestId}`)
+          .set("Authorization", `Bearer ${curator.token}`)
+          .send({
+            shortDescription: `Concurrent update ${i} with sufficient descriptive length.`,
+          })
+      );
+
+      const results = await Promise.all(updatePromises);
+      for (const res of results) {
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+      }
+
+      // Verify audit logs telemetry records: ensure snapshots never leak coordinates, altitude, accuracy, or raw formatted address
+      const auditTelemetries = await testPrisma.auditLogTelemetry.findMany({
+        where: {
+          auditLog: {
+            entityId: updateDestId,
+            action: "destination.update",
+          },
+        },
+      });
+
+      expect(auditTelemetries.length).toBeGreaterThanOrEqual(4);
+      for (const t of auditTelemetries) {
+        const prev = t.previousStateSnapshot as Record<string, unknown> | null;
+        const next = t.newStateSnapshot as Record<string, unknown> | null;
+
+        if (prev) {
+          expect(prev).not.toHaveProperty("coordinates");
+          expect(prev).not.toHaveProperty("altitudeMeters");
+          expect(prev).not.toHaveProperty("accuracyMeters");
+          expect(prev).not.toHaveProperty("formattedAddress");
+        }
+        if (next) {
+          expect(next).not.toHaveProperty("coordinates");
+          expect(next).not.toHaveProperty("altitudeMeters");
+          expect(next).not.toHaveProperty("accuracyMeters");
+          expect(next).not.toHaveProperty("formattedAddress");
+        }
+      }
     });
   });
 
@@ -1242,6 +1355,41 @@ describe("Destination Management Integration Test Suite (Task 11)", () => {
       const returnedIds = res.body.data.map((d: any) => d.id);
       expect(returnedIds).toContain(kochiDestId);
       expect(returnedIds).not.toContain(munnarDestId);
+    });
+
+    it("should support antimeridian-crossing bounding boxes (minLon > maxLon) via safe split envelopes", async () => {
+      // Bounding box covering Kerala longitudes across antimeridian:
+      // minLon 75.0, minLat 8.0, maxLon -170.0, maxLat 13.0
+      // Splits into [75, 8, 180, 13] and [-180, 8, -170, 13]
+      const res = await request(app)
+        .get("/api/v1/destinations/search?bbox=75.0,8.0,-170.0,13.0")
+        .expect(200);
+
+      expect(res.body.success).toBe(true);
+      const returnedIds = res.body.data.map((d: any) => d.id);
+      expect(returnedIds).toContain(kochiDestId);
+      expect(returnedIds).toContain(munnarDestId);
+    });
+
+    it("should exclude Kerala destinations when antimeridian bounding box is elsewhere on the globe", async () => {
+      // Bounding box in Southern Pacific across antimeridian: [160, -20, -160, -10]
+      const res = await request(app)
+        .get("/api/v1/destinations/search?bbox=160.0,-20.0,-160.0,-10.0")
+        .expect(200);
+
+      expect(res.body.success).toBe(true);
+      const returnedIds = res.body.data.map((d: any) => d.id);
+      expect(returnedIds).not.toContain(kochiDestId);
+      expect(returnedIds).not.toContain(munnarDestId);
+    });
+
+    it("should reject invalid bounding box parameters with 422/400 validation error", async () => {
+      // Inverted latitude (minLat > maxLat)
+      const res = await request(app)
+        .get("/api/v1/destinations/search?bbox=76.0,12.0,76.5,10.0")
+        .expect(422);
+
+      expect(res.body.error.code).toBe("VALIDATION_FAILED");
     });
   });
 });

@@ -5,7 +5,12 @@
  */
 
 import { PrismaClient, Prisma } from "@prisma/client";
-import { prisma as defaultPrisma } from "../../lib/db";
+import {
+  prisma as defaultPrisma,
+  createBoundingBoxWhereClause,
+  validateBoundingBox,
+} from "../../lib/db";
+import { logger } from "../../config/logger";
 import { AuthenticatedPrincipal } from "../auth/auth.types";
 import {
   CreateDestinationInputDto,
@@ -86,10 +91,20 @@ export class DestinationService {
         )
       `;
     } catch (err) {
+      logger.error(
+        {
+          err,
+          actorAccountId: params.actor.accountId,
+          action: params.action,
+          entityType: params.entityType,
+          entityId: params.entityId,
+        },
+        "Audit log recording failed"
+      );
       throw new AppError(
         500,
         ErrorCode.AUDIT_LOG_FAILURE,
-        `Audit log insertion failed: ${err instanceof Error ? err.message : String(err)}`
+        "Failed to record mandatory audit log"
       );
     }
   }
@@ -284,21 +299,21 @@ export class DestinationService {
     const whereClause = Prisma.join(whereConditions, " AND ");
 
     // Sorting
-    let orderByClause = Prisma.sql`d.created_at DESC`;
+    let orderByClause = Prisma.sql`d.created_at DESC, d.id ASC`;
     if (query.sort === "featuredRank:asc") {
-      orderByClause = Prisma.sql`d.featured_rank ASC NULLS LAST, d.created_at DESC`;
+      orderByClause = Prisma.sql`d.featured_rank ASC NULLS LAST, d.created_at DESC, d.id ASC`;
     } else if (query.sort === "featuredRank:desc") {
-      orderByClause = Prisma.sql`d.featured_rank DESC NULLS LAST, d.created_at DESC`;
+      orderByClause = Prisma.sql`d.featured_rank DESC NULLS LAST, d.created_at DESC, d.id ASC`;
     } else if (query.sort === "createdAt:asc") {
-      orderByClause = Prisma.sql`d.created_at ASC`;
+      orderByClause = Prisma.sql`d.created_at ASC, d.id ASC`;
     } else if (query.sort === "title:asc") {
-      orderByClause = Prisma.sql`d.title ASC`;
+      orderByClause = Prisma.sql`d.title ASC, d.id ASC`;
     } else if (query.sort === "title:desc") {
-      orderByClause = Prisma.sql`d.title DESC`;
+      orderByClause = Prisma.sql`d.title DESC, d.id ASC`;
     } else if (query.sort === "updatedAt:desc") {
-      orderByClause = Prisma.sql`d.updated_at DESC`;
+      orderByClause = Prisma.sql`d.updated_at DESC, d.id ASC`;
     } else if (query.sort === "updatedAt:asc") {
-      orderByClause = Prisma.sql`d.updated_at ASC`;
+      orderByClause = Prisma.sql`d.updated_at ASC, d.id ASC`;
     }
 
     // Execute total count
@@ -420,7 +435,7 @@ export class DestinationService {
       longitude: number | null;
       latitude: number | null;
       public_locality_name: string | null;
-      formatted_address: string;
+      formatted_address: string | null;
       taluk_or_subdivision: string;
       district: string;
       state_or_province: string;
@@ -433,14 +448,20 @@ export class DestinationService {
         ST_X(vdl.public_coordinates::geometry) AS longitude,
         ST_Y(vdl.public_coordinates::geometry) AS latitude,
         vdl.public_locality_name,
-        dl.formatted_address,
+        CASE
+          WHEN vdl.is_restricted THEN NULL
+          ELSE dl.formatted_address
+        END AS formatted_address,
         vdl.taluk_or_subdivision,
         vdl.district,
         vdl.state_or_province,
         vdl.country_code,
-        vdl.postal_code
+        CASE
+          WHEN vdl.is_restricted THEN NULL
+          ELSE vdl.postal_code
+        END AS postal_code
       FROM v_public_destination_locations vdl
-      JOIN destination_locations dl ON dl.destination_id = vdl.destination_id
+      LEFT JOIN destination_locations dl ON dl.destination_id = vdl.destination_id
       WHERE vdl.destination_id = ${destination.id}::uuid
     `;
 
@@ -464,6 +485,17 @@ export class DestinationService {
       },
     });
 
+    const maskedFormattedAddress = loc?.is_restricted
+      ? [
+          loc.public_locality_name || loc.taluk_or_subdivision,
+          loc.district,
+          loc.state_or_province,
+          loc.country_code,
+        ]
+          .filter(Boolean)
+          .join(", ")
+      : (loc?.formatted_address ?? "");
+
     return {
       id: destination.id,
       slug: destination.slug,
@@ -474,7 +506,7 @@ export class DestinationService {
       secondaryCategories: destination.secondaryCategories.map((sc) => sc.category),
       locationSummary: loc
         ? {
-            formattedAddress: loc.formatted_address,
+            formattedAddress: maskedFormattedAddress,
             locality: loc.public_locality_name,
             talukOrSubdivision: loc.taluk_or_subdivision,
             district: loc.district,
@@ -559,7 +591,7 @@ export class DestinationService {
       district: row.district,
       stateOrProvince: row.state_or_province,
       countryCode: row.country_code,
-      nearestTransitHub: row.nearest_transit_hub,
+      nearestTransitHub: row.is_restricted ? null : row.nearest_transit_hub,
     };
   }
 
@@ -660,9 +692,16 @@ export class DestinationService {
     // Bounding box search
     if (query.bbox) {
       const [minLon, minLat, maxLon, maxLat] = query.bbox.split(",").map(Number);
+      if (!validateBoundingBox({ minLon, minLat, maxLon, maxLat })) {
+        throw new BadRequestError("Invalid bounding box coordinates in bbox parameter");
+      }
+      const bboxWhereClause = createBoundingBoxWhereClause(
+        { minLon, minLat, maxLon, maxLat },
+        Prisma.sql`vdl.public_coordinates`
+      );
       conditions.push(Prisma.sql`
         vdl.public_coordinates IS NOT NULL
-        AND ST_Intersects(vdl.public_coordinates, ST_MakeEnvelope(${minLon}, ${minLat}, ${maxLon}, ${maxLat}, 4326)::geography)
+        AND ${bboxWhereClause}
       `);
     }
 
@@ -703,7 +742,11 @@ export class DestinationService {
       FROM destinations d
       LEFT JOIN v_public_destination_locations vdl ON vdl.destination_id = d.id
       WHERE ${whereClause}
-      ORDER BY ${nearPointSql ? Prisma.sql`distance_km ASC NULLS LAST, d.created_at DESC` : Prisma.sql`d.created_at DESC`}
+      ORDER BY ${
+        nearPointSql
+          ? Prisma.sql`distance_km ASC NULLS LAST, d.created_at DESC, d.id ASC`
+          : Prisma.sql`d.created_at DESC, d.id ASC`
+      }
       LIMIT ${limit} OFFSET ${offset}
     `;
 
@@ -776,14 +819,14 @@ export class DestinationService {
     const whereClause = Prisma.join(conditions, " AND ");
 
     // Sorting
-    let orderByClause = Prisma.sql`d.created_at DESC`;
-    if (query.sort === "createdAt:asc") orderByClause = Prisma.sql`d.created_at ASC`;
-    else if (query.sort === "updatedAt:desc") orderByClause = Prisma.sql`d.updated_at DESC`;
-    else if (query.sort === "updatedAt:asc") orderByClause = Prisma.sql`d.updated_at ASC`;
-    else if (query.sort === "title:asc") orderByClause = Prisma.sql`d.title ASC`;
-    else if (query.sort === "title:desc") orderByClause = Prisma.sql`d.title DESC`;
-    else if (query.sort === "featuredRank:asc") orderByClause = Prisma.sql`d.featured_rank ASC NULLS LAST`;
-    else if (query.sort === "featuredRank:desc") orderByClause = Prisma.sql`d.featured_rank DESC NULLS LAST`;
+    let orderByClause = Prisma.sql`d.created_at DESC, d.id ASC`;
+    if (query.sort === "createdAt:asc") orderByClause = Prisma.sql`d.created_at ASC, d.id ASC`;
+    else if (query.sort === "updatedAt:desc") orderByClause = Prisma.sql`d.updated_at DESC, d.id ASC`;
+    else if (query.sort === "updatedAt:asc") orderByClause = Prisma.sql`d.updated_at ASC, d.id ASC`;
+    else if (query.sort === "title:asc") orderByClause = Prisma.sql`d.title ASC, d.id ASC`;
+    else if (query.sort === "title:desc") orderByClause = Prisma.sql`d.title DESC, d.id ASC`;
+    else if (query.sort === "featuredRank:asc") orderByClause = Prisma.sql`d.featured_rank ASC NULLS LAST, d.id ASC`;
+    else if (query.sort === "featuredRank:desc") orderByClause = Prisma.sql`d.featured_rank DESC NULLS LAST, d.id ASC`;
 
     const countRes = await this.prisma.$queryRaw<Array<{ count: bigint }>>`
       SELECT COUNT(*)::bigint AS count
@@ -1000,9 +1043,31 @@ export class DestinationService {
     reqContext?: RequestAuditContext
   ) {
     return this.prisma.$transaction(async (tx) => {
-      const destination = await tx.destination.findUnique({
-        where: { id },
-      });
+      // Pessimistic row-level lock on destination record to serialize concurrent partial updates
+      const lockedDestinations = await tx.$queryRaw<Array<{
+        id: string;
+        title: string;
+        slug: string;
+        short_description: string;
+        full_description: string;
+        primary_category_id: string;
+        publication_status: string;
+        featured_rank: number | null;
+      }>>`
+        SELECT
+          id,
+          title,
+          slug,
+          short_description,
+          full_description,
+          primary_category_id,
+          publication_status,
+          featured_rank
+        FROM destinations
+        WHERE id = ${id}::uuid
+        FOR UPDATE
+      `;
+      const destination = lockedDestinations[0];
       if (!destination) {
         throw new NotFoundError("Destination not found");
       }
@@ -1027,7 +1092,7 @@ export class DestinationService {
 
       if (input.secondaryCategoryIds) {
         const distinct = Array.from(new Set(input.secondaryCategoryIds));
-        const primaryId = input.primaryCategoryId ?? destination.primaryCategoryId;
+        const primaryId = input.primaryCategoryId ?? destination.primary_category_id;
         if (distinct.includes(primaryId)) {
           throw new BadRequestError("Secondary categories must not include the primary category");
         }
@@ -1070,6 +1135,32 @@ export class DestinationService {
       // Location update if provided
       if (input.location) {
         const loc = input.location;
+
+        // Query existing location with lock to validate restricted display name requirements
+        const existingLocRows = await tx.$queryRaw<Array<{
+          is_restricted: boolean;
+          public_approximate_display_name: string | null;
+        }>>`
+          SELECT is_restricted, public_approximate_display_name
+          FROM destination_locations
+          WHERE destination_id = ${id}::uuid
+          FOR UPDATE
+        `;
+        const existingLoc = existingLocRows[0];
+
+        const targetIsRestricted =
+          loc.isRestricted !== undefined ? loc.isRestricted : (existingLoc?.is_restricted ?? false);
+        const targetDisplayName =
+          loc.publicApproximateDisplayName !== undefined
+            ? loc.publicApproximateDisplayName
+            : existingLoc?.public_approximate_display_name;
+
+        if (targetIsRestricted && (!targetDisplayName || targetDisplayName.trim().length === 0)) {
+          throw new BadRequestError(
+            "publicApproximateDisplayName is required when destination location is restricted"
+          );
+        }
+
         const setClauses: Prisma.Sql[] = [Prisma.sql`updated_at = NOW()`];
 
         if (loc.coordinates) {
@@ -1114,9 +1205,9 @@ export class DestinationService {
         entityId: id,
         previousState: {
           title: destination.title,
-          shortDescription: destination.shortDescription,
-          featuredRank: destination.featuredRank,
-          primaryCategoryId: destination.primaryCategoryId,
+          shortDescription: destination.short_description,
+          featuredRank: destination.featured_rank,
+          primaryCategoryId: destination.primary_category_id,
         },
         newState: {
           title: updatedDestination.title,

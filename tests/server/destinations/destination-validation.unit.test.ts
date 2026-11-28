@@ -11,6 +11,10 @@ import {
   adminListDestinationsQuerySchema,
   searchDestinationsQuerySchema,
   coordinateTupleSchema,
+  destinationLocationInputSchema,
+  destinationOpeningHoursSchema,
+  dayScheduleSchema,
+  feeStructureSchema,
 } from "../../../src/server/destinations/destination.schema";
 
 describe("Destination Schema Validation Unit Tests", () => {
@@ -235,9 +239,222 @@ describe("Destination Schema Validation Unit Tests", () => {
       expect(parsed.bbox).toBe("75.8,10.8,76.5,11.5");
     });
 
+    it("accepts antimeridian-crossing bounding box coordinates (minLon > maxLon)", () => {
+      const parsed = searchDestinationsQuerySchema.parse({
+        bbox: "175.0,10.0,-175.0,12.0",
+      });
+      expect(parsed.bbox).toBe("175.0,10.0,-175.0,12.0");
+    });
+
     it("rejects invalid bounding box coordinates", () => {
       // Inverted latitudes: minLat (12.0) > maxLat (10.0)
       expect(searchDestinationsQuerySchema.safeParse({ bbox: "75.8,12.0,76.5,10.0" }).success).toBe(false);
+      // Latitude out of bounds
+      expect(searchDestinationsQuerySchema.safeParse({ bbox: "75.8,-95.0,76.5,10.0" }).success).toBe(false);
+      // Longitude out of bounds
+      expect(searchDestinationsQuerySchema.safeParse({ bbox: "-185.0,10.0,76.5,12.0" }).success).toBe(false);
+    });
+  });
+
+  describe("destinationLocationInputSchema", () => {
+    it("accepts unrestricted location without publicApproximateDisplayName", () => {
+      const result = destinationLocationInputSchema.safeParse(validLocation);
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects restricted location without publicApproximateDisplayName", () => {
+      const result = destinationLocationInputSchema.safeParse({
+        ...validLocation,
+        isRestricted: true,
+        restrictionReason: "wildlife_protection",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("accepts restricted location with valid publicApproximateDisplayName and approved reason", () => {
+      const result = destinationLocationInputSchema.safeParse({
+        ...validLocation,
+        isRestricted: true,
+        restrictionReason: "wildlife_protection",
+        publicApproximateDisplayName: "Nilambur Forest Division Buffer Area",
+        publicApproximateCentroid: [76.3, 11.3],
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects restricted location with unapproved restriction reason", () => {
+      const result = destinationLocationInputSchema.safeParse({
+        ...validLocation,
+        isRestricted: true,
+        restrictionReason: "unapproved_reason",
+        publicApproximateDisplayName: "Buffer Area",
+      });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe("dayScheduleSchema", () => {
+    it("accepts standard daytime open schedule", () => {
+      const result = dayScheduleSchema.safeParse({
+        dayOfWeek: 1,
+        isClosed: false,
+        openTime: "09:00",
+        closeTime: "17:30",
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("accepts overnight open schedule (closeTime < openTime)", () => {
+      const result = dayScheduleSchema.safeParse({
+        dayOfWeek: 5,
+        isClosed: false,
+        openTime: "22:00",
+        closeTime: "04:00",
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects zero duration schedule (openTime === closeTime)", () => {
+      const result = dayScheduleSchema.safeParse({
+        dayOfWeek: 2,
+        isClosed: false,
+        openTime: "10:00",
+        closeTime: "10:00",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects open day missing openTime or closeTime", () => {
+      expect(
+        dayScheduleSchema.safeParse({
+          dayOfWeek: 3,
+          isClosed: false,
+          openTime: "09:00",
+        }).success
+      ).toBe(false);
+
+      expect(
+        dayScheduleSchema.safeParse({
+          dayOfWeek: 3,
+          isClosed: false,
+          closeTime: "17:00",
+        }).success
+      ).toBe(false);
+    });
+
+    it("accepts closed day with no times specified", () => {
+      const result = dayScheduleSchema.safeParse({
+        dayOfWeek: 0,
+        isClosed: true,
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects closed day specifying openTime or closeTime", () => {
+      expect(
+        dayScheduleSchema.safeParse({
+          dayOfWeek: 0,
+          isClosed: true,
+          openTime: "09:00",
+        }).success
+      ).toBe(false);
+
+      expect(
+        dayScheduleSchema.safeParse({
+          dayOfWeek: 0,
+          isClosed: true,
+          closeTime: "17:00",
+        }).success
+      ).toBe(false);
+    });
+  });
+
+  describe("feeStructureSchema", () => {
+    it("accepts isFree: true with no fees", () => {
+      const result = feeStructureSchema.safeParse({
+        isFree: true,
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects isFree: true when positive fees are present", () => {
+      const result = feeStructureSchema.safeParse({
+        isFree: true,
+        adultFee: 50,
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("accepts isFree: false with valid adult fee", () => {
+      const result = feeStructureSchema.safeParse({
+        isFree: false,
+        currency: "INR",
+        adultFee: 100,
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects isFree: false when no fees, permit, or booking URL are provided", () => {
+      const result = feeStructureSchema.safeParse({
+        isFree: false,
+        currency: "INR",
+      });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe("destinationOpeningHoursSchema", () => {
+    it("accepts weeklySchedule with distinct days of week", () => {
+      const result = destinationOpeningHoursSchema.safeParse({
+        type: "scheduled",
+        weeklySchedule: [
+          { dayOfWeek: 1, isClosed: false, openTime: "09:00", closeTime: "17:00" },
+          { dayOfWeek: 2, isClosed: false, openTime: "09:00", closeTime: "17:00" },
+          { dayOfWeek: 0, isClosed: true },
+        ],
+        entryFeePolicy: "free",
+        feeStructure: { isFree: true },
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects weeklySchedule with duplicate days of the week", () => {
+      const result = destinationOpeningHoursSchema.safeParse({
+        type: "scheduled",
+        weeklySchedule: [
+          { dayOfWeek: 1, isClosed: false, openTime: "09:00", closeTime: "17:00" },
+          { dayOfWeek: 1, isClosed: true }, // Duplicate Monday (1)
+        ],
+        entryFeePolicy: "free",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects entryFeePolicy conflict between policy: free and feeStructure: not free", () => {
+      const result = destinationOpeningHoursSchema.safeParse({
+        type: "always_open",
+        entryFeePolicy: "free",
+        feeStructure: { isFree: false, adultFee: 50 },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects entryFeePolicy conflict between policy: paid and feeStructure: free", () => {
+      const result = destinationOpeningHoursSchema.safeParse({
+        type: "always_open",
+        entryFeePolicy: "paid",
+        feeStructure: { isFree: true },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("accepts entryFeePolicy: restricted_permit with feeStructure", () => {
+      const result = destinationOpeningHoursSchema.safeParse({
+        type: "always_open",
+        entryFeePolicy: "restricted_permit",
+        feeStructure: { isFree: false, specialPermitRequired: true, adultFee: 200 },
+      });
+      expect(result.success).toBe(true);
     });
   });
 });
